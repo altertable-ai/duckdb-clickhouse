@@ -40,9 +40,12 @@ SELECT id FROM ch.test_db.t1 WHERE id = 1 OR id = 3 ORDER BY id;
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 WHERE id = 1 OR id = 3;
 ----
-analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `id` FROM `test_db`.`t1` WHERE .*`id`.*1.*3.*".*
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `id` FROM `test_db`.`t1`".*
 
-# strings
+# not pushed: DuckDB pushes a non-dense OR/IN as an OPTIONAL_FILTER (a zone-map pruning hint, not required
+# for correctness) and keeps the real predicate as a Filter operator above the scan -- pushing the optional
+# copy into ClickHouse too would be redundant at best, and would return wrong rows if a LIMIT above the scan
+# were ever pushed alongside it (see task-8 fix round 1)
 query I
 SELECT id FROM ch.test_db.t1 WHERE name IN ('Alice', 'Charlie') ORDER BY id;
 ----
@@ -52,7 +55,7 @@ SELECT id FROM ch.test_db.t1 WHERE name IN ('Alice', 'Charlie') ORDER BY id;
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 WHERE name IN ('Alice', 'Charlie');
 ----
-analyzed_plan	<REGEX>:.*WHERE .*`name`.*'Alice'.*'Charlie'.*
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
 
 query I
 SELECT count(*) FROM ch.test_db.t1 WHERE name = 'O''Brien\';

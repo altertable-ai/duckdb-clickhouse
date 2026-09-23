@@ -58,7 +58,7 @@ SELECT n FROM ch.test_db.big WHERE n < 100 ORDER BY n DESC LIMIT 1;
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big WHERE n < 100 ORDER BY n DESC LIMIT 1;
 ----
-analyzed_plan	<REGEX>:.*WHERE .*`n` < 100.*ORDER BY `n` DESC NULLS LAST LIMIT 1".*
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big` WHERE \(`n` < 100\) ORDER BY `n` DESC NULLS LAST LIMIT 1".*
 
 # plain LIMIT
 query I
@@ -104,10 +104,79 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 ORDER BY value DESC 
 ----
 analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
 
+# a Nullable key, NULLS FIRST
+query I
+SELECT i FROM ch.test_db.nullables ORDER BY i NULLS FIRST LIMIT 1;
+----
+NULL
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT i FROM ch.test_db.nullables ORDER BY i NULLS FIRST LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`nullables` ORDER BY `i` ASC NULLS FIRST LIMIT 1".*
+
+# a String key
+query I
+SELECT name FROM ch.test_db.t1 ORDER BY name LIMIT 1;
+----
+Alice
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT name FROM ch.test_db.t1 ORDER BY name LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1` ORDER BY `name` ASC NULLS LAST LIMIT 1".*
+
+# an ENUM key: ClickHouse orders Enum8 by its underlying integer value, which is exactly the order
+# ParseEnumEntries (clickhouse_types.cpp) sorts entries into before handing them to LogicalType::ENUM, so
+# DuckDB's own dictionary-index comparison and ClickHouse's native comparison agree
+query I
+SELECT id FROM ch.test_db.scalars ORDER BY e8 LIMIT 1;
+----
+1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.scalars ORDER BY e8 LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`scalars` ORDER BY `e8` ASC NULLS LAST LIMIT 1".*
+
+# not pushed: a non-default collation changes string ordering semantics away from ClickHouse's byte-wise order
+statement ok
+SET default_collation = 'nocase';
+
+query I
+SELECT name FROM ch.test_db.t1 ORDER BY name LIMIT 1;
+----
+Alice
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT name FROM ch.test_db.t1 ORDER BY name LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
+
+statement ok
+RESET default_collation;
+
+# not pushed: LIMIT n% is not a constant row count
+query I
+SELECT count(*) FROM (SELECT n FROM ch.test_db.big LIMIT 10%);
+----
+1000000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big LIMIT 10%;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big`".*
+
 statement ok
 SET ch_order_pushdown = false;
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big ORDER BY n DESC LIMIT 3;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big`".*
+
+# plain LIMIT (LOGICAL_LIMIT, not a TOP_N) is also disabled by the setting
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big LIMIT 5;
 ----
 analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big`".*

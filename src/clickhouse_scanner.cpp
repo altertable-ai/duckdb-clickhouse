@@ -7,6 +7,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/table_column.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -143,11 +144,28 @@ bool ClickhouseScanFunction::IsClickhouseScan(const string &function_name) {
 //===--------------------------------------------------------------------===//
 // Callbacks
 //===--------------------------------------------------------------------===//
+//! The filters BuildQuery may safely translate into a ClickHouse predicate: PhysicalTableScan::table_filters,
+//! not input.filters. DuckDB constructs input.filters (TableScanGlobalSourceState, physical_table_scan.cpp) by
+//! merging that same static set with op.dynamic_filters -- a runtime channel a join or TopN can attach a filter
+//! to for pruning only (e.g. physical_hash_join.cpp pushes an exact-value equality filter, unwrapped, once its
+//! build side resolves to a single distinct value), populated only as execution proceeds, so a filter arriving
+//! only through it can be indistinguishable by type from a real predicate despite never being required for
+//! correctness. Applying it inside ClickHouse could run it before an operator above the scan (the join, or a
+//! LIMIT/TOP_N) is supposed to see the unfiltered rows -- see task-8 fix round 1. input.op (set by
+//! TableScanGlobalSourceState to the PhysicalTableScan itself) is always populated in practice; input.filters
+//! is used only as a defensive fallback so a filter DuckDB expects enforced is never silently dropped.
+static optional_ptr<TableFilterSet> StaticScanFilters(TableFunctionInitInput &input) {
+	if (input.op) {
+		return input.op->Cast<PhysicalTableScan>().table_filters.get();
+	}
+	return input.filters;
+}
+
 static unique_ptr<GlobalTableFunctionState> ClickhouseInitGlobal(ClientContext &context,
                                                                   TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
 	auto result = make_uniq<ClickhouseScanGlobalState>();
-	result->sql = ClickhouseScanFunction::BuildQuery(bind_data, input.column_ids, input.filters);
+	result->sql = ClickhouseScanFunction::BuildQuery(bind_data, input.column_ids, StaticScanFilters(input));
 	// columns needed only to evaluate a filter DuckDB couldn't push down (ClickhouseSupportsPushdownType
 	// returned false for them) are still fetched -- filter_prune=true lets DuckDB tell us, via
 	// projection_ids, which of the fetched columns actually need to reach `output`

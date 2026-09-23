@@ -14,7 +14,6 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
 
 namespace duckdb {
 
@@ -174,7 +173,7 @@ static bool IsVarcharCastOfColumnReference(const Expression &expr) {
 	      cast_expr.child->GetExpressionClass() == ExpressionClass::BOUND_REF;
 }
 
-string ClickhouseFilterPushdown::TransformFilter(const string &column, const TableFilter &filter, bool optional) {
+string ClickhouseFilterPushdown::TransformFilter(const string &column, const TableFilter &filter) {
 	switch (filter.filter_type) {
 	case TableFilterType::IS_NULL:
 		return column + " IS NULL";
@@ -213,7 +212,7 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
 		vector<string> parts;
 		for (auto &child : conjunction.child_filters) {
-			auto part = TransformFilter(column, *child, optional);
+			auto part = TransformFilter(column, *child);
 			if (!part.empty()) {
 				parts.push_back(part);
 			}
@@ -227,7 +226,7 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
 		vector<string> parts;
 		for (auto &child : conjunction.child_filters) {
-			auto part = TransformFilter(column, *child, optional);
+			auto part = TransformFilter(column, *child);
 			if (part.empty()) {
 				// one branch does not restrict rows, so neither does the OR
 				return string();
@@ -236,17 +235,13 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		}
 		return "(" + StringUtil::Join(parts, " OR ") + ")";
 	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &optional_filter = filter.Cast<OptionalFilter>();
-		if (!optional_filter.child_filter) {
-			return string();
-		}
-		try {
-			return TransformFilter(column, *optional_filter.child_filter, true);
-		} catch (NotImplementedException &) {
-			return string();
-		}
-	}
+	case TableFilterType::OPTIONAL_FILTER:
+		// "executing filter is not required for query correctness" (table_filter.hpp) -- DuckDB keeps enforcing
+		// the real predicate itself wherever it needs to (above a join, or above the LIMIT/ORDER BY this filter
+		// was pushed alongside), so it must never become a ClickHouse predicate: doing so could exclude rows
+		// before that real operator ever sees them (see task-8 fix round 1 for the join+LIMIT reproduction).
+		// Never translate the wrapped filter, regardless of whether it is itself translatable.
+		return string();
 	case TableFilterType::DYNAMIC_FILTER:
 	case TableFilterType::BLOOM_FILTER:
 		// runtime hints from joins / top-n: the operators above the scan still enforce them
@@ -288,16 +283,10 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 				}
 			}
 		}
-		if (optional) {
-			return string();
-		}
 		throw NotImplementedException("ClickHouse filter pushdown: unsupported expression filter %s",
 		                              expr.ToString());
 	}
 	default:
-		if (optional) {
-			return string();
-		}
 		throw NotImplementedException("ClickHouse filter pushdown: unsupported filter type %s",
 		                              EnumUtil::ToString(filter.filter_type));
 	}
