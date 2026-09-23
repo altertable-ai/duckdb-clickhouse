@@ -1,0 +1,14 @@
+diff --git a/clickhouse/columns/lowcardinality.h b/clickhouse/columns/lowcardinality.h
+index d7f43a8..4d8348c 100644
+--- a/clickhouse/columns/lowcardinality.h
++++ b/clickhouse/columns/lowcardinality.h
+@@ -96,6 +96,9 @@ public:
+ 
+     size_t GetDictionarySize() const;
+     TypeRef GetNestedType() const;
++    const ColumnRef &GetDictionaryColumn() const { return dictionary_column_; }
++    const ColumnRef &GetIndexColumn() const { return index_column_; }
++
+ 
+ protected:
+     std::uint64_t getDictionaryIndex(std::uint64_t item_index) const;
