@@ -1,7 +1,9 @@
 #include "storage/clickhouse_table_entry.hpp"
 
+#include "clickhouse_scanner.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
+#include "storage/clickhouse_catalog.hpp"
 
 namespace duckdb {
 
@@ -15,8 +17,14 @@ unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &co
 }
 
 TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	// replaced in Task 6
-	throw NotImplementedException("Scanning ClickHouse tables is not implemented yet");
+	auto result = make_uniq<ClickhouseScanBindData>();
+	result->pool = catalog.Cast<ClickhouseCatalog>().GetConnectionPoolPtr();
+	result->database = schema.name;
+	result->table = name;
+	result->columns = clickhouse_columns;
+	result->approx_rows = approx_rows;
+	bind_data = std::move(result);
+	return ClickhouseScanFunction();
 }
 
 TableStorageInfo ClickhouseTableEntry::GetStorageInfo(ClientContext &context) {

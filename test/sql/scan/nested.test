@@ -1,0 +1,32 @@
+# name: test/sql/scan/nested.test
+# description: Array, Tuple and Map columns
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query IIIIIIIIII
+SELECT * FROM ch.test_db.nested ORDER BY id;
+----
+1	[1, 2, 3]	[a, NULL]	[[1], [2, 3]]	{'a': 1, 'b': x}	{'1': 2, '2': y}	{k1=1, k2=2}	{h=1.2.3.4}	[1.1.1.1, 2.2.2.2]	{'ip': 8.8.8.8, 'n': 5}
+2	[]	[]	[]	{'a': 0, 'b': }	{'1': 0, '2': }	{}	{}	[]	{'ip': 0.0.0.0, 'n': 0}
+
+query I
+SELECT m['k2'] FROM ch.test_db.nested WHERE id = 1;
+----
+2

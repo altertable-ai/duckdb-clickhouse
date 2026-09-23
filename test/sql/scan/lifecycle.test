@@ -1,0 +1,76 @@
+# name: test/sql/scan/lifecycle.test
+# description: clear-cache safety and connection-pool reuse across scans
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+# --- clearing the catalog cache does not break a scan bound before the clear: ClickhouseCatalogSet
+# retires cleared entries (moves them aside) instead of freeing them, so a PREPAREd plan that still
+# holds a raw CatalogEntry* from before the clear stays valid.
+
+statement ok
+PREPARE q AS SELECT count(*) FROM ch.test_db.t1;
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+EXECUTE q;
+----
+3
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+EXECUTE q;
+----
+3
+
+# --- a scan stopped early (LIMIT reached in DuckDB) returns its connection to the pool instead of
+# leaking it: repeating this many times should not grow the number of open TCP connections on the
+# server by anywhere near the number of iterations.
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_sys (TYPE clickhouse, SHOW_SYSTEM true);
+
+statement ok
+CREATE TABLE metrics_before AS SELECT value AS v FROM ch_sys.system.metrics WHERE metric = 'TCPConnection';
+
+loop i 0 20
+
+query I
+SELECT count(*) FROM (SELECT n FROM ch.test_db.big WHERE n % 2 = 0 LIMIT 10);
+----
+10
+
+endloop
+
+# allow some slack for connections opened by unrelated background activity on the server; the
+# important thing is that it did not grow by anything near the 20 iterations above
+query I
+SELECT (SELECT value FROM ch_sys.system.metrics WHERE metric = 'TCPConnection') - (SELECT v FROM metrics_before) < 10;
+----
+true
+
+# the pool is still healthy: a normal scan still returns correct results
+query II
+SELECT count(*), sum(n) FROM ch.test_db.big;
+----
+10000000	49999995000000
