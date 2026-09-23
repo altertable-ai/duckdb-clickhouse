@@ -1,0 +1,113 @@
+# name: test/sql/pushdown/limit.test
+# description: LIMIT and ORDER BY ... LIMIT run inside ClickHouse when that is exact
+# group: [pushdown]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query I
+SELECT n FROM ch.test_db.big ORDER BY n DESC LIMIT 3;
+----
+9999999
+9999998
+9999997
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big ORDER BY n DESC LIMIT 3;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big` ORDER BY `n` DESC NULLS LAST LIMIT 3".*
+
+query II
+SELECT n, s FROM ch.test_db.big ORDER BY n LIMIT 2 OFFSET 5;
+----
+5	5
+6	6
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n, s FROM ch.test_db.big ORDER BY n LIMIT 2 OFFSET 5;
+----
+analyzed_plan	<REGEX>:.*ORDER BY `n` ASC NULLS LAST LIMIT 2 OFFSET 5".*
+
+# through a projection with an alias
+query I
+SELECT n AS x FROM ch.test_db.big ORDER BY x DESC LIMIT 1;
+----
+9999999
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n AS x FROM ch.test_db.big ORDER BY x DESC LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*ORDER BY `n` DESC NULLS LAST LIMIT 1".*
+
+# together with a pushed filter
+query I
+SELECT n FROM ch.test_db.big WHERE n < 100 ORDER BY n DESC LIMIT 1;
+----
+99
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big WHERE n < 100 ORDER BY n DESC LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*WHERE .*`n` < 100.*ORDER BY `n` DESC NULLS LAST LIMIT 1".*
+
+# plain LIMIT
+query I
+SELECT count(*) FROM (SELECT n FROM ch.test_db.big LIMIT 5);
+----
+5
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big LIMIT 5;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big` LIMIT 5".*
+
+# not pushed: ORDER BY an expression
+query I
+SELECT id FROM ch.test_db.t1 ORDER BY id % 2, id LIMIT 1;
+----
+2
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 ORDER BY id % 2, id LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
+
+# not pushed: a filter DuckDB evaluates itself (the LIMIT must apply after it)
+query I
+SELECT id FROM ch.test_db.t1 WHERE value > 100 ORDER BY id LIMIT 1;
+----
+2
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 WHERE value > 100 ORDER BY id LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
+
+# not pushed: ordering on a float column
+query I
+SELECT id FROM ch.test_db.t1 ORDER BY value DESC LIMIT 1;
+----
+3
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 ORDER BY value DESC LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1`".*
+
+statement ok
+SET ch_order_pushdown = false;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM ch.test_db.big ORDER BY n DESC LIMIT 3;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big`".*

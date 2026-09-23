@@ -10,7 +10,9 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "storage/clickhouse_clear_cache.hpp"
+#include "storage/clickhouse_optimizer.hpp"
 #include "storage/clickhouse_storage_extension.hpp"
 
 #include <clickhouse/client.h>
@@ -66,6 +68,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("ch_pool_idle_timeout_millis",
 	                          "Idle pooled connections are closed after this many milliseconds (new ATTACHes)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis));
+	config.AddExtensionOption("ch_order_pushdown", "Push LIMIT and ORDER BY ... LIMIT down into ClickHouse queries",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	OptimizerExtension clickhouse_optimizer;
+	clickhouse_optimizer.optimize_function = ClickhouseOptimizer::Optimize;
+	OptimizerExtension::Register(config, std::move(clickhouse_optimizer));
 }
 
 void ClickhouseScannerExtension::Load(ExtensionLoader &loader) {
