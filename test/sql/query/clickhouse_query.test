@@ -1,0 +1,77 @@
+# name: test/sql/query/clickhouse_query.test
+# description: clickhouse_query runs arbitrary ClickHouse SQL through an attached database
+# group: [query]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT number AS n, toString(number) AS s FROM numbers(3)');
+----
+0	0
+1	1
+2	2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT finalizeAggregation(total) AS total FROM test_db.aggregates');
+----
+10
+
+# trailing semicolons are ignored; unqualified tables resolve in the connection's database
+query I
+SELECT u FROM clickhouse_query('ch', 'SELECT uniqExact(n) AS u FROM big;');
+----
+10000000
+
+# the ClickHouse type mapping applies to query results
+query II
+SELECT typeof(ip), ip FROM clickhouse_query('ch', 'SELECT toIPv4(''1.2.3.4'') AS ip');
+----
+VARCHAR	1.2.3.4
+
+# projection and filter pushdown wrap the query
+query I
+SELECT n FROM clickhouse_query('ch', 'SELECT number AS n, number * 2 AS m FROM numbers(100)') WHERE n = 42;
+----
+42
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM clickhouse_query('ch', 'SELECT number AS n, number * 2 AS m FROM numbers(100)') WHERE n = 42;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM \(SELECT number AS n, number \* 2 AS m FROM numbers\(100\)\) WHERE `n` = 42".*
+
+query I
+SELECT n FROM clickhouse_query('ch', 'SELECT number AS n FROM numbers(1000)') ORDER BY n DESC LIMIT 2;
+----
+999
+998
+
+statement error
+SELECT * FROM clickhouse_query('nope', 'SELECT 1');
+----
+Failed to find attached database "nope" referenced in clickhouse_query
+
+statement error
+SELECT * FROM clickhouse_query('memory', 'SELECT 1');
+----
+Attached database "memory" is not a ClickHouse database
+
+statement error
+SELECT * FROM clickhouse_query('ch', 'SELECT * FROM does_not_exist');
+----
+ClickHouse error 60 (UNKNOWN_TABLE)
+
+statement error
+SELECT * FROM clickhouse_query('ch', NULL);
+----
+Parameters to clickhouse_query cannot be NULL

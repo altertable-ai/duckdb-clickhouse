@@ -2,8 +2,10 @@
 
 #include "clickhouse_conversion.hpp"
 #include "clickhouse_filter_pushdown.hpp"
+#include "clickhouse_secrets.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/table_column.hpp"
@@ -436,10 +438,65 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.get_virtual_columns = ClickhouseGetVirtualColumns;
 }
 
+//===--------------------------------------------------------------------===//
+// clickhouse_scan()
+//===--------------------------------------------------------------------===//
+//! Binds clickhouse_scan('<connection string>', '<database>', '<table>' [, secret := '<secret name>']): opens a
+//! private connection pool (no ATTACH) and reads the table's columns straight from system.columns
+static unique_ptr<FunctionData> ClickhouseScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	for (auto &value : input.inputs) {
+		if (value.IsNull()) {
+			throw BinderException("Parameters to clickhouse_scan cannot be NULL");
+		}
+	}
+	string secret_name;
+	auto secret_parameter = input.named_parameters.find("secret");
+	if (secret_parameter != input.named_parameters.end()) {
+		secret_name = secret_parameter->second.ToString();
+	}
+	ClickhouseConnectionConfig config;
+	auto secret_entry = ClickhouseSecrets::GetSecretEntry(context, secret_name);
+	if (secret_entry) {
+		ClickhouseSecrets::ApplySecret(*secret_entry, config);
+	}
+	config.ApplyConnectionString(StringValue::Get(input.inputs[0]));
+
+	// a private pool for this scan; no background reaper thread for such a short-lived pool
+	auto pool_config = ClickhouseConnectionPool::PoolConfigFromContext(context);
+	pool_config.start_reaper_thread = false;
+	auto result = make_uniq<ClickhouseScanBindData>();
+	result->pool = make_shared_ptr<ClickhouseConnectionPool>(config, ClickhouseTimeouts::FromContext(context),
+	                                                          pool_config);
+	result->database = StringValue::Get(input.inputs[1]);
+	result->table = StringValue::Get(input.inputs[2]);
+	result->filter_pushdown = ClickhouseScanFunction::FilterPushdownEnabled(context);
+
+	auto connection = result->pool->GetConnection();
+	auto sql = "SELECT name, type FROM system.columns WHERE database = " +
+	           ClickhouseUtils::QuoteLiteral(result->database) +
+	           " AND table = " + ClickhouseUtils::QuoteLiteral(result->table) +
+	           " AND default_kind != 'EPHEMERAL' ORDER BY position";
+	for (auto &block : connection->Query(sql)) {
+		auto column_names = block[0]->As<clickhouse::ColumnString>();
+		auto column_types = block[1]->As<clickhouse::ColumnString>();
+		for (size_t row = 0; row < block.GetRowCount(); row++) {
+			result->columns.push_back(
+			    ClickhouseColumnInfo::Create(string(column_names->At(row)), string(column_types->At(row))));
+		}
+	}
+	if (result->columns.empty()) {
+		throw BinderException("ClickHouse table \"%s\".\"%s\" not found", result->database, result->table);
+	}
+	ClickhouseScanFunction::SetReturnTypes(*result, return_types, names);
+	return std::move(result);
+}
+
 ClickhouseScanFunction::ClickhouseScanFunction()
     : TableFunction("clickhouse_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-                    ClickhouseScan) {
+                    ClickhouseScan, ClickhouseScanBind) {
 	SetScanCallbacks(*this);
+	named_parameters["secret"] = LogicalType::VARCHAR;
 }
 
 } // namespace duckdb

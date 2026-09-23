@@ -49,4 +49,10 @@ public:
 	static bool FilterPushdownEnabled(ClientContext &context);
 };
 
+//! clickhouse_query('<attached database>', '<ClickHouse SQL>')
+class ClickhouseQueryFunction : public TableFunction {
+public:
+	ClickhouseQueryFunction();
+};
+
 } // namespace duckdb

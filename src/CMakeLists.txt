@@ -7,6 +7,7 @@ add_library(
   clickhouse_conversion.cpp
   clickhouse_error_codes.cpp
   clickhouse_filter_pushdown.cpp
+  clickhouse_query.cpp
   clickhouse_scanner.cpp
   clickhouse_scanner_extension.cpp
   clickhouse_secrets.cpp

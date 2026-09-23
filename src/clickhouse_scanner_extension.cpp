@@ -3,6 +3,7 @@
 #include "clickhouse_scanner_extension.hpp"
 
 #include "clickhouse_connection.hpp"
+#include "clickhouse_scanner.hpp"
 #include "clickhouse_secrets.hpp"
 #include "clickhouse_type_mapping_function.hpp"
 #include "dbconnector/pool.hpp"
@@ -36,6 +37,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(version_function);
 	loader.RegisterFunction(ClickhouseTypeMappingFunction());
 	loader.RegisterFunction(ClickhouseClearCacheFunction());
+	loader.RegisterFunction(ClickhouseScanFunction());
+	loader.RegisterFunction(ClickhouseQueryFunction());
 
 	loader.RegisterSecretType(ClickhouseSecrets::CreateType());
 	CreateSecretFunction secret_function = {ClickhouseSecrets::TYPE_NAME, "config", ClickhouseSecrets::CreateFunction};

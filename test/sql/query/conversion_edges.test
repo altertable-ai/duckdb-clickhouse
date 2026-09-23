@@ -1,0 +1,67 @@
+# name: test/sql/query/conversion_edges.test
+# description: conversion edge cases deferred from Task 6 -- exercised via clickhouse_query() since they need
+#              generated values rather than fixture tables: negative sub-second DateTime64 flooring, duplicate
+#              Map keys, and Nullable/Array/Map conversion across a chunk boundary (>= STANDARD_VECTOR_SIZE rows)
+# group: [query]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+# --- negative sub-second DateTime64: precision > 6 floors toward -infinity, not toward zero (fix-round-1 item 2) ---
+# 1969-12-31 23:59:59.9999999 is 1 tick before the epoch at precision 7 (1e-7s); scaling 7 -> 6 floors -1/10 to
+# -1 (not 0), i.e. one microsecond before the epoch: 1969-12-31 23:59:59.999999, not 1970-01-01 00:00:00.000000.
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toDateTime64(''1969-12-31 23:59:59.9999999'', 7, ''UTC'') AS t');
+----
+1969-12-31 23:59:59.999999+00
+
+# a DateTime64(3) value before the epoch round-trips exactly: widening precision 3 -> 6 never floors
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toDateTime64(''1969-06-15 12:00:00.123'', 3, ''UTC'') AS t');
+----
+1969-06-15 12:00:00.123+00
+
+# --- duplicate Map keys are rejected ---
+# ClickHouse's map() constructor keeps duplicate keys verbatim (verified against clickhouse/clickhouse-server:25.8:
+# `SELECT map('a', 1, 'a', 2)` returns {'a':1,'a':2}, not a deduplicated map), which DuckDB's MAP type cannot
+# represent.
+statement error
+SELECT * FROM clickhouse_query('ch', 'SELECT map(''a'', 1, ''a'', 2) AS m');
+----
+column "m" contains a Map with duplicate keys, which DuckDB's MAP type does not allow. Use clickhouse_query() with mapKeys()
+
+# --- Nullable / Array(Nullable) / Map conversion across chunk boundaries (10000 rows > STANDARD_VECTOR_SIZE) ---
+# maybe is NULL for n % 3 == 0 (3334 of the 10000 rows -> 6666 non-null).
+# arr has n % 5 elements (range(n % 5)); over 10000 rows each residue 0..4 occurs exactly 2000 times, so
+# sum(len(arr)) = 2000 * (0+1+2+3+4) = 20000.
+# within arr, arrayMap nulls out even values (the elements are the index values 0..k-1 themselves), keeping only
+# odd ones; per residue class the non-null sum is 0, 0, 1, 1, 4 for k=0..4, so summed over 2000 occurrences each:
+# 2000 * (0+0+1+1+4) = 12000.
+# m['k'] is n itself, so sum(m['k']) over n=0..9999 = 9999*10000/2 = 49995000.
+query IIII
+WITH t AS (
+    SELECT * FROM clickhouse_query('ch', 'SELECT number AS n, if(number % 3 = 0, NULL, number) AS maybe,
+        arrayMap(x -> if(x % 2 = 0, NULL, x), range(number % 5)) AS arr, map(''k'', number) AS m FROM numbers(10000)')
+)
+SELECT
+    (SELECT count(maybe) FROM t),
+    (SELECT sum(len(arr)) FROM t),
+    (SELECT sum(x) FROM (SELECT UNNEST(arr) AS x FROM t) WHERE x IS NOT NULL),
+    (SELECT sum(m['k']) FROM t);
+----
+6666	20000	12000	49995000
