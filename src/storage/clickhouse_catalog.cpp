@@ -77,6 +77,28 @@ PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &, PhysicalPlanGen
 	ClickhouseUtils::ThrowReadOnly();
 }
 
+PhysicalOperator &ClickhouseCatalog::PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &,
+                                                   PhysicalOperator &) {
+	// the base Catalog::PlanMergeInto() throws NotImplementedException; MERGE INTO is a write like any
+	// other and must be rejected with the same read-only error
+	ClickhouseUtils::ThrowReadOnly();
+}
+
+unique_ptr<LogicalOperator> ClickhouseCatalog::BindCreateIndex(Binder &, CreateStatement &, TableCatalogEntry &,
+                                                               unique_ptr<LogicalOperator>) {
+	// must throw here, before the base implementation's IndexBinder::BindCreateIndex() gets anywhere near
+	// LogicalGet::bind_data: it assumes bind_data is a TableScanBindData and casts + writes through it,
+	// which is type confusion against our ClickhouseScanBindData
+	ClickhouseUtils::ThrowReadOnly();
+}
+
+unique_ptr<LogicalOperator> ClickhouseCatalog::BindAlterAddIndex(Binder &, TableCatalogEntry &,
+                                                                 unique_ptr<LogicalOperator>,
+                                                                 unique_ptr<CreateIndexInfo>,
+                                                                 unique_ptr<AlterTableInfo>) {
+	ClickhouseUtils::ThrowReadOnly();
+}
+
 DatabaseSize ClickhouseCatalog::GetDatabaseSize(ClientContext &context) {
 	return DatabaseSize();
 }

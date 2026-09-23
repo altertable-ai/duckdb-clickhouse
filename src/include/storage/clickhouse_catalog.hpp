@@ -54,6 +54,18 @@ public:
 	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
+	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+	                                PhysicalOperator &plan) override;
+	//! The base Catalog::BindCreateIndex() would otherwise bind straight into IndexBinder::BindCreateIndex(),
+	//! which assumes bind_data is a TableScanBindData and writes through it -- type confusion against our
+	//! ClickhouseScanBindData. Throwing here, before anything touches the bind data, is required, not just a
+	//! nicer error message.
+	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
+	                                            unique_ptr<LogicalOperator> plan) override;
+	unique_ptr<LogicalOperator> BindAlterAddIndex(Binder &binder, TableCatalogEntry &table_entry,
+	                                              unique_ptr<LogicalOperator> plan,
+	                                              unique_ptr<CreateIndexInfo> create_info,
+	                                              unique_ptr<AlterTableInfo> alter_info) override;
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 	bool InMemory() override {
 		return false;

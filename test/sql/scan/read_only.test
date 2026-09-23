@@ -35,6 +35,17 @@ DELETE FROM ch.test_db.t1;
 ----
 clickhouse_scanner is read-only
 
+statement error
+CREATE INDEX idx ON ch.test_db.t1(id);
+----
+clickhouse_scanner is read-only
+
+statement error
+MERGE INTO ch.test_db.t1 USING (VALUES (1)) src(id) ON t1.id = src.id
+WHEN MATCHED THEN UPDATE SET name = 'x';
+----
+clickhouse_scanner is read-only
+
 query I
 SELECT count(*) FROM ch.test_db.t1;
 ----
