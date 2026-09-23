@@ -21,7 +21,13 @@
 - DateTime / DateTime64 → `TIMESTAMP WITH TIME ZONE` (µs; precision > 6 floor-truncated).
 - Passwords never appear in errors, `duckdb_databases().path` or `duckdb_secrets()`.
 - Code style: DuckDB conventions. Tabs, `namespace duckdb`, `unique_ptr`/`make_uniq`, `StringUtil`, and DuckDB exception types (`IOException`, `BinderException`, `InvalidInputException`, `PermissionException`, `NotImplementedException`, `InternalException`, `ConversionException`).
-- Server-dependent tests start with `require-env CLICKHOUSE_TEST_SERVER_AVAILABLE`, so `make test` without a server skips them.
+- Server-dependent tests start with `require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD`, so `make test` without a server skips them.
 - Commits end with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Build & test cheat sheet (used by every task)
@@ -34,16 +40,16 @@ export GEN=ninja
 make release
 # tests that need no server
 ./build/release/test/unittest "test/*"
-# ClickHouse test server (Task 2 onward)
-make clickhouse-up
-CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"
-# a single test file
-CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest test/sql/scan/scalars.test
+# tests against a throw-away ClickHouse container (Task 2 onward): all tests, one file, or a glob
+make smoke
+make smoke ARGS=test/sql/scan/scalars.test
+make smoke ARGS='test/sql/scan/*'
+make smoke SMOKE_BUILD=debug ARGS='test/sql/scan/*'
 ```
 
 Troubleshooting:
 - **vcpkg ports fail under CMake ≥ 4.0** with "Compatibility with CMake < 3.5 has been removed". Add `"-DCMAKE_POLICY_VERSION_MINIMUM=3.5"` to the `OPTIONS` of `vcpkg_cmake_configure` in `vcpkg_ports/clickhouse-cpp/portfile.cmake`, and export `CMAKE_POLICY_VERSION_MINIMUM=3.5` before `make`.
-- **Port 9000 already in use** locally: stop whatever holds it (`lsof -i :9000`). The tests assume 9000 (plain) and 9440 (TLS).
+- **Debugging a failing smoke run**: `CLICKHOUSE_TEST_KEEP=1 make smoke ARGS=…` keeps the container (`clickhouse-scanner-test`) running afterwards; inspect it with `docker exec -it clickhouse-scanner-test clickhouse-client --user duckdb --password duckdb`, then `docker rm -f clickhouse-scanner-test`.
 
 ## File Structure
 
@@ -51,11 +57,11 @@ Troubleshooting:
 .gitmodules                      duckdb, extension-ci-tools, database-connector submodules
 .gitignore
 CMakeLists.txt                   extension target, links clickhouse-cpp + OpenSSL
-Makefile                         extension-ci-tools include + clickhouse-up/down, test-clickhouse targets
+Makefile                         extension-ci-tools include + `smoke` target
 extension_config.cmake           loads clickhouse_scanner (+ icu, json for tests)
 vcpkg.json                       clickhouse-cpp[openssl], openssl
 vcpkg_ports/clickhouse-cpp/      overlay port (adapted from pixonic/duckdb-clickhouse, MIT)
-docker-compose.yml               ClickHouse 25.8 test server, ports 9000 + 9440(TLS)
+scripts/test_with_clickhouse.sh  `make smoke`: throw-away ClickHouse 25.8 container on random ports, fixtures, env vars, tests, cleanup
 scripts/generate_test_certs.sh   self-signed CA + localhost cert → scripts/certs/ (gitignored)
 scripts/clickhouse/tls.xml       server config enabling tcp_port_secure 9440
 scripts/setup_clickhouse.sql     test fixtures (test_db, other_db)
@@ -92,7 +98,7 @@ README.md
 ## Task Order and Dependencies
 
 1. Scaffold. Build links clickhouse-cpp.
-2. ClickHouse test server and fixtures.
+2. `make smoke`: throw-away ClickHouse container, fixtures and test plumbing.
 3. Utils + type parser/mapper + `clickhouse_type_mapping()` (no server).
 4. Connection config, secrets, connection, pool, transaction, storage extension: `ATTACH` works.
 5. Catalog: schemas, tables, columns, clear cache, read-only errors.
@@ -394,17 +400,54 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: ClickHouse test server and fixtures
+### Task 2: `make smoke`: throw-away ClickHouse container and fixtures
+
+This mirrors `make smoke` in duckdb-altertable (`scripts/test_with_mock.sh`). A script starts a disposable container on random localhost ports, waits for it, loads fixtures, exports `CLICKHOUSE_TEST_*` variables for `require-env`, runs the tests and always removes the container. CI runs the same script (Task 10). A GitHub service container can't be used because the TLS config and certificates must be mounted from the checkout.
 
 **Files:**
-- Create: `docker-compose.yml`, `scripts/generate_test_certs.sh`, `scripts/clickhouse/tls.xml`, `scripts/setup_clickhouse.sql`
-- Modify: `Makefile` (append targets)
+- Create: `scripts/test_with_clickhouse.sh`, `scripts/generate_test_certs.sh`, `scripts/clickhouse/tls.xml`, `scripts/setup_clickhouse.sql`
+- Modify: `Makefile` (append the `smoke` target)
+- Test: `test/sql/smoke/environment.test`
 
 **Interfaces:**
-- Produces: a server on `localhost:9000` (plain) and `localhost:9440` (TLS). User `duckdb`, password `duckdb`. CA certificate at `scripts/certs/ca.crt`. Databases `test_db` and `other_db` with the tables listed in Step 3. Make targets `clickhouse-up`, `clickhouse-down`, `test-clickhouse`. Later tests attach with:
-  `ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse)`.
+- Produces:
+  - `make smoke [ARGS=<unittest args>] [SMOKE_BUILD=release|debug]`. With no `ARGS` it runs every test under `test/`.
+  - The environment variables `CLICKHOUSE_TEST_HOST` (`127.0.0.1`), `CLICKHOUSE_TEST_PORT` (mapped native port), `CLICKHOUSE_TEST_TLS_PORT` (mapped TLS port), `CLICKHOUSE_TEST_USER` (`duckdb`), `CLICKHOUSE_TEST_PASSWORD` (`duckdb`) and `CLICKHOUSE_TEST_CA_CERT` (absolute path of the test CA).
+  - Databases `test_db` and `other_db` with the tables in Step 4.
+  - `CLICKHOUSE_TEST_KEEP=1` keeps the container after the run.
+- Every later server test attaches with:
+  `ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse)`.
 
-- [ ] **Step 1: Certificates and TLS config**
+- [ ] **Step 1: Write the failing test**
+
+`test/sql/smoke/environment.test` checks the plumbing only. It needs no extension code beyond Task 1:
+```
+# name: test/sql/smoke/environment.test
+# description: make smoke exports the ClickHouse connection variables
+# group: [smoke]
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_TLS_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require-env CLICKHOUSE_TEST_CA_CERT
+
+query IIII
+SELECT '${CLICKHOUSE_TEST_HOST}', '${CLICKHOUSE_TEST_PORT}'::INTEGER > 0, '${CLICKHOUSE_TEST_TLS_PORT}'::INTEGER > 0, '${CLICKHOUSE_TEST_PORT}' <> '${CLICKHOUSE_TEST_TLS_PORT}';
+----
+127.0.0.1	true	true	true
+```
+
+Run: `./build/release/test/unittest test/sql/smoke/environment.test`
+Expected: the test is **skipped** (`require-env` not satisfied). That is correct for plain `make test`. `make smoke` does not exist yet.
+
+- [ ] **Step 2: Certificates and TLS config**
 
 `scripts/generate_test_certs.sh` (make it executable):
 ```bash
@@ -446,61 +489,130 @@ rm -f server.csr server.ext ca.srl
 </clickhouse>
 ```
 
-`docker-compose.yml`:
-```yaml
-services:
-  clickhouse:
-    image: clickhouse/clickhouse-server:25.8
-    ports:
-      - "9000:9000"
-      - "9440:9440"
-      - "8123:8123"
-    environment:
-      CLICKHOUSE_USER: duckdb
-      CLICKHOUSE_PASSWORD: duckdb
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-    volumes:
-      - ./scripts/clickhouse/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
-      - ./scripts/certs:/etc/clickhouse-server/certs:ro
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--user", "duckdb", "--password", "duckdb", "--query", "SELECT 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 60
-```
+- [ ] **Step 3: The smoke script and Makefile target**
 
-- [ ] **Step 2: Makefile targets**
+`scripts/test_with_clickhouse.sh` (make it executable):
+```bash
+#!/usr/bin/env bash
+# `make smoke`: run the sqllogictests against a throw-away ClickHouse container.
+#
+# Starts clickhouse/clickhouse-server on random localhost ports (native + TLS), loads scripts/setup_clickhouse.sql,
+# exports the CLICKHOUSE_TEST_* variables read by `require-env` in the tests, runs the tests and removes the container
+# on exit, whatever happens. Used unchanged locally and in CI.
+#
+# Usage: scripts/test_with_clickhouse.sh [unittest arguments...]
+#   no arguments  runs every test under test/
+#   arguments     are passed to the unittest binary, e.g. test/sql/scan/scalars.test
+# Environment:
+#   SMOKE_BUILD=release|debug    which build to test (default: release)
+#   CLICKHOUSE_IMAGE             image to run (default: clickhouse/clickhouse-server:25.8)
+#   CLICKHOUSE_TEST_KEEP=1       keep the container after the run, for debugging
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
+
+IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8}"
+CONTAINER_NAME="clickhouse-scanner-test"
+BUILD="${SMOKE_BUILD:-release}"
+UNITTEST="./build/${BUILD}/test/unittest"
+CH_USER="duckdb"
+CH_PASSWORD="duckdb"
+
+if ! command -v docker &>/dev/null; then
+  echo "ERROR: Docker is not installed or not on PATH." >&2
+  exit 1
+fi
+if [[ ! -x "${UNITTEST}" ]]; then
+  echo "ERROR: ${UNITTEST} not found; run 'make ${BUILD}' first." >&2
+  exit 1
+fi
+
+./scripts/generate_test_certs.sh
+
+# remove a leftover container from an earlier run
+docker rm -f "${CONTAINER_NAME}" &>/dev/null || true
+
+echo "==> Starting ${IMAGE} ..."
+docker run -d --name "${CONTAINER_NAME}" \
+  -p "127.0.0.1::9000" \
+  -p "127.0.0.1::9440" \
+  -e CLICKHOUSE_USER="${CH_USER}" \
+  -e CLICKHOUSE_PASSWORD="${CH_PASSWORD}" \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v "${ROOT}/scripts/clickhouse/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro" \
+  -v "${ROOT}/scripts/certs:/etc/clickhouse-server/certs:ro" \
+  --ulimit nofile=262144:262144 \
+  "${IMAGE}" >/dev/null
+
+cleanup() {
+  if [[ "${CLICKHOUSE_TEST_KEEP:-}" == "1" ]]; then
+    echo "==> Keeping container ${CONTAINER_NAME} (CLICKHOUSE_TEST_KEEP=1)"
+  else
+    echo "==> Removing container ${CONTAINER_NAME} ..."
+    docker rm -f "${CONTAINER_NAME}" &>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+ch_client() {
+  docker exec -i "${CONTAINER_NAME}" clickhouse-client --user "${CH_USER}" --password "${CH_PASSWORD}" "$@"
+}
+
+echo "==> Waiting for ClickHouse to accept queries ..."
+ready=0
+for _ in $(seq 1 60); do
+  if ch_client --query "SELECT 1" &>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${ready}" != "1" ]]; then
+  echo "ERROR: ClickHouse did not become ready." >&2
+  docker logs --tail 50 "${CONTAINER_NAME}" >&2 || true
+  exit 1
+fi
+
+echo "==> Loading fixtures ..."
+ch_client --multiquery < scripts/setup_clickhouse.sql
+
+host_port() {
+  docker inspect --format "{{(index (index .NetworkSettings.Ports \"$1/tcp\") 0).HostPort}}" "${CONTAINER_NAME}"
+}
+
+export CLICKHOUSE_TEST_HOST="127.0.0.1"
+export CLICKHOUSE_TEST_PORT="$(host_port 9000)"
+export CLICKHOUSE_TEST_TLS_PORT="$(host_port 9440)"
+export CLICKHOUSE_TEST_USER="${CH_USER}"
+export CLICKHOUSE_TEST_PASSWORD="${CH_PASSWORD}"
+export CLICKHOUSE_TEST_CA_CERT="${ROOT}/scripts/certs/ca.crt"
+
+echo "==> Running ${BUILD} tests against ${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT} (TLS ${CLICKHOUSE_TEST_TLS_PORT}) ..."
+if [[ $# -gt 0 ]]; then
+  "${UNITTEST}" "$@"
+else
+  "${UNITTEST}" "test/*"
+fi
+```
 
 Append to `Makefile`:
 ```make
 
-#### ClickHouse test server
-.PHONY: clickhouse-up clickhouse-down test-clickhouse test-clickhouse-debug
+#### Tests against a throw-away ClickHouse container (see scripts/test_with_clickhouse.sh)
+SMOKE_BUILD ?= release
+ARGS ?=
 
-clickhouse-up:
-	./scripts/generate_test_certs.sh
-	docker compose up -d --wait
-	docker compose exec -T clickhouse clickhouse-client --user duckdb --password duckdb --multiquery < scripts/setup_clickhouse.sql
-
-clickhouse-down:
-	docker compose down -v
-
-test-clickhouse:
-	CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"
-
-test-clickhouse-debug:
-	CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/debug/test/unittest "test/*"
+.PHONY: smoke
+smoke:
+	SMOKE_BUILD=$(SMOKE_BUILD) ./scripts/test_with_clickhouse.sh $(ARGS)
 ```
 
-- [ ] **Step 3: Fixtures**
+- [ ] **Step 4: Fixtures**
 
 `scripts/setup_clickhouse.sql`:
 ```sql
--- Test fixtures for clickhouse_scanner. Loaded by `make clickhouse-up`.
+-- Test fixtures for clickhouse_scanner. Loaded by scripts/test_with_clickhouse.sh (`make smoke`).
 SET enable_time_time64_type = 1;
 
 DROP DATABASE IF EXISTS test_db;
@@ -632,27 +744,36 @@ CREATE TABLE test_db.big (n UInt64, s String) ENGINE = MergeTree ORDER BY n
 AS SELECT number, toString(number) FROM numbers(10000000);
 ```
 
-- [ ] **Step 4: Verify the server and fixtures**
+- [ ] **Step 5: Run the smoke suite and verify the fixtures**
 
 ```bash
-make clickhouse-up
-docker compose exec -T clickhouse clickhouse-client --user duckdb --password duckdb \
+make smoke
+CLICKHOUSE_TEST_KEEP=1 make smoke ARGS=test/sql/smoke/environment.test
+docker exec clickhouse-scanner-test clickhouse-client --user duckdb --password duckdb \
   --query "SELECT count() FROM system.tables WHERE database = 'test_db'"
-docker compose exec -T clickhouse clickhouse-client --user duckdb --password duckdb --secure \
+docker exec clickhouse-scanner-test clickhouse-client --user duckdb --password duckdb --secure \
   --port 9440 --accept-invalid-certificate --query "SELECT 1"
+docker rm -f clickhouse-scanner-test
+docker ps -a --filter name=clickhouse-scanner-test --format '{{.Names}}'
 ```
-Expected: `13`, then `1`. The second command proves TLS on 9440. If `enable_time_time64_type` is rejected, check the image tag is `25.8`.
+Expected:
+- `make smoke`: `All tests passed`, with `environment.test` now actually run instead of skipped, and the log ending with `Removing container`.
+- The kept container reports `13` tables, then `1` over TLS.
+- The final `docker ps` prints nothing.
 
-- [ ] **Step 5: Commit**
+Also check that a failing run still cleans up. Run `make smoke ARGS=does/not/exist.test`: it must exit non-zero, and `docker ps -a --filter name=clickhouse-scanner-test` must be empty afterwards. If `enable_time_time64_type` is rejected, check that the image tag is `25.8`.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add docker-compose.yml scripts Makefile
-git commit -m "test: add ClickHouse docker test server with TLS and fixtures
+git add scripts Makefile test .gitignore
+git commit -m "test: make smoke runs the tests against a throw-away ClickHouse container
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
+
 ### Task 3: Utils, type parser/mapper and `clickhouse_type_mapping()`
 
 **Files:**
@@ -1792,15 +1913,22 @@ Invalid value "snappy" for ClickHouse option "compression"
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
+# the path never contains the password
 query II
-SELECT type, path FROM duckdb_databases() WHERE database_name = 'ch';
+SELECT type, path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch';
 ----
-clickhouse	clickhouse://duckdb@localhost:9000/test_db
+clickhouse	true
 
 query I
 SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch' ORDER BY schema_name;
@@ -1819,33 +1947,33 @@ DETACH ch;
 
 # the storage extension is also reachable under its full name
 statement ok
-ATTACH 'host=localhost user=duckdb password=duckdb database=test_db' AS ch_full (TYPE clickhouse_scanner);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch_full (TYPE clickhouse_scanner);
 
 # the unnamed secret supplies credentials; the URI supplies host, port and database
 statement ok
-CREATE SECRET (TYPE clickhouse, USER 'duckdb', PASSWORD 'duckdb');
+CREATE SECRET (TYPE clickhouse, USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}');
 
 statement ok
-ATTACH 'clickhouse://localhost:9000/other_db' AS ch_uri (TYPE clickhouse);
+ATTACH 'clickhouse://${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/other_db' AS ch_uri (TYPE clickhouse);
 
 query I
-SELECT path FROM duckdb_databases() WHERE database_name = 'ch_uri';
+SELECT path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/other_db' FROM duckdb_databases() WHERE database_name = 'ch_uri';
 ----
-clickhouse://duckdb@localhost:9000/other_db
+true
 
 statement ok
-CREATE SECRET named_secret (TYPE clickhouse, HOST 'localhost', USER 'duckdb', PASSWORD 'duckdb', DATABASE 'test_db');
+CREATE SECRET named_secret (TYPE clickhouse, HOST '${CLICKHOUSE_TEST_HOST}', PORT '${CLICKHOUSE_TEST_PORT}', USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}', DATABASE 'test_db');
 
 statement ok
 ATTACH '' AS ch_secret (TYPE clickhouse, SECRET named_secret);
 
 query I
-SELECT path FROM duckdb_databases() WHERE database_name = 'ch_secret';
+SELECT path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch_secret';
 ----
-clickhouse://duckdb@localhost:9000/test_db
+true
 
 statement ok
-ATTACH 'host=localhost user=duckdb password=duckdb' AS ch_sys (TYPE clickhouse, SHOW_SYSTEM true);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_sys (TYPE clickhouse, SHOW_SYSTEM true);
 
 query I
 SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_sys' AND schema_name = 'system';
@@ -1853,9 +1981,9 @@ SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_sys' AND schema_
 1
 
 statement error
-ATTACH 'host=localhost port=9000 user=duckdb password=wrong' AS ch_bad (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=wrong' AS ch_bad (TYPE clickhouse);
 ----
-Failed to connect to ClickHouse at localhost:9000
+Failed to connect to ClickHouse at
 ```
 
 `test/sql/attach/tls.test`:
@@ -1866,34 +1994,44 @@ Failed to connect to ClickHouse at localhost:9000
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
 
+require-env CLICKHOUSE_TEST_TLS_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require-env CLICKHOUSE_TEST_CA_CERT
+
+# the mapped TLS port is random, so secure=true must be explicit
 statement ok
-ATTACH 'host=localhost port=9440 user=duckdb password=duckdb database=test_db ca_cert=scripts/certs/ca.crt' AS ch_tls (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_TLS_PORT} secure=true user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db ca_cert=${CLICKHOUSE_TEST_CA_CERT}' AS ch_tls (TYPE clickhouse);
 
 query I
-SELECT path FROM duckdb_databases() WHERE database_name = 'ch_tls';
+SELECT path = 'clickhouses://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_TLS_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch_tls';
 ----
-clickhouses://duckdb@localhost:9440/test_db
+true
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_tls' AND schema_name = 'test_db';
+SELECT count(*) FROM ch_tls.test_db.t1;
 ----
-1
+3
 
 # the self-signed test certificate is rejected without the test CA
 statement error
-ATTACH 'host=localhost port=9440 user=duckdb password=duckdb' AS ch_tls_bad (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_TLS_PORT} secure=true user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_tls_bad (TYPE clickhouse);
 ----
-Failed to connect to ClickHouse at localhost:9440
+Failed to connect to ClickHouse at
 
 statement ok
-ATTACH 'clickhouses://duckdb:duckdb@localhost:9440/test_db?skip_verify=true' AS ch_tls_skip (TYPE clickhouse);
+ATTACH 'clickhouses://${CLICKHOUSE_TEST_USER}:${CLICKHOUSE_TEST_PASSWORD}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_TLS_PORT}/test_db?skip_verify=true' AS ch_tls_skip (TYPE clickhouse);
 ```
+Note: `SELECT count(*) FROM ch_tls.test_db.t1` only works from Task 6 onward. In Task 4, replace it with `SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_tls' AND schema_name = 'test_db'` (expected `1`), and switch to the scan in Task 6.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `make release && make clickhouse-up && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/sql/attach/*"`
+Run: `make release && make smoke ARGS='test/sql/attach/*'`
 Expected: FAIL. The first error is about the unknown storage type `clickhouse` / the missing secret type.
 
 - [ ] **Step 3: Connection config**
@@ -3396,8 +3534,8 @@ set(ALL_OBJECT_FILES
 
 - [ ] **Step 10: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
-Expected: `All tests passed`. Also run `./build/release/test/unittest "test/*"` without the env var: the server tests are skipped and the rest pass.
+Run: `make release && make smoke`
+Expected: `All tests passed`. Also run `./build/release/test/unittest "test/*"` directly: the server tests are skipped and the rest pass.
 
 - [ ] **Step 11: Commit**
 
@@ -3434,10 +3572,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 query I
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'test_db' ORDER BY table_name;
@@ -3484,10 +3628,16 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name 
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 query III
 SELECT column_name, data_type, is_nullable FROM duckdb_columns() WHERE database_name = 'ch' AND table_name = 'scalars' ORDER BY column_index;
@@ -3583,10 +3733,16 @@ name	VARCHAR
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 statement error
 CREATE TABLE ch.test_db.new_table (i INTEGER);
@@ -3611,7 +3767,7 @@ clickhouse_scanner is read-only
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/sql/catalog/*"`
+Run: `make release && make smoke ARGS='test/sql/catalog/*'`
 Expected: FAIL. `duckdb_tables()` returns no ClickHouse rows and `clickhouse_clear_cache` does not exist.
 
 - [ ] **Step 3: Table entry**
@@ -3903,7 +4059,7 @@ Register it in `src/clickhouse_scanner_extension.cpp`. Add `#include "storage/cl
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
+Run: `make release && make smoke`
 Expected: `All tests passed`. If `ALTER TABLE` fails with a DuckDB binder message before reaching `Alter()`, accept that message in the test, provided it does not modify ClickHouse. If `estimated_size` is `NULL`, check the `TableStorageInfo` field name.
 
 - [ ] **Step 8: Commit**
@@ -3939,7 +4095,13 @@ Every server test below starts with this header. It is shown once here and writt
 ```
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 require icu
 
@@ -3947,7 +4109,7 @@ statement ok
 SET TimeZone = 'UTC';
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 ```
 
 `test/sql/scan/basic.test` (the header is preceded by `# name: test/sql/scan/basic.test`, `# description: basic scans, projections, parallelism and early termination`, `# group: [scan]`):
@@ -4180,7 +4342,7 @@ Note on expectations: they are written as DuckDB renders values in sqllogictest.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/sql/scan/*"`
+Run: `make release && make smoke ARGS='test/sql/scan/*'`
 Expected: FAIL with `Scanning ClickHouse tables is not implemented yet`.
 
 - [ ] **Step 3: Conversion**
@@ -4980,8 +5142,8 @@ Add `clickhouse_conversion.cpp` and `clickhouse_scanner.cpp` to `clickhouse_ext`
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
-Expected: `All tests passed`. Then run the debug build: `make debug && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/debug/test/unittest "test/sql/scan/*"`. Debug builds run DuckDB's vector verification and catch malformed vectors (for example list sizes or validity).
+Run: `make release && make smoke`
+Expected: `All tests passed`. Then run the debug build: `make debug && make smoke SMOKE_BUILD=debug ARGS='test/sql/scan/*'`. Debug builds run DuckDB's vector verification and catch malformed vectors (for example list sizes or validity).
 If the server rejects reads of `Time`/`Time64` columns because they are experimental in 25.8, add `settings=enable_time_time64_type=1` to the ATTACH string in `times.test` and `errors.test`, rather than to the extension.
 DuckDB's binder may reject `UPDATE`/`DELETE` with its own message before `PlanUpdate`/`PlanDelete` runs. If so, accept that message in `read_only.test`. The contract is only that no write reaches ClickHouse, and the final `count(*) = 3` checks that.
 
@@ -5020,7 +5182,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 require icu
 
@@ -5028,7 +5196,7 @@ statement ok
 SET TimeZone = 'UTC';
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 # integers
 query II
@@ -5184,7 +5352,7 @@ SELECT id, name FROM ch.test_db.t1 WHERE id = 2;
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest test/sql/pushdown/filters.test`
+Run: `make release && make smoke ARGS=test/sql/pushdown/filters.test`
 Expected: FAIL on the first EXPLAIN. The results are correct because DuckDB filters locally, but the generated query has no `WHERE`. The `SET ch_filter_pushdown` statement also fails because the setting does not exist yet.
 
 - [ ] **Step 3: Implement the translation**
@@ -5442,7 +5610,7 @@ Add `clickhouse_filter_pushdown.cpp` to `clickhouse_ext` in `src/CMakeLists.txt`
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
+Run: `make release && make smoke`
 Expected: `All tests passed`.
 If an EXPLAIN regex fails but the result queries pass, print the plan with `./build/release/duckdb -unsigned` and compare. DuckDB may express the same filter differently, for example `IN` instead of `OR`. Loosen the regex only when the generated SQL is still correct.
 
@@ -5478,10 +5646,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 query I
 SELECT n FROM ch.test_db.big ORDER BY n DESC LIMIT 3;
@@ -5583,7 +5757,7 @@ analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big`".*
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest test/sql/pushdown/limit.test`
+Run: `make release && make smoke ARGS=test/sql/pushdown/limit.test`
 Expected: FAIL on the first EXPLAIN (no `ORDER BY` in the generated query).
 
 - [ ] **Step 3: Implement the optimizer**
@@ -5779,7 +5953,7 @@ Add `clickhouse_optimizer.cpp` to `clickhouse_ext_storage` in `src/storage/CMake
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
+Run: `make release && make smoke`
 Expected: `All tests passed`. `test/sql/scan/basic.test` still covers early termination and cancellation, because its loop filters on an expression and so its LIMIT is not pushed.
 
 - [ ] **Step 6: Commit**
@@ -5816,10 +5990,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 statement ok
-ATTACH 'host=localhost port=9000 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 query II
 SELECT * FROM clickhouse_query('ch', 'SELECT number AS n, toString(number) AS s FROM numbers(3)');
@@ -5891,37 +6071,43 @@ Parameters to clickhouse_query cannot be NULL
 
 require clickhouse_scanner
 
-require-env CLICKHOUSE_TEST_SERVER_AVAILABLE
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
 
 query II
-SELECT id, name FROM clickhouse_scan('host=localhost port=9000 user=duckdb password=duckdb', 'test_db', 't1') ORDER BY id;
+SELECT id, name FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 't1') ORDER BY id;
 ----
 1	Alice
 2	Bob
 3	Charlie
 
 query I
-SELECT name FROM clickhouse_scan('host=localhost user=duckdb password=duckdb', 'test_db', 't1') WHERE id = 3;
+SELECT name FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 't1') WHERE id = 3;
 ----
 Charlie
 
 statement ok
-CREATE SECRET scan_secret (TYPE clickhouse, USER 'duckdb', PASSWORD 'duckdb');
+CREATE SECRET scan_secret (TYPE clickhouse, USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}');
 
 query I
-SELECT count(*) FROM clickhouse_scan('host=localhost', 'test_db', 'big', secret := 'scan_secret');
+SELECT count(*) FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT}', 'test_db', 'big', secret := 'scan_secret');
 ----
 10000000
 
 statement error
-SELECT * FROM clickhouse_scan('host=localhost user=duckdb password=duckdb', 'test_db', 'nope');
+SELECT * FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 'nope');
 ----
 ClickHouse table "test_db"."nope" not found
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/sql/query/*"`
+Run: `make release && make smoke ARGS='test/sql/query/*'`
 Expected: FAIL with `Table Function with name clickhouse_query does not exist!`
 
 - [ ] **Step 3: `clickhouse_scan` bind**
@@ -6086,7 +6272,7 @@ Add `clickhouse_query.cpp` to `clickhouse_ext` in `src/CMakeLists.txt`.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `make release && CLICKHOUSE_TEST_SERVER_AVAILABLE=1 ./build/release/test/unittest "test/*"`
+Run: `make release && make smoke`
 Expected: `All tests passed`.
 
 - [ ] **Step 7: Commit**
@@ -6106,7 +6292,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Create: `.github/workflows/MainDistributionPipeline.yml`, `.github/workflows/IntegrationTests.yml`, `README.md`, `LICENSE`
 
 **Interfaces:**
-- Consumes: `make release`, `make clickhouse-up`, `make test-clickhouse` (Task 2).
+- Consumes: `make release`, `make smoke` (Task 2).
 
 - [ ] **Step 1: Distribution pipeline** (builds every community platform; server tests skip themselves)
 
@@ -6180,11 +6366,10 @@ jobs:
       - name: Build extension
         run: make release
 
-      - name: Start ClickHouse
-        run: make clickhouse-up
-
-      - name: Run tests
-        run: make test-clickhouse
+      # same entry point as locally; not a service container, because the TLS config and test
+      # certificates have to be mounted from the checkout
+      - name: Smoke tests against ClickHouse
+        run: make smoke
 ```
 
 - [ ] **Step 3: README**
@@ -6290,9 +6475,9 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 git submodule update --init --recursive
 export VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja
 make release
-make clickhouse-up        # ClickHouse 25.8 in Docker on ports 9000 and 9440 (TLS), with test fixtures
-make test-clickhouse      # all tests; `make test` runs only the tests that need no server
-make clickhouse-down
+make test                                  # tests that need no server
+make smoke                                 # all tests against a throw-away ClickHouse 25.8 container (Docker)
+make smoke ARGS=test/sql/scan/scalars.test # a single test file
 ```
 
 The clickhouse-cpp vcpkg port is adapted from [pixonic/duckdb-clickhouse](https://github.com/pixonic/duckdb-clickhouse)
@@ -6309,7 +6494,7 @@ MIT
 
 ```bash
 python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" .github/workflows/*.yml
-make release && make test && make test-clickhouse
+make release && make test && make smoke
 ```
 Expected: no YAML error, and `All tests passed` twice.
 
@@ -6326,5 +6511,5 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ## Self-review checklist (for the plan author; already applied)
 
-- Spec coverage. ATTACH/secrets/URI/TLS: Task 4. Catalog mapping, system databases, clear cache, read-only: Tasks 4–6. Type mapping: Tasks 3, 5, 6. Parallel pull scan and cancellation: Task 6. Filter pushdown: Task 7. LIMIT / TOP-N: Task 8. `clickhouse_query` and `clickhouse_scan`: Task 9. Settings: Tasks 4, 7, 8. Docker, TLS fixtures and CI: Tasks 2 and 10. README: Task 10.
+- Spec coverage. ATTACH/secrets/URI/TLS: Task 4. Catalog mapping, system databases, clear cache, read-only: Tasks 4–6. Type mapping: Tasks 3, 5, 6. Parallel pull scan and cancellation: Task 6. Filter pushdown: Task 7. LIMIT / TOP-N: Task 8. `clickhouse_query` and `clickhouse_scan`: Task 9. Settings: Tasks 4, 7, 8. `make smoke` (throw-away container, TLS, fixtures) and CI: Tasks 2 and 10. README: Task 10.
 - Deliberately out of scope (spec section 7): writes, aggregate pushdown, multi-stream scans, HTTP transport, WASM, `clickhouse_configure_pool`.
