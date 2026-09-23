@@ -209,6 +209,26 @@ Strings that are not valid UTF-8 raise `InvalidInputException` naming the column
 - **CI:** extension-ci-tools `_extension_distribution.yml` for all community platforms except `wasm_*`; an additional Linux job starts ClickHouse as a service container, runs the setup script and `make test`.
 - Community-extensions `description.yml` submission is a follow-up after v1, not part of this repo's v1 deliverable.
 
-## 6. Out of scope for v1
+## 6. Revisions made while planning (2026-09-23)
+
+API research against the exact versions we pin changed a few details. These supersede the sections above:
+
+1. **Pinned versions.** DuckDB `v1.5.5` (`d8cdaa33`), extension-ci-tools `72e76e99`, database-connector `0a8505f7` (its `v1.5-variegata` branch) — the same pins as duckdb-postgres' `v1.5-variegata` branch. duckdb-postgres `main` targets DuckDB 2.0-dev and is not a valid reference for APIs.
+2. **database-connector on v1.5 only provides the connection pool** (plus attached-catalog lookup and a transaction-manager template). It has no filter pushdown, query writer, ORDER BY/LIMIT optimizer or `configure_pool` function. We therefore:
+   - implement our own filter pushdown (`clickhouse_filter_pushdown.cpp`) and optimizer (`clickhouse_optimizer.cpp`);
+   - drop `clickhouse_configure_pool()` from v1; pool knobs are the `ch_pool_*` settings, applied at ATTACH time;
+   - write our own trivial transaction manager (the database-connector template issues `CHECKPOINT` on the remote side).
+3. **No producer thread.** clickhouse-cpp 2.6.2 has a pull API (`BeginSelect` / `NextBlock` / `Cancel`). DuckDB workers pull blocks under a mutex and convert them in parallel. `ch_block_queue_size` is removed.
+4. **LowCardinality** columns are decoded by asking the server to send plain columns (query setting `low_cardinality_allow_in_native_format = 0`). No clickhouse-cpp LowCardinality code or patch is needed.
+5. **Map(K, V)** is read as `arrayZip(mapKeys(c), mapValues(c))`, so on the wire it is `Array(Tuple(K, V))`, which has the same layout as DuckDB `MAP`.
+6. **ORDER BY pushdown** is limited to `ORDER BY … LIMIT` (DuckDB `TOP_N`) and plain `LIMIT/OFFSET`, both gated by `ch_order_pushdown`. It is only pushed when every order key is a plain column that supports pushdown and every table filter on the scan was pushed too. A pushed ORDER BY forces a single-threaded scan.
+7. **Filter pushdown safety.** A per-column `supports_pushdown_type` callback makes DuckDB evaluate filters itself on columns we cannot translate exactly: floats (NaN semantics differ), UUID (ordering differs), FixedString, Time, nested types and every column with a read expression. Pushable: Bool, (U)Int8–128, Decimal ≤ 38, String, Date/Date32, DateTime/DateTime64, Enum. Decimal constants are sent as `toDecimal128('<v>', <scale>)`.
+8. **Settings.** `ch_compression` becomes the connection option `compression`. The final list is `ch_debug_show_queries`, `ch_filter_pushdown`, `ch_order_pushdown`, `ch_connect_timeout_ms`, `ch_receive_timeout_ms`, `ch_pool_max_connections`, `ch_pool_acquire_mode`, `ch_pool_wait_timeout_millis`, `ch_pool_idle_timeout_millis`.
+9. **TLS CA discovery.** vcpkg's OpenSSL does not know the OS trust store. When `secure` is on and no `ca_cert` is given, we probe the usual CA bundle paths (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, …). On Windows, users must pass `ca_cert`.
+10. **EXPLAIN.** The generated ClickHouse SQL is shown by `EXPLAIN ANALYZE` (`dynamic_to_string`), because filters are only known at scan initialisation. Plain `EXPLAIN` shows the table and the pushed ORDER BY/LIMIT.
+11. **Test-only helper.** A `clickhouse_type_mapping(type)` table function exposes the type mapper, so type mapping can be tested without a server. It is also useful for users debugging a mapping.
+12. **ATTACH connects eagerly** (one pooled connection) so bad hosts or credentials fail at ATTACH.
+
+## 7. Out of scope for v1
 
 INSERT/UPDATE/DELETE/DDL, `clickhouse_execute`, aggregate pushdown, multi-stream scans, HTTP/Arrow transport, DuckDB-WASM, cluster awareness, ClickHouse Native file reader, `GEOMETRY` type mapping.
