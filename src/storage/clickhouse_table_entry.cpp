@@ -18,8 +18,14 @@ unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &co
 
 TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<ClickhouseScanBindData>();
-	result->pool = catalog.Cast<ClickhouseCatalog>().GetConnectionPoolPtr();
+	auto &clickhouse_catalog = catalog.Cast<ClickhouseCatalog>();
+	result->pool = clickhouse_catalog.GetConnectionPoolPtr();
 	result->table_entry = this;
+	// the bound plan may outlive the catalog's own reference to this entry (clickhouse_clear_cache()); keep
+	// the schema that transitively owns it alive for as long as the plan holds table_entry. Null only if
+	// another connection cleared the cache between the catalog lookup that found this entry and this call,
+	// a window in which `this` is being freed underneath us either way.
+	result->lifetime = clickhouse_catalog.GetSchemaEntryOwner(schema.name);
 	result->database = schema.name;
 	result->table = name;
 	result->columns = clickhouse_columns;

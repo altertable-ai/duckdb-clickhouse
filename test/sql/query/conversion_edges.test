@@ -22,7 +22,7 @@ SET TimeZone = 'UTC';
 statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
-# --- negative sub-second DateTime64: precision > 6 floors toward -infinity, not toward zero (fix-round-1 item 2) ---
+# --- negative sub-second DateTime64: precision > 6 floors toward -infinity, not toward zero ---
 # 1969-12-31 23:59:59.9999999 is 1 tick before the epoch at precision 7 (1e-7s); scaling 7 -> 6 floors -1/10 to
 # -1 (not 0), i.e. one microsecond before the epoch: 1969-12-31 23:59:59.999999, not 1970-01-01 00:00:00.000000.
 query I

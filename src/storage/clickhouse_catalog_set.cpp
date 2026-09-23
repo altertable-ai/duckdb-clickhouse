@@ -38,6 +38,15 @@ optional_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntry(ClientContext &context
 	return nullptr;
 }
 
+shared_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntryOwner(const string &name) {
+	lock_guard<mutex> guard(entry_lock);
+	auto entry = entries.find(name);
+	if (entry == entries.end()) {
+		return nullptr;
+	}
+	return entry->second;
+}
+
 void ClickhouseCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	TryLoadEntries(context);
 	vector<shared_ptr<CatalogEntry>> snapshot;
@@ -53,11 +62,8 @@ void ClickhouseCatalogSet::Scan(ClientContext &context, const std::function<void
 void ClickhouseCatalogSet::ClearEntries() {
 	lock_guard<mutex> load_guard(load_lock);
 	lock_guard<mutex> guard(entry_lock);
-	// move rather than drop: a bound query on another connection may still hold a raw CatalogEntry*
-	// returned by an earlier GetEntry() call, so the shared_ptr keeping it alive must not be released here
-	for (auto &entry : ordered_entries) {
-		retired.push_back(std::move(entry));
-	}
+	// releasing the last reference to an entry here is safe: everything that keeps a raw pointer into one
+	// past the clear owns it through GetEntryOwner() (see ClickhouseScanBindData::lifetime)
 	entries.clear();
 	ordered_entries.clear();
 	is_loaded = false;

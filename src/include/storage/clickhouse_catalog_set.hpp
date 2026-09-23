@@ -18,6 +18,11 @@ public:
 
 	//! Exact (case-sensitive) match first, then the first case-insensitive match
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const string &name);
+	//! The shared_ptr that owns the currently cached entry named `name`, for a caller that has to keep it
+	//! alive past a ClearEntries() (see ClickhouseScanBindData::lifetime). Exact match only, and never
+	//! loads: the caller already holds the entry it is asking about. Null if the cache was cleared in the
+	//! meantime.
+	shared_ptr<CatalogEntry> GetEntryOwner(const string &name);
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
 	//! Drops the cache; the next access reloads from ClickHouse
 	void ClearEntries();
@@ -36,10 +41,6 @@ private:
 	bool is_loaded = false;
 	vector<shared_ptr<CatalogEntry>> ordered_entries;
 	unordered_map<string, shared_ptr<CatalogEntry>> entries;
-	//! Entries dropped by ClearEntries(): GetEntry() returns a raw pointer, so a bound query on another
-	//! connection may still be holding one when clickhouse_clear_cache() runs here. Kept alive for the
-	//! lifetime of the catalog set instead of letting the last shared_ptr go out of scope.
-	vector<shared_ptr<CatalogEntry>> retired;
 };
 
 } // namespace duckdb

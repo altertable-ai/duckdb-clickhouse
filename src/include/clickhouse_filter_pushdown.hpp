@@ -14,9 +14,9 @@ public:
 	//! not TableFunctionInitInput::filters directly: the latter is that same static set merged, at scan-init
 	//! time, with whatever a join's or TopN's runtime "dynamic" filter mechanism has attached to the scan by
 	//! then, which can add a filter indistinguishable by type from a real predicate but meant only as a pruning
-	//! hint, never required for correctness (see task-8 fix round 1) -- translating it here as if it were makes
-	//! ClickHouse apply it eagerly, before whatever operator (the join, or a LIMIT above it) is supposed to see
-	//! the unfiltered rows first.
+	//! hint, never required for correctness -- translating it here as if it were makes ClickHouse apply it
+	//! eagerly, before whatever operator (the join, or a LIMIT above it) is supposed to see the unfiltered rows
+	//! first.
 	static string TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
 	                               const vector<ClickhouseColumnInfo> &columns);
 	//! Translates one filter on `column`. Returns "" for a filter that must not become a ClickHouse predicate:

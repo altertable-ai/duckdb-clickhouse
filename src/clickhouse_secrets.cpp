@@ -39,10 +39,10 @@ unique_ptr<SecretEntry> ClickhouseSecrets::GetSecretEntry(ClientContext &context
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto name = secret_name.empty() ? string(DEFAULT_SECRET_NAME) : secret_name;
+	// the default (empty) storage searches every registered storage, including local_file when persistent
+	// secrets are enabled; naming a storage here instead would throw "Unknown secret storage found" under
+	// allow_persistent_secrets=false, where local_file is never registered
 	auto entry = secret_manager.GetSecretByName(transaction, name);
-	if (!entry) {
-		entry = secret_manager.GetSecretByName(transaction, name, "local_file");
-	}
 	if (!entry) {
 		if (!secret_name.empty()) {
 			throw BinderException("Secret with name \"%s\" not found", secret_name);

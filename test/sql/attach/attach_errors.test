@@ -62,7 +62,7 @@ ATTACH 'host=127.0.0.1 port=1' AS ch (TYPE clickhouse);
 ----
 Failed to connect to ClickHouse at 127.0.0.1:1
 
-# --- fix round 1: passwords must never appear in URI parse errors (finding 1) ---
+# --- passwords must never appear in URI parse errors ---
 
 # a malformed IPv6 URI with credentials must not echo the password
 statement error
@@ -83,7 +83,7 @@ ATTACH 'clickhouse://127.0.0.1:1/db?password:hunter2' AS ch_leak3 (TYPE clickhou
 ----
 <!REGEX>:.*hunter2.*
 
-# --- fix round 1: user settings can no longer override the LowCardinality guard (finding 3) ---
+# --- user settings cannot override the LowCardinality guard ---
 
 statement error
 ATTACH 'host=localhost settings=low_cardinality_allow_in_native_format=1' AS ch_lc (TYPE clickhouse);

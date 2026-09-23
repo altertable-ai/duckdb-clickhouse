@@ -20,9 +20,9 @@ ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHO
 # not through table_filters/OPTIONAL_FILTER, but a separate, unwrapped ConstantFilter DuckDB attaches to
 # LogicalGet::dynamic_filters once the join's build phase resolves (physical_hash_join.cpp); it is never
 # required for correctness (the join itself still checks the real condition). Applying it as a hard ClickHouse
-# WHERE would filter before ORDER BY/LIMIT ran, changing which rows the top 3 even are -- see task-8 fix round
-# 1 (ClickhouseInitGlobal now sources filters from PhysicalTableScan::table_filters, before that merge, instead
-# of TableFunctionInitInput::filters). The true top 3 of `big` are 0, 1, 2, so joining against 5000000 must
+# WHERE would filter before ORDER BY/LIMIT ran, changing which rows the top 3 even are, which is why
+# ClickhouseInitGlobal sources filters from PhysicalTableScan::table_filters, before that merge, instead of
+# TableFunctionInitInput::filters. The true top 3 of `big` are 0, 1, 2, so joining against 5000000 must
 # return no rows, regardless of whether the ORDER BY ... LIMIT itself is pushed.
 query I
 SELECT a.n FROM (SELECT n FROM ch.test_db.big ORDER BY n LIMIT 3) a JOIN (VALUES (5000000::UBIGINT)) v(x) ON a.n = v.x;

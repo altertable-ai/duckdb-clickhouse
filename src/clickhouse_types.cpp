@@ -457,10 +457,10 @@ bool ClickhouseTypes::SupportsPushdown(const ClickhouseTypeNode &node) {
 		return width <= 38;
 	}
 	if (type.name == "DateTime64") {
-		// global-context.md: "precision > 6 floor-truncated" on read. A pushed comparison would be evaluated
-		// by ClickHouse at the column's own (higher) precision, matching/excluding rows differently than
-		// DuckDB's own (truncated, microsecond) value would -- see fix-round-1 item 2. DateTime64() without an
-		// explicit precision defaults to 3 in ClickHouse, well within range.
+		// a precision above 6 is floor-truncated to DuckDB's microseconds on read, so a pushed comparison
+		// would be evaluated by ClickHouse at the column's own (higher) precision, matching/excluding rows
+		// differently than DuckDB's own truncated value would. DateTime64() without an explicit precision
+		// defaults to 3 in ClickHouse, well within range.
 		return ParseIntegerLiteral(type, 0, 3) <= 6;
 	}
 	return PUSHDOWN_TYPES.find(type.name) != PUSHDOWN_TYPES.end();

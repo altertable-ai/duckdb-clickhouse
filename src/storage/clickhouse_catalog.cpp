@@ -26,6 +26,10 @@ void ClickhouseCatalog::ClearCache() {
 	schemas.ClearEntries();
 }
 
+shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &name) {
+	return schemas.GetEntryOwner(name);
+}
+
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	ClickhouseUtils::ThrowReadOnly();
 }

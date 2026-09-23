@@ -45,7 +45,7 @@ analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `id` FROM `test_db`.`t1`".*
 # not pushed: DuckDB pushes a non-dense OR/IN as an OPTIONAL_FILTER (a zone-map pruning hint, not required
 # for correctness) and keeps the real predicate as a Filter operator above the scan -- pushing the optional
 # copy into ClickHouse too would be redundant at best, and would return wrong rows if a LIMIT above the scan
-# were ever pushed alongside it (see task-8 fix round 1)
+# were ever pushed alongside it
 query I
 SELECT id FROM ch.test_db.t1 WHERE name IN ('Alice', 'Charlie') ORDER BY id;
 ----

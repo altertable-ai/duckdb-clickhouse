@@ -42,7 +42,7 @@ static string TransformComparison(ExpressionType type) {
 //! ClickHouse itself would not. [1900-01-01, 2299-12-31] is ClickHouse's own Date32 range -- the widest either
 //! Date or Date32 (whichever the filtered column actually is) can ever store, so an in-range check here is safe
 //! regardless of which of the two the column turns out to be (Date's own range, 1970-01-01..2149-06-06, is a
-//! subset of it). See fix-round-1 item 3.
+//! subset of it).
 static bool DateInPushdownRange(date_t date) {
 	static const date_t MIN_PUSHDOWN_DATE = Date::FromDate(1900, 1, 1);
 	static const date_t MAX_PUSHDOWN_DATE = Date::FromDate(2299, 12, 31);
@@ -108,7 +108,7 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 //! for Date/Date32 -- outside ClickHouse's representable range): either the comparison can never be true for any
 //! row (folds to a predicate that is false whether or not column itself is NULL, matching DuckDB's own
 //! NULL-excluding WHERE semantics either way) or it is true for every non-NULL row (folds to `column IS NOT
-//! NULL`). See fix-round-1 items 3 and 7.
+//! NULL`).
 static string FoldOutOfBoundsComparison(const string &column, ExpressionType comparison_type,
                                         bool value_is_below_range) {
 	bool always_true_when_not_null;
@@ -196,11 +196,16 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 			try {
 				values.push_back(TransformConstant(value));
 			} catch (NotImplementedException &) {
-				// this value can never equal any value the column could hold (currently: an out-of-range or
-				// infinite Date -- see TransformConstant) -- omit it from the list instead of mistranslating
-				// it or failing the whole query; supports_pushdown_type already guarantees every value here
-				// shares the column's (translatable) type, so this is never a "some type isn't handled at all"
-				// gap in disguise
+				// TransformConstant refuses a value of a type it otherwise translates in exactly two cases:
+				// a DATE outside the range toDate32 represents exactly, and an infinite DATE or
+				// TIMESTAMP_TZ. Such a value can never equal any value the column could hold, so dropping
+				// it from the list is exact. A refusal for any other type means the type is not translatable
+				// at all, which would make dropping it silently wrong -- rethrow and let the whole filter
+				// stay with DuckDB.
+				auto type_id = value.type().id();
+				if (type_id != LogicalTypeId::DATE && type_id != LogicalTypeId::TIMESTAMP_TZ) {
+					throw;
+				}
 			}
 		}
 		if (values.empty()) {
@@ -239,8 +244,9 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		// "executing filter is not required for query correctness" (table_filter.hpp) -- DuckDB keeps enforcing
 		// the real predicate itself wherever it needs to (above a join, or above the LIMIT/ORDER BY this filter
 		// was pushed alongside), so it must never become a ClickHouse predicate: doing so could exclude rows
-		// before that real operator ever sees them (see task-8 fix round 1 for the join+LIMIT reproduction).
-		// Never translate the wrapped filter, regardless of whether it is itself translatable.
+		// before that real operator ever sees them (a join whose build side resolves to one value, feeding a
+		// LIMIT, is the shape that reproduces it). Never translate the wrapped filter, regardless of whether
+		// it is itself translatable.
 		return string();
 	case TableFilterType::DYNAMIC_FILTER:
 	case TableFilterType::BLOOM_FILTER:

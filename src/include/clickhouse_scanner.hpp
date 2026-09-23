@@ -16,6 +16,12 @@ struct ClickhouseScanBindData : public TableFunctionData {
 	//! A raw pointer (not optional_ptr) so it stays dereferenceable to a non-const TableCatalogEntry&
 	//! even through the const bind data reference get_bind_info receives.
 	TableCatalogEntry *table_entry = nullptr;
+	//! Keeps table_entry alive for as long as this bind data does: the schema entry it belongs to, which
+	//! owns the table set, which owns table_entry. clickhouse_clear_cache() drops the catalog's own
+	//! reference to the schema, so without this one a plan bound before the clear (a PREPARE, a view, a
+	//! cached plan) would be left with a dangling table_entry. Null for clickhouse_scan() /
+	//! clickhouse_query(), which have no catalog entry to begin with.
+	shared_ptr<CatalogEntry> lifetime;
 	//! Scanned table (attached tables and clickhouse_scan)
 	string database;
 	string table;

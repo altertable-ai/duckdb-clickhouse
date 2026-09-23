@@ -34,6 +34,10 @@ public:
 	}
 	//! Forgets all cached databases, tables and columns
 	void ClearCache();
+	//! The shared_ptr owning the cached schema entry for the ClickHouse database `name`; null once the
+	//! cache has been cleared. Lets a bound scan keep its schema -- and therefore the table entry that
+	//! schema's table set owns -- alive past a ClearCache() (see ClickhouseScanBindData::lifetime).
+	shared_ptr<CatalogEntry> GetSchemaEntryOwner(const string &name);
 
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {

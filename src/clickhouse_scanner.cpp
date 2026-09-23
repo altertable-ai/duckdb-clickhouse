@@ -12,6 +12,7 @@
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -31,6 +32,7 @@ unique_ptr<FunctionData> ClickhouseScanBindData::Copy() const {
 	auto result = make_uniq<ClickhouseScanBindData>();
 	result->pool = pool;
 	result->table_entry = table_entry;
+	result->lifetime = lifetime;
 	result->database = database;
 	result->table = table;
 	result->query = query;
@@ -96,8 +98,7 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 			// row id / empty projection (e.g. count(*)): ClickHouse tables have no row identifier, so a real
 			// (explicit `SELECT rowid`) or synthetic (count(*)'s "any column" placeholder) reference to it
 			// always reads as NULL -- `WHERE rowid = ...` then consistently matches nothing rather than
-			// crashing (see ClickhouseGetVirtualColumns / fix-round-1 item 6), and only the row count matters
-			// for count(*).
+			// crashing (see ClickhouseGetVirtualColumns), and only the row count matters for count(*).
 			select_list.push_back("NULL");
 			continue;
 		}
@@ -119,7 +120,9 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 		source = ClickhouseUtils::QuoteIdentifier(bind_data.database) + "." +
 		         ClickhouseUtils::QuoteIdentifier(bind_data.table);
 	} else {
-		source = "(" + bind_data.query + ")";
+		// newlines, not just parentheses: a trailing line comment in the user's query would otherwise
+		// comment out the closing paren (see also ClickhouseQueryBind's DESCRIBE)
+		source = "(\n" + bind_data.query + "\n)";
 	}
 	auto sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + source;
 	auto where_clause = ClickhouseFilterPushdown::TransformFilters(column_ids, filters, bind_data.columns);
@@ -153,9 +156,9 @@ bool ClickhouseScanFunction::IsClickhouseScan(const string &function_name) {
 //! build side resolves to a single distinct value), populated only as execution proceeds, so a filter arriving
 //! only through it can be indistinguishable by type from a real predicate despite never being required for
 //! correctness. Applying it inside ClickHouse could run it before an operator above the scan (the join, or a
-//! LIMIT/TOP_N) is supposed to see the unfiltered rows -- see task-8 fix round 1. input.op (set by
-//! TableScanGlobalSourceState to the PhysicalTableScan itself) is always populated in practice; input.filters
-//! is used only as a defensive fallback so a filter DuckDB expects enforced is never silently dropped.
+//! LIMIT/TOP_N) is supposed to see the unfiltered rows. input.op (set by TableScanGlobalSourceState to the
+//! PhysicalTableScan itself) is always populated in practice; input.filters is used only as a defensive
+//! fallback so a filter DuckDB expects enforced is never silently dropped.
 static optional_ptr<TableFilterSet> StaticScanFilters(TableFunctionInitInput &input) {
 	if (input.op) {
 		return input.op->Cast<PhysicalTableScan>().table_filters.get();
@@ -445,6 +448,11 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 //! private connection pool (no ATTACH) and reads the table's columns straight from system.columns
 static unique_ptr<FunctionData> ClickhouseScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	// same gate ATTACH goes through (ClickhouseAttach); must come before anything that reads a secret or
+	// opens a connection
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
+		throw PermissionException("Reading from ClickHouse is disabled through configuration");
+	}
 	for (auto &value : input.inputs) {
 		if (value.IsNull()) {
 			throw BinderException("Parameters to clickhouse_scan cannot be NULL");

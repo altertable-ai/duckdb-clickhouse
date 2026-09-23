@@ -45,16 +45,41 @@ SELECT n FROM clickhouse_query('ch', 'SELECT number AS n, number * 2 AS m FROM n
 ----
 42
 
+# the query sits on its own line inside the wrapping parentheses, so the JSON plan renders it as three lines
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT n FROM clickhouse_query('ch', 'SELECT number AS n, number * 2 AS m FROM numbers(100)') WHERE n = 42;
 ----
-analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM \(SELECT number AS n, number \* 2 AS m FROM numbers\(100\)\) WHERE `n` = 42".*
+analyzed_plan	<REGEX>:.*"ClickHouse Query": \[.*"SELECT `n` FROM \(",.*"SELECT number AS n, number \* 2 AS m FROM numbers\(100\)",.*"\) WHERE `n` = 42".*
 
 query I
 SELECT n FROM clickhouse_query('ch', 'SELECT number AS n FROM numbers(1000)') ORDER BY n DESC LIMIT 2;
 ----
 999
 998
+
+# the query is wrapped in a subquery, so a trailing line comment must not swallow the closing paren
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT 1 AS x -- trailing comment');
+----
+1
+
+# ClickHouse only accepts FORMAT on the outermost query, so a wrapped one cannot carry it: say so
+# instead of letting the server answer with a bare SYNTAX_ERROR
+statement error
+SELECT * FROM clickhouse_query('ch', 'SELECT 1 AS x FORMAT JSON');
+----
+clickhouse_query: the query cannot end in a FORMAT clause
+
+statement error
+SELECT * FROM clickhouse_query('ch', 'SELECT 1 AS x FORMAT JSONEachRow;');
+----
+clickhouse_query: the query cannot end in a FORMAT clause
+
+# only a trailing clause is rejected, not the word itself
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT ''FORMAT JSON'' AS s');
+----
+FORMAT JSON
 
 statement error
 SELECT * FROM clickhouse_query('nope', 'SELECT 1');

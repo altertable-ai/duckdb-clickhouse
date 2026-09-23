@@ -76,13 +76,13 @@ ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHO
 ----
 Failed to connect to ClickHouse at
 
-# the wrong password itself never appears in the error (finding 1 / finding 7)
+# the wrong password itself never appears in the error
 statement error
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=wrong_pw_7f3a' AS ch_bad2 (TYPE clickhouse);
 ----
 <!REGEX>:.*wrong_pw_7f3a.*
 
-# --- fix round 1: compression regression guard (finding 7) ---
+# --- compression regression guard ---
 # guards the vendored-cityhash fix, which the default lz4 path above already exercises
 
 statement ok
@@ -105,7 +105,7 @@ default
 other_db
 test_db
 
-# --- fix round 1: the ClickHouse error message names the symbolic error code (finding 2) ---
+# --- the ClickHouse error message names the symbolic error code ---
 # LoadEntries() is lazy, so the bad setting only surfaces once a query actually runs against ch_bad_setting.
 # nonexistent_setting_xyz is rejected server-side as UNKNOWN_SETTING (verified against the running server).
 
