@@ -105,7 +105,15 @@ static void SplitFieldName(const string &argument, string &field_name, string &t
 	}
 }
 
-ClickhouseTypeNode ClickhouseTypeParser::Parse(const string &type_text) {
+//! Maximum number of nested type levels the parser will recurse into. Guards against a stack overflow on
+//! adversarial input like Array(Array(Array(...))); everything downstream (ToDuckDB, ReadExpression, ...)
+//! only ever walks trees built by the parser, so bounding recursion here is enough to bound it everywhere.
+static constexpr idx_t MAX_TYPE_NESTING_DEPTH = 64;
+
+static ClickhouseTypeNode ParseInternal(const string &type_text, idx_t depth) {
+	if (depth > MAX_TYPE_NESTING_DEPTH) {
+		throw InvalidInputException("ClickHouse type \"%s\" is nested too deeply", type_text);
+	}
 	ClickhouseTypeNode node;
 	node.text = TrimCopy(type_text);
 	if (node.text.empty()) {
@@ -135,10 +143,14 @@ ClickhouseTypeNode ClickhouseTypeParser::Parse(const string &type_text) {
 		string field_name;
 		string child_text;
 		SplitFieldName(argument, field_name, child_text);
-		node.children.push_back(Parse(child_text));
+		node.children.push_back(ParseInternal(child_text, depth + 1));
 		node.field_names.push_back(field_name);
 	}
 	return node;
+}
+
+ClickhouseTypeNode ClickhouseTypeParser::Parse(const string &type_text) {
+	return ParseInternal(type_text, 0);
 }
 
 //===--------------------------------------------------------------------===//
@@ -167,24 +179,33 @@ static int64_t ParseIntegerLiteral(const ClickhouseTypeNode &node, idx_t index, 
 }
 
 static bool GetDecimalInfo(const ClickhouseTypeNode &node, idx_t &width, idx_t &scale) {
+	int64_t raw_width;
+	int64_t raw_scale;
 	if (node.name == "Decimal") {
-		width = NumericCast<idx_t>(ParseIntegerLiteral(node, 0, 10));
-		scale = NumericCast<idx_t>(ParseIntegerLiteral(node, 1, 0));
+		raw_width = ParseIntegerLiteral(node, 0, 10);
+		raw_scale = ParseIntegerLiteral(node, 1, 0);
 	} else if (node.name == "Decimal32") {
-		width = 9;
-		scale = NumericCast<idx_t>(ParseIntegerLiteral(node, 0, 0));
+		raw_width = 9;
+		raw_scale = ParseIntegerLiteral(node, 0, 0);
 	} else if (node.name == "Decimal64") {
-		width = 18;
-		scale = NumericCast<idx_t>(ParseIntegerLiteral(node, 0, 0));
+		raw_width = 18;
+		raw_scale = ParseIntegerLiteral(node, 0, 0);
 	} else if (node.name == "Decimal128") {
-		width = 38;
-		scale = NumericCast<idx_t>(ParseIntegerLiteral(node, 0, 0));
+		raw_width = 38;
+		raw_scale = ParseIntegerLiteral(node, 0, 0);
 	} else if (node.name == "Decimal256") {
-		width = 76;
-		scale = NumericCast<idx_t>(ParseIntegerLiteral(node, 0, 0));
+		raw_width = 76;
+		raw_scale = ParseIntegerLiteral(node, 0, 0);
 	} else {
 		return false;
 	}
+	// ClickHouse requires 1 <= width <= 76 and 0 <= scale <= width; reject anything outside that range
+	// before it reaches NumericCast, which would otherwise raise an InternalException on overflow/underflow.
+	if (raw_width < 1 || raw_width > 76 || raw_scale < 0 || raw_scale > raw_width) {
+		throw InvalidInputException("Malformed ClickHouse type \"%s\"", node.text);
+	}
+	width = NumericCast<idx_t>(raw_width);
+	scale = NumericCast<idx_t>(raw_scale);
 	return true;
 }
 

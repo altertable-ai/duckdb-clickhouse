@@ -214,3 +214,36 @@ statement error
 SELECT * FROM clickhouse_type_mapping('Array(Int32))');
 ----
 Malformed ClickHouse type "Array(Int32))"
+
+# a type nested past the maximum depth must throw a clean error instead of overflowing the stack
+statement error
+SELECT * FROM clickhouse_type_mapping(repeat('Array(', 100) || 'Int32' || repeat(')', 100));
+----
+nested too deeply
+
+# comfortably below the depth limit, mapping must still succeed
+query I
+SELECT duckdb_type = 'INTEGER' || repeat('[]', 50)
+FROM clickhouse_type_mapping(repeat('Array(', 50) || 'Int32' || repeat(')', 50));
+----
+true
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(-1, 2)');
+----
+Malformed ClickHouse type "Decimal(-1, 2)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(10, 999)');
+----
+Malformed ClickHouse type "Decimal(10, 999)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(10, 50)');
+----
+Malformed ClickHouse type "Decimal(10, 50)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal64(40)');
+----
+Malformed ClickHouse type "Decimal64(40)"
