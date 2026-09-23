@@ -2,11 +2,12 @@
 
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 
 namespace duckdb {
 
 ClickhouseSchemaEntry::ClickhouseSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
-    : SchemaCatalogEntry(catalog, info) {
+    : SchemaCatalogEntry(catalog, info), tables(*this, catalog) {
 }
 
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) {
@@ -50,7 +51,10 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &, DropInfo &) {
 
 void ClickhouseSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                  const std::function<void(CatalogEntry &)> &callback) {
-	// tables are added in Task 5
+	if (type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	tables.Scan(context, callback);
 }
 
 void ClickhouseSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
@@ -59,8 +63,10 @@ void ClickhouseSchemaEntry::Scan(CatalogType type, const std::function<void(Cata
 
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                               const EntryLookupInfo &lookup_info) {
-	// tables are added in Task 5
-	return nullptr;
+	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	return tables.GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
 }
 
 } // namespace duckdb

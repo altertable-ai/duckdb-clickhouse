@@ -1,0 +1,36 @@
+# name: test/sql/catalog/read_only.test
+# description: DDL against an attached ClickHouse database is rejected
+# group: [catalog]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement error
+CREATE TABLE ch.test_db.new_table (i INTEGER);
+----
+clickhouse_scanner is read-only
+
+statement error
+CREATE VIEW ch.test_db.new_view AS SELECT 42;
+----
+clickhouse_scanner is read-only
+
+statement error
+DROP TABLE ch.test_db.t1;
+----
+clickhouse_scanner is read-only
+
+statement error
+ALTER TABLE ch.test_db.t1 ADD COLUMN extra INTEGER;
+----
+clickhouse_scanner is read-only

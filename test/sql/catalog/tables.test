@@ -1,0 +1,52 @@
+# name: test/sql/catalog/tables.test
+# description: ClickHouse tables and views are listed in the DuckDB catalog
+# group: [catalog]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'test_db' ORDER BY table_name;
+----
+MixedCase
+aggregates
+bad_times
+big
+binary
+empty
+nested
+nullables
+scalars
+semi
+t1
+times
+v1
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name <> 'test_db' ORDER BY ALL;
+----
+other_db	other_table
+
+# approximate row counts come from system.tables
+query I
+SELECT estimated_size FROM duckdb_tables() WHERE database_name = 'ch' AND table_name = 'big';
+----
+10000000
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'test_db';
+----
+13

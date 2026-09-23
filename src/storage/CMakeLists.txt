@@ -2,10 +2,13 @@ add_library(
   clickhouse_ext_storage OBJECT
   clickhouse_catalog.cpp
   clickhouse_catalog_set.cpp
+  clickhouse_clear_cache.cpp
   clickhouse_connection_pool.cpp
   clickhouse_schema_entry.cpp
   clickhouse_schema_set.cpp
   clickhouse_storage_extension.cpp
+  clickhouse_table_entry.cpp
+  clickhouse_table_set.cpp
   clickhouse_transaction.cpp)
 
 # See the matching comment in ../CMakeLists.txt for clickhouse_ext: clickhouse-cpp and the

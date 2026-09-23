@@ -10,6 +10,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "storage/clickhouse_clear_cache.hpp"
 #include "storage/clickhouse_storage_extension.hpp"
 
 #include <clickhouse/client.h>
@@ -32,6 +33,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                ClickhouseClientVersionFunction);
 	loader.RegisterFunction(version_function);
 	loader.RegisterFunction(ClickhouseTypeMappingFunction());
+	loader.RegisterFunction(ClickhouseClearCacheFunction());
 
 	loader.RegisterSecretType(ClickhouseSecrets::CreateType());
 	CreateSecretFunction secret_function = {ClickhouseSecrets::TYPE_NAME, "config", ClickhouseSecrets::CreateFunction};
