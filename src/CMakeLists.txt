@@ -2,7 +2,10 @@ add_subdirectory(storage)
 
 add_library(
   clickhouse_ext OBJECT
+  clickhouse_connection.cpp
+  clickhouse_connection_config.cpp
   clickhouse_scanner_extension.cpp
+  clickhouse_secrets.cpp
   clickhouse_type_mapping_function.cpp
   clickhouse_types.cpp
   clickhouse_utils.cpp)

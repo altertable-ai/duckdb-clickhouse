@@ -2,10 +2,15 @@
 
 #include "clickhouse_scanner_extension.hpp"
 
+#include "clickhouse_connection.hpp"
+#include "clickhouse_secrets.hpp"
 #include "clickhouse_type_mapping_function.hpp"
+#include "dbconnector/pool.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "storage/clickhouse_storage_extension.hpp"
 
 #include <clickhouse/client.h>
 
@@ -18,11 +23,45 @@ static void ClickhouseClientVersionFunction(DataChunk &args, ExpressionState &st
 	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, text);
 }
 
+static void SetClickhouseDebugPrintQueries(ClientContext &context, SetScope scope, Value &parameter) {
+	ClickhouseConnection::SetDebugPrintQueries(BooleanValue::Get(parameter));
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction version_function("clickhouse_client_version", {}, LogicalType::VARCHAR,
 	                                ClickhouseClientVersionFunction);
 	loader.RegisterFunction(version_function);
 	loader.RegisterFunction(ClickhouseTypeMappingFunction());
+
+	loader.RegisterSecretType(ClickhouseSecrets::CreateType());
+	CreateSecretFunction secret_function = {ClickhouseSecrets::TYPE_NAME, "config", ClickhouseSecrets::CreateFunction};
+	ClickhouseSecrets::SetSecretParameters(secret_function);
+	loader.RegisterFunction(secret_function);
+
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	auto storage_extension = make_shared_ptr<ClickhouseStorageExtension>();
+	StorageExtension::Register(config, "clickhouse_scanner", storage_extension);
+	StorageExtension::Register(config, "clickhouse", storage_extension);
+
+	dbconnector::pool::ConnectionPoolConfig default_pool_config;
+	config.AddExtensionOption("ch_debug_show_queries", "DEBUG SETTING: print all queries sent to ClickHouse to stdout",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetClickhouseDebugPrintQueries);
+	config.AddExtensionOption("ch_connect_timeout_ms", "Timeout in milliseconds for connecting to ClickHouse",
+	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
+	config.AddExtensionOption("ch_receive_timeout_ms", "Timeout in milliseconds for receiving data from ClickHouse",
+	                          LogicalType::UBIGINT, Value::UBIGINT(300000));
+	config.AddExtensionOption("ch_pool_max_connections",
+	                          "Maximum number of pooled connections per attached ClickHouse database (new ATTACHes)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections));
+	config.AddExtensionOption("ch_pool_acquire_mode",
+	                          "What to do when the pool is exhausted: force, wait or try (new ATTACHes)",
+	                          LogicalType::VARCHAR, Value("force"));
+	config.AddExtensionOption("ch_pool_wait_timeout_millis",
+	                          "How long 'wait' acquire mode waits for a free connection (new ATTACHes)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis));
+	config.AddExtensionOption("ch_pool_idle_timeout_millis",
+	                          "Idle pooled connections are closed after this many milliseconds (new ATTACHes)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis));
 }
 
 void ClickhouseScannerExtension::Load(ExtensionLoader &loader) {

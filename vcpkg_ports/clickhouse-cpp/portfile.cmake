@@ -25,7 +25,15 @@ vcpkg_cmake_configure(
         ${FEATURE_OPTIONS}
         -DWITH_SYSTEM_ABSEIL=ON
         -DWITH_SYSTEM_LZ4=ON
-        -DWITH_SYSTEM_CITYHASH=ON
+        # IMPORTANT: keep this OFF (the clickhouse-cpp default). ClickHouse's native-protocol block
+        # checksums use a specific old CityHash revision ("cityhash102") vendored under contrib/cityhash,
+        # not the latest google/cityhash algorithm that vcpkg's system "cityhash" port provides. Linking
+        # against the system port produces syntactically valid but wire-INCOMPATIBLE checksums: every
+        # compressed block (lz4/zstd; compression=none is unaffected) is then rejected by the server with
+        # "DB::Exception: Checksum doesn't match: corrupted data" (error code 271). clickhouse-cpp builds
+        # and installs its own vendored cityhash static lib when this is OFF, which is what
+        # find_library(CITYHASH_LIB cityhash) in the extension's top-level CMakeLists.txt picks up.
+        -DWITH_SYSTEM_CITYHASH=OFF
         -DWITH_SYSTEM_ZSTD=ON
         -DDEBUG_DEPENDENCIES=OFF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5

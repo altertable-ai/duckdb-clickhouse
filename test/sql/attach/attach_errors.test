@@ -1,0 +1,63 @@
+# name: test/sql/attach/attach_errors.test
+# description: invalid ATTACH input is rejected before connecting
+# group: [attach]
+
+require clickhouse_scanner
+
+statement error
+ATTACH 'hots=localhost' AS ch (TYPE clickhouse);
+----
+Unknown ClickHouse connection option "hots"
+
+statement error
+ATTACH 'host=localhost port=abc' AS ch (TYPE clickhouse);
+----
+Invalid ClickHouse port "abc"
+
+statement error
+ATTACH 'host=localhost compression=snappy' AS ch (TYPE clickhouse);
+----
+Invalid value "snappy" for ClickHouse option "compression"
+
+statement error
+ATTACH 'host=localhost secure=maybe' AS ch (TYPE clickhouse);
+----
+Invalid value "maybe" for ClickHouse option "secure"
+
+statement error
+ATTACH 'host=localhost password=''unterminated' AS ch (TYPE clickhouse);
+----
+unterminated quoted value
+
+statement error
+ATTACH 'host=localhost settings=''bad setting''' AS ch (TYPE clickhouse);
+----
+Invalid ClickHouse setting "bad setting"
+
+statement error
+ATTACH 'clickhouse://localhost:9000/db?bogus=1' AS ch (TYPE clickhouse);
+----
+Unknown ClickHouse connection option "bogus"
+
+statement error
+ATTACH '' AS ch (TYPE clickhouse, SECRET does_not_exist);
+----
+Secret with name "does_not_exist" not found
+
+statement error
+ATTACH '' AS ch (TYPE clickhouse, FOO 1);
+----
+Unrecognized option for ClickHouse attach
+
+statement error
+ATTACH 'host=127.0.0.1 port=1 connect_timeout=1' AS ch (TYPE clickhouse);
+----
+Unknown ClickHouse connection option "connect_timeout"
+
+statement ok
+SET ch_connect_timeout_ms = 2000;
+
+statement error
+ATTACH 'host=127.0.0.1 port=1' AS ch (TYPE clickhouse);
+----
+Failed to connect to ClickHouse at 127.0.0.1:1

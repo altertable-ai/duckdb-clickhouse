@@ -1,0 +1,39 @@
+# name: test/sql/attach/tls.test
+# description: TLS connections on the secure native port
+# group: [attach]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_TLS_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require-env CLICKHOUSE_TEST_CA_CERT
+
+# the mapped TLS port is random, so secure=true must be explicit
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_TLS_PORT} secure=true user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db ca_cert=${CLICKHOUSE_TEST_CA_CERT}' AS ch_tls (TYPE clickhouse);
+
+query I
+SELECT path = 'clickhouses://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_TLS_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch_tls';
+----
+true
+
+# table scans arrive in Task 5/6; for now just confirm the database is visible as a schema
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_tls' AND schema_name = 'test_db';
+----
+1
+
+# the self-signed test certificate is rejected without the test CA
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_TLS_PORT} secure=true user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_tls_bad (TYPE clickhouse);
+----
+Failed to connect to ClickHouse at
+
+statement ok
+ATTACH 'clickhouses://${CLICKHOUSE_TEST_USER}:${CLICKHOUSE_TEST_PASSWORD}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_TLS_PORT}/test_db?skip_verify=true' AS ch_tls_skip (TYPE clickhouse);
