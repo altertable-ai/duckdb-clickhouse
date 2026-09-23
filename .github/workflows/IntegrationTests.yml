@@ -1,0 +1,44 @@
+name: Integration Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  linux-tests:
+    name: Linux tests against ClickHouse
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y -q
+          sudo apt-get install -y -q build-essential ninja-build
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build extension
+        run: make release
+
+      # same entry point as locally; not a service container, because the TLS config and test
+      # certificates have to be mounted from the checkout
+      - name: Smoke tests against ClickHouse
+        run: make smoke
