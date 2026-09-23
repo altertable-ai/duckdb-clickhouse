@@ -325,6 +325,19 @@ static void ConvertList(const ch::ColumnRef &column, Vector &result, idx_t offse
 		ClickhouseConversion::ConvertColumn(array->GetData(), ListVector::GetEntry(result), child_start, total,
 		                                     column_name);
 	}
+	if (result.GetType().id() == LogicalTypeId::MAP) {
+		// ClickHouse allows duplicate Map keys; DuckDB's MAP does not, and a malformed MAP vector trips
+		// D_ASSERT(valid_check == VALID) in debug builds and produces bad output in release
+		auto reason = MapVector::CheckMapValidity(result, count);
+		if (reason == MapInvalidReason::DUPLICATE_KEY) {
+			throw InvalidInputException(
+			    "ClickHouse column \"%s\" contains a Map with duplicate keys, which DuckDB's MAP type does not "
+			    "allow. Use clickhouse_query() with mapKeys()/mapValues(), or a query that deduplicates the keys, "
+			    "to read it",
+			    column_name);
+		}
+		MapVector::EvalMapInvalidReason(reason);
+	}
 }
 
 static void ConvertStruct(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,

@@ -2,6 +2,7 @@
 
 #include "clickhouse_conversion.hpp"
 #include "clickhouse_utils.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -18,6 +19,7 @@ namespace duckdb {
 unique_ptr<FunctionData> ClickhouseScanBindData::Copy() const {
 	auto result = make_uniq<ClickhouseScanBindData>();
 	result->pool = pool;
+	result->table_entry = table_entry;
 	result->database = database;
 	result->table = table;
 	result->query = query;
@@ -31,9 +33,9 @@ unique_ptr<FunctionData> ClickhouseScanBindData::Copy() const {
 
 bool ClickhouseScanBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<ClickhouseScanBindData>();
-	return pool == other.pool && database == other.database && table == other.table && query == other.query &&
-	       filter_pushdown == other.filter_pushdown && order_by_clause == other.order_by_clause &&
-	       limit_clause == other.limit_clause;
+	return pool == other.pool && table_entry == other.table_entry && database == other.database &&
+	       table == other.table && query == other.query && filter_pushdown == other.filter_pushdown &&
+	       order_by_clause == other.order_by_clause && limit_clause == other.limit_clause;
 }
 
 //===--------------------------------------------------------------------===//
@@ -150,7 +152,17 @@ static bool FetchNextBlock(ClickhouseScanGlobalState &gstate, ClickhouseScanLoca
 	lstate.block.reset();
 	lstate.offset = 0;
 	while (!gstate.finished) {
-		auto block = gstate.connection->NextBlock();
+		std::optional<clickhouse::Block> block;
+		try {
+			block = gstate.connection->NextBlock();
+		} catch (...) {
+			// the query failed: stop every other worker from touching this connection again (it is no
+			// longer selecting, so a second NextBlock() on it would raise a spurious, unrelated error and
+			// mark an otherwise-healthy connection broken) and release it before propagating the real error
+			gstate.finished = true;
+			gstate.connection = ClickhousePoolConnection();
+			throw;
+		}
 		if (!block) {
 			gstate.finished = true;
 			// hand the connection back to the pool as soon as the query is done
@@ -225,6 +237,17 @@ static InsertionOrderPreservingMap<string> ClickhouseScanDynamicToString(TableFu
 	return result;
 }
 
+//! Without this, LogicalGet::GetTable() always returns null (it requires get_bind_info), which makes
+//! UPDATE/DELETE's binder reject the scan before it ever reaches ClickhouseCatalog::PlanUpdate/PlanDelete.
+static BindInfo ClickhouseGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<ClickhouseScanBindData>();
+	if (bind_data.table_entry) {
+		return BindInfo(*bind_data.table_entry);
+	}
+	// clickhouse_scan() / clickhouse_query() (Task 9): no backing catalog entry
+	return BindInfo(ScanType::EXTERNAL);
+}
+
 void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.init_global = ClickhouseInitGlobal;
 	function.init_local = ClickhouseInitLocal;
@@ -233,6 +256,7 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.cardinality = ClickhouseScanCardinality;
 	function.to_string = ClickhouseScanToString;
 	function.dynamic_to_string = ClickhouseScanDynamicToString;
+	function.get_bind_info = ClickhouseGetBindInfo;
 	function.projection_pushdown = true;
 	function.filter_pushdown = false;
 }

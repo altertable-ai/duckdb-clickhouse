@@ -19,6 +19,7 @@ unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &co
 TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<ClickhouseScanBindData>();
 	result->pool = catalog.Cast<ClickhouseCatalog>().GetConnectionPoolPtr();
+	result->table_entry = this;
 	result->database = schema.name;
 	result->table = name;
 	result->columns = clickhouse_columns;

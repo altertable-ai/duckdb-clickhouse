@@ -10,6 +10,12 @@ namespace duckdb {
 struct ClickhouseScanBindData : public TableFunctionData {
 	//! Pool of the attached catalog, or a private pool for clickhouse_scan() without ATTACH
 	shared_ptr<ClickhouseConnectionPool> pool;
+	//! The catalog entry backing this scan (attached tables only; null for clickhouse_scan() /
+	//! clickhouse_query(), added in Task 9). Required for get_bind_info so that LogicalGet::GetTable()
+	//! resolves, which UPDATE/DELETE's binder needs before it will even consider planning a write.
+	//! A raw pointer (not optional_ptr) so it stays dereferenceable to a non-const TableCatalogEntry&
+	//! even through the const bind data reference get_bind_info receives.
+	TableCatalogEntry *table_entry = nullptr;
 	//! Scanned table (attached tables and clickhouse_scan)
 	string database;
 	string table;

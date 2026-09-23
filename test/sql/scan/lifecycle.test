@@ -20,9 +20,11 @@ SET TimeZone = 'UTC';
 statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
-# --- clearing the catalog cache does not break a scan bound before the clear: ClickhouseCatalogSet
-# retires cleared entries (moves them aside) instead of freeing them, so a PREPAREd plan that still
-# holds a raw CatalogEntry* from before the clear stays valid.
+# --- clearing the catalog cache does not break a scan bound before the clear: the bound plan's
+# ClickhouseScanBindData::table_entry (used by get_bind_info, e.g. for LogicalGet::GetTable()) is a
+# raw TableCatalogEntry* into the ClickhouseTableEntry that was current at bind time. ClickhouseCatalogSet
+# retires cleared entries (moves them aside) instead of freeing them, so that pointer stays valid across
+# a clickhouse_clear_cache() even though the entry is no longer reachable from the catalog itself.
 
 statement ok
 PREPARE q AS SELECT count(*) FROM ch.test_db.t1;
