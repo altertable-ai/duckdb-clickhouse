@@ -61,3 +61,31 @@ statement error
 ATTACH 'host=127.0.0.1 port=1' AS ch (TYPE clickhouse);
 ----
 Failed to connect to ClickHouse at 127.0.0.1:1
+
+# --- fix round 1: passwords must never appear in URI parse errors (finding 1) ---
+
+# a malformed IPv6 URI with credentials must not echo the password
+statement error
+ATTACH 'clickhouse://u:hunter2@[::1' AS ch_leak1 (TYPE clickhouse);
+----
+<!REGEX>:.*hunter2.*
+
+# a password containing an unencoded '/' must not leak into a host/port parse error, and (once parsed)
+# must not leak into the connection-failure error either
+statement error
+ATTACH 'clickhouse://u:hunter2/x@127.0.0.1:1/db' AS ch_leak2 (TYPE clickhouse);
+----
+<!REGEX>:.*hunter2.*
+
+# a malformed query parameter (missing "=") must not echo a value that could be a password
+statement error
+ATTACH 'clickhouse://127.0.0.1:1/db?password:hunter2' AS ch_leak3 (TYPE clickhouse);
+----
+<!REGEX>:.*hunter2.*
+
+# --- fix round 1: user settings can no longer override the LowCardinality guard (finding 3) ---
+
+statement error
+ATTACH 'host=localhost settings=low_cardinality_allow_in_native_format=1' AS ch_lc (TYPE clickhouse);
+----
+low_cardinality_allow_in_native_format

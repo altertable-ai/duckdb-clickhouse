@@ -107,6 +107,12 @@ void ClickhouseConnectionConfig::AddSettings(const string &settings_text) {
 		if (equals == string::npos || !IsValidSettingName(name)) {
 			throw InvalidInputException("Invalid ClickHouse setting \"%s\": expected name=value", item);
 		}
+		if (StringUtil::Lower(name) == "low_cardinality_allow_in_native_format") {
+			// the block-conversion code assumes LowCardinality columns always arrive as plain columns;
+			// letting a user setting re-enable dictionary encoding would silently corrupt scans
+			throw InvalidInputException("ClickHouse setting \"low_cardinality_allow_in_native_format\" cannot be "
+			                            "set: clickhouse_scanner requires it to stay disabled");
+		}
 		auto value = item.substr(equals + 1);
 		StringUtil::Trim(value);
 		settings.emplace_back(name, value);
@@ -143,7 +149,12 @@ void ClickhouseConnectionConfig::ApplyKeyValuePairs(const string &text) {
 			pos++;
 		}
 		if (pos >= text.size() || text[pos] != '=') {
-			throw InvalidInputException("Invalid ClickHouse connection string: expected \"=\" after \"%s\"", key);
+			// `key` here is just the token the scanner stopped on: if the previous value was an unquoted
+			// password containing a space, this token is actually a leftover fragment of that password, so
+			// it must never be echoed back
+			throw InvalidInputException("Invalid ClickHouse connection string: expected \"key=value\" pairs "
+			                            "separated by spaces (a value containing a space must be quoted, e.g. "
+			                            "password='my pass')");
 		}
 		pos++;
 		while (pos < text.size() && StringUtil::CharacterIsSpace(text[pos])) {
@@ -184,22 +195,23 @@ void ClickhouseConnectionConfig::ApplyUri(const string &uri) {
 	if (secure_scheme) {
 		secure = 1;
 	}
-	string query;
-	auto question = rest.find('?');
-	if (question != string::npos) {
-		query = rest.substr(question + 1);
-		rest = rest.substr(0, question);
-	}
-	string path;
-	auto slash = rest.find('/');
-	if (slash != string::npos) {
-		path = rest.substr(slash + 1);
-		rest = rest.substr(0, slash);
-	}
-	auto at = rest.rfind('@');
-	if (at != string::npos) {
-		auto user_info = rest.substr(0, at);
-		rest = rest.substr(at + 1);
+
+	// Rule (documented since it is more lenient than RFC 3986): the authority is bounded by the first
+	// '/', '?' or '#' that appears AT OR AFTER the last '@' in the string, rather than simply the first
+	// '/', '?' or '#' after the scheme. Anchoring on the last '@' means an unencoded '/' or '?' inside
+	// the password does not truncate the authority before the real "@host" boundary is reached -- the
+	// leftover password fragment would otherwise be misread as the start of the path/query and could
+	// leak into a port/host parse error. Percent-encoding '@', '/', '?' and '#' in the password is still
+	// recommended and avoids relying on this fallback; a stray '@' inside an unencoded query value (after
+	// the real authority) is a known, accepted edge case of this simpler rule.
+	auto last_at = rest.find_last_of('@');
+	auto authority_end = rest.find_first_of("/?#", last_at == string::npos ? 0 : last_at);
+	string authority = authority_end == string::npos ? rest : rest.substr(0, authority_end);
+	string remainder = authority_end == string::npos ? string() : rest.substr(authority_end);
+
+	if (last_at != string::npos) {
+		auto user_info = authority.substr(0, last_at);
+		authority = authority.substr(last_at + 1);
 		auto colon = user_info.find(':');
 		if (colon == string::npos) {
 			user = StringUtil::URLDecode(user_info);
@@ -208,28 +220,47 @@ void ClickhouseConnectionConfig::ApplyUri(const string &uri) {
 			password = StringUtil::URLDecode(user_info.substr(colon + 1));
 		}
 	}
-	if (!rest.empty() && rest[0] == '[') {
-		// IPv6 literal: [::1]:9000
-		auto close = rest.find(']');
-		if (close == string::npos) {
-			throw InvalidInputException("Invalid ClickHouse URI \"%s\": unterminated IPv6 address", uri);
-		}
-		host = rest.substr(1, close - 1);
-		rest = rest.substr(close + 1);
-		if (!rest.empty()) {
-			if (rest[0] != ':') {
-				throw InvalidInputException("Invalid ClickHouse URI \"%s\"", uri);
+
+	string path;
+	string query;
+	if (!remainder.empty()) {
+		if (remainder[0] == '/') {
+			auto question = remainder.find('?');
+			path = question == string::npos ? remainder.substr(1) : remainder.substr(1, question - 1);
+			if (question != string::npos) {
+				query = remainder.substr(question + 1);
 			}
-			port = ParsePort(rest.substr(1));
+		} else if (remainder[0] == '?') {
+			query = remainder.substr(1);
+		}
+		// a leading '#' carries neither a path nor a query and is ignored
+	}
+
+	// From here `authority` holds only host[:port] or [ipv6][:port]; any credentials were already
+	// extracted above, so none of the errors below can echo a password.
+	if (!authority.empty() && authority[0] == '[') {
+		// IPv6 literal: [::1]:9000
+		auto close = authority.find(']');
+		if (close == string::npos) {
+			throw InvalidInputException("Invalid ClickHouse URI: unterminated IPv6 address literal (percent-encode "
+			                            "'@', '/', '?' and '#' if they appear in the password)");
+		}
+		host = authority.substr(1, close - 1);
+		auto after = authority.substr(close + 1);
+		if (!after.empty()) {
+			if (after[0] != ':') {
+				throw InvalidInputException("Invalid ClickHouse URI: unexpected characters after the IPv6 address");
+			}
+			port = ParsePort(after.substr(1));
 		}
 	} else {
-		auto colon = rest.rfind(':');
+		auto colon = authority.rfind(':');
 		if (colon != string::npos) {
-			port = ParsePort(rest.substr(colon + 1));
-			rest = rest.substr(0, colon);
+			port = ParsePort(authority.substr(colon + 1));
+			authority = authority.substr(0, colon);
 		}
-		if (!rest.empty()) {
-			host = rest;
+		if (!authority.empty()) {
+			host = authority;
 		}
 	}
 	if (!path.empty()) {
@@ -241,10 +272,13 @@ void ClickhouseConnectionConfig::ApplyUri(const string &uri) {
 		}
 		auto equals = parameter.find('=');
 		if (equals == string::npos) {
-			throw InvalidInputException("Invalid ClickHouse URI parameter \"%s\": expected key=value", parameter);
+			// the segment may be an unencoded password fragment (e.g. a stray "?password:x" typo); never
+			// echo it back since it cannot be reliably attributed to a non-sensitive key
+			throw InvalidInputException("Invalid ClickHouse URI query parameter: expected \"key=value\"");
 		}
-		SetOption(StringUtil::URLDecode(parameter.substr(0, equals)),
-		          StringUtil::URLDecode(parameter.substr(equals + 1)));
+		auto key = StringUtil::URLDecode(parameter.substr(0, equals));
+		auto value = StringUtil::URLDecode(parameter.substr(equals + 1));
+		SetOption(key, value);
 	}
 }
 

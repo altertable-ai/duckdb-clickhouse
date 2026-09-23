@@ -29,6 +29,13 @@ void ClickhouseConnectionPool::ResetConnection(ClickhouseConnection &connection)
 	}
 }
 
+bool ClickhouseConnectionPool::TryRecoverConnection(ClickhouseConnection &connection) {
+	if (connection.IsQueryRunning()) {
+		connection.Cancel();
+	}
+	return !connection.IsBroken() && !connection.IsQueryRunning();
+}
+
 dbconnector::pool::ConnectionPoolConfig ClickhouseConnectionPool::PoolConfigFromContext(ClientContext &context) {
 	dbconnector::pool::ConnectionPoolConfig result;
 	Value value;

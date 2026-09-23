@@ -4,6 +4,7 @@ add_library(
   clickhouse_ext OBJECT
   clickhouse_connection.cpp
   clickhouse_connection_config.cpp
+  clickhouse_error_codes.cpp
   clickhouse_scanner_extension.cpp
   clickhouse_secrets.cpp
   clickhouse_type_mapping_function.cpp

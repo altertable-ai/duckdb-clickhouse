@@ -22,6 +22,10 @@ protected:
 	std::unique_ptr<ClickhouseConnection> CreateNewConnection() override;
 	bool CheckConnectionHealthy(ClickhouseConnection &connection) override;
 	void ResetConnection(ClickhouseConnection &connection) override;
+	//! CheckConnectionHealthy() is false while a query is running (IsHealthy() reports unusable-right-now,
+	//! not unrecoverable), which would otherwise make the pool discard every connection returned mid-query
+	//! (e.g. a LIMIT-terminated scan). Cancels the in-flight query so the connection can be reset and reused.
+	bool TryRecoverConnection(ClickhouseConnection &connection) override;
 
 private:
 	ClickhouseConnectionConfig config;

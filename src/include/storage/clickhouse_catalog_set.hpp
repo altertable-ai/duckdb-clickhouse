@@ -36,6 +36,10 @@ private:
 	bool is_loaded = false;
 	vector<shared_ptr<CatalogEntry>> ordered_entries;
 	unordered_map<string, shared_ptr<CatalogEntry>> entries;
+	//! Entries dropped by ClearEntries(): GetEntry() returns a raw pointer, so a bound query on another
+	//! connection may still be holding one when clickhouse_clear_cache() runs here. Kept alive for the
+	//! lifetime of the catalog set instead of letting the last shared_ptr go out of scope.
+	vector<shared_ptr<CatalogEntry>> retired;
 };
 
 } // namespace duckdb

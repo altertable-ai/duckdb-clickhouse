@@ -1,5 +1,6 @@
 #include "clickhouse_connection.hpp"
 
+#include "clickhouse_error_codes.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -14,6 +15,64 @@ std::atomic<bool> ClickhouseConnection::debug_print_queries {false};
 //! LowCardinality columns are sent as plain columns, so the conversion code never sees dictionary encoding
 static constexpr const char *LOW_CARDINALITY_SETTING = "low_cardinality_allow_in_native_format";
 static constexpr auto PING_AFTER_IDLE = std::chrono::seconds(30);
+
+static bool IsUpperSnakeCase(const string &value) {
+	if (value.empty()) {
+		return false;
+	}
+	bool has_alpha = false;
+	for (auto c : value) {
+		if (c >= 'A' && c <= 'Z') {
+			has_alpha = true;
+		} else if (!((c >= '0' && c <= '9') || c == '_')) {
+			return false;
+		}
+	}
+	return has_alpha;
+}
+
+//! Some ClickHouse exception paths embed the symbolic error code name at the end of display_text, e.g.
+//! "DB::Exception: Table default.t doesn't exist. (UNKNOWN_TABLE)" -- verified this is NOT the case for
+//! a native-protocol connection to a plain (non-distributed) ClickHouse 25.8 server, where display_text
+//! is always just "DB::Exception: <message>" with no trailing "(NAME)"; that annotation turned out to be
+//! something clickhouse-client's terminal formatter adds locally from the numeric code, not something
+//! ClickHouse puts on the wire. So: try to extract a trailing "(NAME)" token first (in case some other
+//! server version or a wrapped/distributed-query exception does include one), then fall back to our own
+//! code -> name table (see clickhouse_error_codes.hpp), and only fall back to error.name (just the
+//! exception class, e.g. "DB::Exception") if the code itself is unrecognized.
+static string ErrorCodeName(const clickhouse::Exception &error) {
+	const string &text = error.display_text;
+	idx_t search_end = text.size();
+	for (int attempt = 0; attempt < 3 && search_end > 0; attempt++) {
+		auto close = text.rfind(')', search_end - 1);
+		if (close == string::npos) {
+			break;
+		}
+		auto open = text.rfind('(', close);
+		if (open == string::npos) {
+			break;
+		}
+		auto candidate = text.substr(open + 1, close - open - 1);
+		if (IsUpperSnakeCase(candidate)) {
+			return candidate;
+		}
+		search_end = open;
+	}
+	auto looked_up = ClickhouseErrorCodeName(error.code);
+	if (looked_up[0] != '\0') {
+		return looked_up;
+	}
+	return error.name;
+}
+
+//! Strips a leading "DB::Exception: " so it is not duplicated after "ClickHouse error N (NAME): "
+static string StripExceptionPrefix(const string &display_text) {
+	static const string PREFIX = "DB::Exception: ";
+	if (StringUtil::StartsWith(display_text, PREFIX)) {
+		return display_text.substr(PREFIX.size());
+	}
+	return display_text;
+}
 
 ClickhouseTimeouts ClickhouseTimeouts::FromContext(ClientContext &context) {
 	ClickhouseTimeouts result;
@@ -95,7 +154,8 @@ unique_ptr<ClickhouseConnection> ClickhouseConnection::Open(const ClickhouseConn
 	} catch (const clickhouse::ServerException &ex) {
 		auto &error = ex.GetException();
 		throw IOException("Failed to connect to ClickHouse at %s:%d: ClickHouse error %d (%s): %s", config.host,
-		                  static_cast<int32_t>(config.GetPort()), error.code, error.name, error.display_text);
+		                  static_cast<int32_t>(config.GetPort()), error.code, ErrorCodeName(error),
+		                  StripExceptionPrefix(error.display_text));
 	} catch (const std::exception &ex) {
 		throw IOException("Failed to connect to ClickHouse at %s:%d: %s", config.host,
 		                  static_cast<int32_t>(config.GetPort()), ex.what());
@@ -108,12 +168,14 @@ void ClickhouseConnection::SetDebugPrintQueries(bool print) {
 
 clickhouse::Query ClickhouseConnection::MakeQuery(const string &sql) const {
 	clickhouse::Query query(sql);
-	query.SetSetting(LOW_CARDINALITY_SETTING, clickhouse::QuerySettingsField {"0", 0});
 	for (auto &setting : config.settings) {
 		// IMPORTANT makes the server reject unknown settings instead of silently ignoring them
 		query.SetSetting(setting.first,
 		                 clickhouse::QuerySettingsField {setting.second, clickhouse::QuerySettingsField::IMPORTANT});
 	}
+	// Applied last, after the user's settings, so a "settings=" value can never re-enable LowCardinality's
+	// dictionary encoding: AddSettings() also rejects this key outright, this is a second line of defense.
+	query.SetSetting(LOW_CARDINALITY_SETTING, clickhouse::QuerySettingsField {"0", 0});
 	return query;
 }
 
@@ -124,7 +186,8 @@ void ClickhouseConnection::RethrowAsDuckDBException(const string &sql) {
 	} catch (const clickhouse::ServerException &ex) {
 		// the server reported an error; the connection itself is still in a clean state
 		auto &error = ex.GetException();
-		throw IOException("ClickHouse error %d (%s): %s%s", error.code, error.name, error.display_text, query_suffix);
+		throw IOException("ClickHouse error %d (%s): %s%s", error.code, ErrorCodeName(error),
+		                  StripExceptionPrefix(error.display_text), query_suffix);
 	} catch (const Exception &) {
 		broken = true;
 		throw;

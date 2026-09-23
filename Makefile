@@ -13,4 +13,4 @@ ARGS ?=
 
 .PHONY: smoke
 smoke:
-	SMOKE_BUILD=$(SMOKE_BUILD) ./scripts/test_with_clickhouse.sh $(ARGS)
+	set -f; SMOKE_BUILD=$(SMOKE_BUILD) ./scripts/test_with_clickhouse.sh $(ARGS)

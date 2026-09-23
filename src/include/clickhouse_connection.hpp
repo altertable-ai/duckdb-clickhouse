@@ -34,7 +34,9 @@ public:
 	void BeginQuery(const string &sql);
 	//! The next block (possibly with zero rows); nullopt once the query has finished
 	std::optional<clickhouse::Block> NextBlock();
-	//! Cancels the running query (if any) and drains the connection
+	//! Cancels the running query (if any): sends a cancel and reads (drains) the blocks the server sends
+	//! afterward, leaving the connection idle and safe to reuse for a new query. No-op if no query is
+	//! running. Marks the connection broken (see IsBroken()) if the cancel itself fails.
 	void Cancel();
 	bool IsQueryRunning() const;
 

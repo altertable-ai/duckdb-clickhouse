@@ -53,6 +53,11 @@ void ClickhouseCatalogSet::Scan(ClientContext &context, const std::function<void
 void ClickhouseCatalogSet::ClearEntries() {
 	lock_guard<mutex> load_guard(load_lock);
 	lock_guard<mutex> guard(entry_lock);
+	// move rather than drop: a bound query on another connection may still hold a raw CatalogEntry*
+	// returned by an earlier GetEntry() call, so the shared_ptr keeping it alive must not be released here
+	for (auto &entry : ordered_entries) {
+		retired.push_back(std::move(entry));
+	}
 	entries.clear();
 	ordered_entries.clear();
 	is_loaded = false;
