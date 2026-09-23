@@ -25,15 +25,19 @@ INSERT INTO ch.test_db.t1 VALUES (4, 'Dan', 1.0, TIMESTAMPTZ '2024-01-04 00:00:0
 ----
 clickhouse_scanner is read-only
 
+# DuckDB's binder rejects this before PlanUpdate ever runs; the contract is only that nothing is
+# written, which the final count(*) = 3 below proves
 statement error
 UPDATE ch.test_db.t1 SET name = 'x';
 ----
-clickhouse_scanner is read-only
+Can only update base table
 
+
+# same as UPDATE above: DuckDB's binder rejects this before PlanDelete ever runs
 statement error
 DELETE FROM ch.test_db.t1;
 ----
-clickhouse_scanner is read-only
+Can only delete from base table
 
 query I
 SELECT count(*) FROM ch.test_db.t1;

@@ -24,7 +24,7 @@ query IIIIIIIIII
 SELECT * FROM ch.test_db.nested ORDER BY id;
 ----
 1	[1, 2, 3]	[a, NULL]	[[1], [2, 3]]	{'a': 1, 'b': x}	{'1': 2, '2': y}	{k1=1, k2=2}	{h=1.2.3.4}	[1.1.1.1, 2.2.2.2]	{'ip': 8.8.8.8, 'n': 5}
-2	[]	[]	[]	{'a': 0, 'b': }	{'1': 0, '2': }	{}	{}	[]	{'ip': 0.0.0.0, 'n': 0}
+2	[]	[]	[]	{'a': 0, 'b': ''}	{'1': 0, '2': ''}	{}	{}	[]	{'ip': 0.0.0.0, 'n': 0}
 
 query I
 SELECT m['k2'] FROM ch.test_db.nested WHERE id = 1;
