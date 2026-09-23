@@ -93,9 +93,29 @@ export CLICKHOUSE_TEST_USER="${CH_USER}"
 export CLICKHOUSE_TEST_PASSWORD="${CH_PASSWORD}"
 export CLICKHOUSE_TEST_CA_CERT="${ROOT}/scripts/certs/ca.crt"
 
+# Runs the unittest binary, streaming its output to the terminal while also capturing it so we
+# can detect the "No tests ran" case (e.g. a typo'd or stale ARGS filter). The Catch2-based
+# unittest binary exits 0 for that case, which would otherwise report success with zero tests run.
+run_unittest() {
+  local output_file
+  output_file="$(mktemp)"
+  set +e
+  "${UNITTEST}" "$@" 2>&1 | tee "${output_file}"
+  local status="${PIPESTATUS[0]}"
+  set -e
+
+  if grep -q "No tests ran" "${output_file}"; then
+    rm -f "${output_file}"
+    echo "ERROR: no tests matched the given filter ('$*'); treating as a failure." >&2
+    exit 1
+  fi
+  rm -f "${output_file}"
+  return "${status}"
+}
+
 echo "==> Running ${BUILD} tests against ${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT} (TLS ${CLICKHOUSE_TEST_TLS_PORT}) ..."
 if [[ $# -gt 0 ]]; then
-  "${UNITTEST}" "$@"
+  run_unittest "$@"
 else
-  "${UNITTEST}" "test/*"
+  run_unittest "test/*"
 fi
