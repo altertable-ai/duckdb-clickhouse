@@ -2,6 +2,7 @@
 
 #include "clickhouse_scanner_extension.hpp"
 
+#include "clickhouse_type_mapping_function.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -21,6 +22,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction version_function("clickhouse_client_version", {}, LogicalType::VARCHAR,
 	                                ClickhouseClientVersionFunction);
 	loader.RegisterFunction(version_function);
+	loader.RegisterFunction(ClickhouseTypeMappingFunction());
 }
 
 void ClickhouseScannerExtension::Load(ExtensionLoader &loader) {

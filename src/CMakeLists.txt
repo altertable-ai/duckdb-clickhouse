@@ -1,6 +1,11 @@
 add_subdirectory(storage)
 
-add_library(clickhouse_ext OBJECT clickhouse_scanner_extension.cpp)
+add_library(
+  clickhouse_ext OBJECT
+  clickhouse_scanner_extension.cpp
+  clickhouse_type_mapping_function.cpp
+  clickhouse_types.cpp
+  clickhouse_utils.cpp)
 
 # DuckDB's top-level CMakeLists.txt sets CMAKE_CXX_STANDARD to 11 as a CACHE variable before this
 # extension is add_subdirectory()-ed in, so the CACHE STRING set above is a no-op (set(... CACHE ...)
