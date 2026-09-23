@@ -6,3 +6,4 @@ duckdb_unittest_tempdir/
 testext
 scripts/certs/
 vcpkg_installed/
+.cache/
