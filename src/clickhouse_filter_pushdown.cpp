@@ -38,6 +38,18 @@ static string TransformComparison(ExpressionType type) {
 	}
 }
 
+//! toDate32(...) clamps rather than errors on an out-of-range argument (e.g. toDate32('1850-01-01') silently
+//! becomes 1900-01-01): pushing a comparison against a date outside this range would then match/exclude rows
+//! ClickHouse itself would not. [1900-01-01, 2299-12-31] is ClickHouse's own Date32 range -- the widest either
+//! Date or Date32 (whichever the filtered column actually is) can ever store, so an in-range check here is safe
+//! regardless of which of the two the column turns out to be (Date's own range, 1970-01-01..2149-06-06, is a
+//! subset of it). See fix-round-1 item 3.
+static bool DateInPushdownRange(date_t date) {
+	static const date_t MIN_PUSHDOWN_DATE = Date::FromDate(1900, 1, 1);
+	static const date_t MAX_PUSHDOWN_DATE = Date::FromDate(2299, 12, 31);
+	return date >= MIN_PUSHDOWN_DATE && date <= MAX_PUSHDOWN_DATE;
+}
+
 string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 	switch (value.type().id()) {
 	case LogicalTypeId::BOOLEAN:
@@ -50,9 +62,13 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 	case LogicalTypeId::USMALLINT:
 	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UHUGEINT:
 		return value.ToString();
+	case LogicalTypeId::HUGEINT:
+		// beyond +-2^63, a bare integer literal parses as Float64 in ClickHouse (losing precision) instead of
+		// comparing exactly against an Int128 column
+		return "toInt128(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
+	case LogicalTypeId::UHUGEINT:
+		return "toUInt128(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
 	case LogicalTypeId::DECIMAL:
 		// a plain 12.5 literal would be a Float64 in ClickHouse, which does not compare with Decimal columns
 		return StringUtil::Format("toDecimal128(%s, %d)", ClickhouseUtils::QuoteLiteral(value.ToString()),
@@ -66,6 +82,14 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 		if (!Date::IsFinite(date)) {
 			throw NotImplementedException("ClickHouse filter pushdown: infinite dates are not supported");
 		}
+		if (!DateInPushdownRange(date)) {
+			// CONSTANT_COMPARISON folds this to an exact predicate before ever calling TransformConstant (see
+			// TryFoldUnrepresentableComparison); reachable here only from IN_FILTER, which drops values that
+			// throw NotImplementedException instead of mistranslating them
+			throw NotImplementedException("ClickHouse filter pushdown: date %s is outside the range toDate32 "
+			                              "can represent exactly",
+			                              value.ToString());
+		}
 		return "toDate32(" + ClickhouseUtils::QuoteLiteral(Date::ToString(date)) + ")";
 	}
 	case LogicalTypeId::TIMESTAMP_TZ: {
@@ -78,6 +102,65 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 	default:
 		throw NotImplementedException("ClickHouse filter pushdown: unsupported constant type %s",
 		                              value.type().ToString());
+	}
+}
+
+//! `column OP value` where value is provably outside every value column could ever hold (+-infinity, or --
+//! for Date/Date32 -- outside ClickHouse's representable range): either the comparison can never be true for any
+//! row (folds to a predicate that is false whether or not column itself is NULL, matching DuckDB's own
+//! NULL-excluding WHERE semantics either way) or it is true for every non-NULL row (folds to `column IS NOT
+//! NULL`). See fix-round-1 items 3 and 7.
+static string FoldOutOfBoundsComparison(const string &column, ExpressionType comparison_type,
+                                        bool value_is_below_range) {
+	bool always_true_when_not_null;
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		always_true_when_not_null = false;
+		break;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		always_true_when_not_null = true;
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		always_true_when_not_null = !value_is_below_range;
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		always_true_when_not_null = value_is_below_range;
+		break;
+	default:
+		throw NotImplementedException("ClickHouse filter pushdown: unsupported comparison %s",
+		                              EnumUtil::ToString(comparison_type));
+	}
+	return always_true_when_not_null ? column + " IS NOT NULL" : "1 = 0";
+}
+
+//! Folds a comparison against a Date/Date32 or TIMESTAMPTZ constant ClickHouse cannot represent exactly (an
+//! out-of-range Date, or +-infinity) to an equivalent predicate, instead of pushing a mistranslated constant
+//! (Date) or failing the whole query (both currently throw in TransformConstant). Returns "" when value is
+//! representable and the normal `column OP TransformConstant(value)` path applies.
+static string TryFoldUnrepresentableComparison(const string &column, ExpressionType comparison_type,
+                                               const Value &value) {
+	switch (value.type().id()) {
+	case LogicalTypeId::DATE: {
+		auto date = DateValue::Get(value);
+		if (!Date::IsFinite(date)) {
+			return FoldOutOfBoundsComparison(column, comparison_type, date == date_t::ninfinity());
+		}
+		if (!DateInPushdownRange(date)) {
+			return FoldOutOfBoundsComparison(column, comparison_type, date < Date::FromDate(1900, 1, 1));
+		}
+		return string();
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		auto timestamp = TimestampTZValue::Get(value);
+		if (!Timestamp::IsFinite(timestamp)) {
+			return FoldOutOfBoundsComparison(column, comparison_type, timestamp == timestamp_t::ninfinity());
+		}
+		return string();
+	}
+	default:
+		return string();
 	}
 }
 
@@ -99,6 +182,11 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		return column + " IS NOT NULL";
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = filter.Cast<ConstantFilter>();
+		auto folded = TryFoldUnrepresentableComparison(column, constant_filter.comparison_type,
+		                                                constant_filter.constant);
+		if (!folded.empty()) {
+			return folded;
+		}
 		return column + " " + TransformComparison(constant_filter.comparison_type) + " " +
 		       TransformConstant(constant_filter.constant);
 	}
@@ -106,7 +194,18 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		auto &in_filter = filter.Cast<InFilter>();
 		vector<string> values;
 		for (auto &value : in_filter.values) {
-			values.push_back(TransformConstant(value));
+			try {
+				values.push_back(TransformConstant(value));
+			} catch (NotImplementedException &) {
+				// this value can never equal any value the column could hold (currently: an out-of-range or
+				// infinite Date -- see TransformConstant) -- omit it from the list instead of mistranslating
+				// it or failing the whole query; supports_pushdown_type already guarantees every value here
+				// shares the column's (translatable) type, so this is never a "some type isn't handled at all"
+				// gap in disguise
+			}
+		}
+		if (values.empty()) {
+			return "1 = 0";
 		}
 		return column + " IN (" + StringUtil::Join(values, ", ") + ")";
 	}
@@ -180,8 +279,13 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 			}
 			if (other && other->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 				auto &constant = other->Cast<BoundConstantExpression>();
-				auto op = expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL ? " = " : " != ";
-				return column + op + ClickhouseUtils::QuoteLiteral(StringValue::Get(constant.value));
+				// ClickhousePushdownExpression already rejects a NULL or non-VARCHAR constant here (and
+				// validates the label against the column's own enum members) -- checked again defensively
+				// since this switch has no other way to know that gate ran
+				if (!constant.value.IsNull() && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					auto op = expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL ? " = " : " != ";
+					return column + op + ClickhouseUtils::QuoteLiteral(StringValue::Get(constant.value));
+				}
 			}
 		}
 		if (optional) {

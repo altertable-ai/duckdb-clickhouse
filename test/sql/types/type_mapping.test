@@ -82,7 +82,12 @@ TIMESTAMP WITH TIME ZONE	c	false	true	true
 query TTTTT
 SELECT * FROM clickhouse_type_mapping('Nullable(DateTime64(9, ''Asia/Tokyo''))');
 ----
-TIMESTAMP WITH TIME ZONE	c	true	true	true
+TIMESTAMP WITH TIME ZONE	c	true	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('DateTime64(3, ''UTC'')');
+----
+TIMESTAMP WITH TIME ZONE	c	false	true	true
 
 query TTTTT
 SELECT * FROM clickhouse_type_mapping('Time');

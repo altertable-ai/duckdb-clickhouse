@@ -6,11 +6,13 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/table_column.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -88,7 +90,11 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 	vector<string> select_list;
 	for (auto column_id : column_ids) {
 		if (IsVirtualColumn(column_id)) {
-			// row id / empty projection (e.g. count(*)): any value works, only the row count matters
+			// row id / empty projection (e.g. count(*)): ClickHouse tables have no row identifier, so a real
+			// (explicit `SELECT rowid`) or synthetic (count(*)'s "any column" placeholder) reference to it
+			// always reads as NULL -- `WHERE rowid = ...` then consistently matches nothing rather than
+			// crashing (see ClickhouseGetVirtualColumns / fix-round-1 item 6), and only the row count matters
+			// for count(*).
 			select_list.push_back("NULL");
 			continue;
 		}
@@ -351,13 +357,42 @@ static bool ClickhousePushdownExpression(ClientContext &context, const LogicalGe
 		if (!column_ref || other->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
 		}
+		auto &constant = other->Cast<BoundConstantExpression>();
+		// a NULL constant never survives to here in practice (DuckDB folds `x = NULL` away before filter
+		// pushdown), but TransformFilter reconstructs this same shape independently -- guard it explicitly
+		// rather than rely on that
+		if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
 		auto column_id = ResolvePushdownableColumn(get, bind_data, *column_ref);
 		// only ENUM columns get the CAST-to-VARCHAR treatment from the binder; comparing the string form of
 		// any other type (dates, decimals, ...) is not guaranteed to match ClickHouse's own formatting
-		return column_id.IsValid() && bind_data.columns[column_id.GetIndex()].type.id() == LogicalTypeId::ENUM;
+		if (!column_id.IsValid() || bind_data.columns[column_id.GetIndex()].type.id() != LogicalTypeId::ENUM) {
+			return false;
+		}
+		// a literal that is not one of the enum's own labels can never equal a converted column value --
+		// pushed as `` `col` = 'label' ``, ClickHouse raises UNKNOWN_ELEMENT_OF_ENUM instead of just not
+		// matching (observed for `!=`; `=` happens to not error, but relying on that would be fragile), so
+		// don't push and let DuckDB compare the (always-false) strings itself
+		auto &column_type = bind_data.columns[column_id.GetIndex()].type;
+		return EnumType::GetPos(column_type, StringValue::Get(constant.value)) >= 0;
 	}
 
 	return false;
+}
+
+//! Matches TableCatalogEntry::GetVirtualColumns() (duckdb/src/catalog/catalog_entry/table_catalog_entry.cpp),
+//! which the binder already uses to resolve a `rowid` reference on an attached table. Registering it here too
+//! keeps plan_get.cpp's own virtual-column lookup (building a local PhysicalFilter for a filter on a column
+//! ClickhouseSupportsPushdownType rejected) from indexing an empty map with std::out_of_range when that column
+//! is rowid. ClickHouse tables have no real row identifier: BuildQuery always reads it as NULL, so `WHERE rowid
+//! = ...` consistently matches nothing instead of crashing, and count(*) (which also scans this virtual column,
+//! just to get a row count) keeps working.
+static virtual_column_map_t ClickhouseGetVirtualColumns(ClientContext &context,
+                                                         optional_ptr<FunctionData> bind_data) {
+	virtual_column_map_t result;
+	result.emplace(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::BIGINT));
+	return result;
 }
 
 void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
@@ -380,6 +415,7 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.filter_prune = true;
 	function.supports_pushdown_type = ClickhouseSupportsPushdownType;
 	function.pushdown_expression = ClickhousePushdownExpression;
+	function.get_virtual_columns = ClickhouseGetVirtualColumns;
 }
 
 ClickhouseScanFunction::ClickhouseScanFunction()
