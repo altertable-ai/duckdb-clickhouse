@@ -48,6 +48,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	dbconnector::pool::ConnectionPoolConfig default_pool_config;
 	config.AddExtensionOption("ch_debug_show_queries", "DEBUG SETTING: print all queries sent to ClickHouse to stdout",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetClickhouseDebugPrintQueries);
+	config.AddExtensionOption("ch_filter_pushdown", "Push filters down into the queries sent to ClickHouse",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("ch_connect_timeout_ms", "Timeout in milliseconds for connecting to ClickHouse",
 	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
 	config.AddExtensionOption("ch_receive_timeout_ms", "Timeout in milliseconds for receiving data from ClickHouse",

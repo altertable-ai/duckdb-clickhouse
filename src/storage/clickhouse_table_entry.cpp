@@ -24,6 +24,7 @@ TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, uniq
 	result->table = name;
 	result->columns = clickhouse_columns;
 	result->approx_rows = approx_rows;
+	result->filter_pushdown = ClickhouseScanFunction::FilterPushdownEnabled(context);
 	bind_data = std::move(result);
 	return ClickhouseScanFunction();
 }

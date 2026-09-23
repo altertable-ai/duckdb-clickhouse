@@ -1,12 +1,18 @@
 #include "clickhouse_scanner.hpp"
 
 #include "clickhouse_conversion.hpp"
+#include "clickhouse_filter_pushdown.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include <optional>
@@ -59,6 +65,9 @@ struct ClickhouseScanGlobalState : public GlobalTableFunctionState {
 	ClickhousePoolConnection connection;
 	string sql;
 	vector<string> column_names;
+	//! Which of column_names / the fetched block's columns must reach `output`, and in what order; empty means
+	//! all of them, in order (see ClickhouseInitGlobal)
+	vector<idx_t> projection_ids;
 	bool finished = false;
 	idx_t next_batch_index = 0;
 	idx_t max_threads = 1;
@@ -104,6 +113,10 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 		source = "(" + bind_data.query + ")";
 	}
 	auto sql = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + source;
+	auto where_clause = ClickhouseFilterPushdown::TransformFilters(column_ids, filters, bind_data.columns);
+	if (!where_clause.empty()) {
+		sql += " WHERE " + where_clause;
+	}
 	sql += bind_data.order_by_clause;
 	sql += bind_data.limit_clause;
 	return sql;
@@ -129,6 +142,10 @@ static unique_ptr<GlobalTableFunctionState> ClickhouseInitGlobal(ClientContext &
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
 	auto result = make_uniq<ClickhouseScanGlobalState>();
 	result->sql = ClickhouseScanFunction::BuildQuery(bind_data, input.column_ids, input.filters);
+	// columns needed only to evaluate a filter DuckDB couldn't push down (ClickhouseSupportsPushdownType
+	// returned false for them) are still fetched -- filter_prune=true lets DuckDB tell us, via
+	// projection_ids, which of the fetched columns actually need to reach `output`
+	result->projection_ids = input.projection_ids;
 	for (auto column_id : input.column_ids) {
 		result->column_names.push_back(IsVirtualColumn(column_id) ? "rowid" : bind_data.columns[column_id].name);
 	}
@@ -185,7 +202,8 @@ static void ClickhouseScan(ClientContext &context, TableFunctionInput &data, Dat
 	while (true) {
 		if (lstate.block && lstate.offset < lstate.block->GetRowCount()) {
 			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, lstate.block->GetRowCount() - lstate.offset);
-			ClickhouseConversion::ConvertBlock(*lstate.block, output, lstate.offset, count, gstate.column_names);
+			ClickhouseConversion::ConvertBlock(*lstate.block, output, lstate.offset, count, gstate.column_names,
+			                                  gstate.projection_ids);
 			lstate.offset += count;
 			return;
 		}
@@ -248,6 +266,100 @@ static BindInfo ClickhouseGetBindInfo(const optional_ptr<FunctionData> bind_data
 	return BindInfo(ScanType::EXTERNAL);
 }
 
+//! DuckDB only hands us filters on columns for which this returns true; it evaluates all others itself
+static bool ClickhouseSupportsPushdownType(const FunctionData &bind_data_p, idx_t column_index) {
+	auto &bind_data = bind_data_p.Cast<ClickhouseScanBindData>();
+	if (!bind_data.filter_pushdown || column_index >= bind_data.columns.size()) {
+		return false;
+	}
+	return ClickhouseTypes::SupportsPushdown(bind_data.columns[column_index].type_node);
+}
+
+bool ClickhouseScanFunction::FilterPushdownEnabled(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("ch_filter_pushdown", value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return true;
+}
+
+//! `CAST(<column> AS VARCHAR)`, unwrapped to the column reference inside, or null when expr isn't that shape
+static const BoundColumnRefExpression *AsVarcharCastOfColumnRef(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+		return nullptr;
+	}
+	auto &cast_expr = expr.Cast<BoundCastExpression>();
+	if (cast_expr.return_type.id() != LogicalTypeId::VARCHAR ||
+	    cast_expr.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	return &cast_expr.child->Cast<BoundColumnRefExpression>();
+}
+
+//! Resolves a BoundColumnRefExpression to its ClickHouse column, when that column may have filters pushed down
+static optional_idx ResolvePushdownableColumn(const LogicalGet &get, const ClickhouseScanBindData &bind_data,
+                                              const BoundColumnRefExpression &column_ref) {
+	if (!bind_data.filter_pushdown) {
+		return optional_idx();
+	}
+	auto &get_column_ids = get.GetColumnIds();
+	if (column_ref.binding.column_index >= get_column_ids.size()) {
+		return optional_idx();
+	}
+	auto column_id = get_column_ids[column_ref.binding.column_index].GetPrimaryIndex();
+	if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size()) {
+		return optional_idx();
+	}
+	if (!ClickhouseTypes::SupportsPushdown(bind_data.columns[column_id].type_node)) {
+		return optional_idx();
+	}
+	return optional_idx(column_id);
+}
+
+//! DuckDB's filter combiner (duckdb/src/optimizer/filter_combiner.cpp) never turns a bare `col IS [NOT] NULL`
+//! into a TableFilterType::IS_NULL / IS_NOT_NULL constant filter for a generic table function the way it does
+//! for `=`, `<`, IN, etc. -- that filter stays a plain LogicalFilter above the scan unless the table function
+//! opts into generic-expression pushdown here, which hands back an ExpressionFilter instead. Same story for
+//! `enum_col = 'literal'`: DuckDB's binder rewrites it to `CAST(enum_col AS VARCHAR) = 'literal'` (casting a
+//! VARCHAR literal to ENUM isn't implicit), so it never becomes a plain constant-comparison filter either.
+//! Only recognize the two shapes ClickhouseFilterPushdown::TransformFilter can translate exactly.
+static bool ClickhousePushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	if (!get.bind_data) {
+		return false;
+	}
+	auto &bind_data = get.bind_data->Cast<ClickhouseScanBindData>();
+
+	if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
+		if (op_expr.children.size() != 1 ||
+		    op_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &column_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+		return ResolvePushdownableColumn(get, bind_data, column_ref).IsValid();
+	}
+
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON &&
+	    (expr.type == ExpressionType::COMPARE_EQUAL || expr.type == ExpressionType::COMPARE_NOTEQUAL)) {
+		auto &comparison = expr.Cast<BoundComparisonExpression>();
+		auto *column_ref = AsVarcharCastOfColumnRef(*comparison.left);
+		auto *other = comparison.right.get();
+		if (!column_ref) {
+			column_ref = AsVarcharCastOfColumnRef(*comparison.right);
+			other = comparison.left.get();
+		}
+		if (!column_ref || other->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+		auto column_id = ResolvePushdownableColumn(get, bind_data, *column_ref);
+		// only ENUM columns get the CAST-to-VARCHAR treatment from the binder; comparing the string form of
+		// any other type (dates, decimals, ...) is not guaranteed to match ClickHouse's own formatting
+		return column_id.IsValid() && bind_data.columns[column_id.GetIndex()].type.id() == LogicalTypeId::ENUM;
+	}
+
+	return false;
+}
+
 void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.init_global = ClickhouseInitGlobal;
 	function.init_local = ClickhouseInitLocal;
@@ -258,7 +370,16 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.dynamic_to_string = ClickhouseScanDynamicToString;
 	function.get_bind_info = ClickhouseGetBindInfo;
 	function.projection_pushdown = true;
-	function.filter_pushdown = false;
+	function.filter_pushdown = true;
+	// lets DuckDB immediately drop columns that are only needed to evaluate a filter it couldn't push down
+	// (see ClickhouseSupportsPushdownType / the projection_ids handling in ClickhouseInitGlobal); required
+	// for correctness once supports_pushdown_type is set, not just an optimization -- see
+	// duckdb/src/optimizer/remove_unused_columns.cpp (only populates LogicalGet::projection_ids when this is
+	// true) and duckdb/src/execution/physical_plan/plan_get.cpp (always sizes the scan's output off it once a
+	// filter on an unsupported column exists)
+	function.filter_prune = true;
+	function.supports_pushdown_type = ClickhouseSupportsPushdownType;
+	function.pushdown_expression = ClickhousePushdownExpression;
 }
 
 ClickhouseScanFunction::ClickhouseScanFunction()

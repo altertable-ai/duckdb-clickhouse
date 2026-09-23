@@ -444,19 +444,26 @@ void ClickhouseConversion::ConvertColumn(const ch::ColumnRef &column, Vector &re
 }
 
 void ClickhouseConversion::ConvertBlock(const ch::Block &block, DataChunk &output, idx_t offset, idx_t count,
-                                         const vector<string> &column_names) {
+                                         const vector<string> &column_names, const vector<idx_t> &projection_ids) {
 	if (output.ColumnCount() == 0) {
 		// no columns requested (e.g. count(*)): only the row count matters
 		output.SetCardinality(count);
 		return;
 	}
-	if (block.GetColumnCount() != output.ColumnCount()) {
+	if (block.GetColumnCount() != column_names.size()) {
 		throw InternalException("ClickHouse returned %llu columns, expected %llu",
 		                         static_cast<uint64_t>(block.GetColumnCount()),
+		                         static_cast<uint64_t>(column_names.size()));
+	}
+	auto projected_count = projection_ids.empty() ? output.ColumnCount() : projection_ids.size();
+	if (projected_count != output.ColumnCount()) {
+		throw InternalException("ClickHouse scan: %llu projected columns, expected %llu",
+		                         static_cast<uint64_t>(projected_count),
 		                         static_cast<uint64_t>(output.ColumnCount()));
 	}
 	for (idx_t c = 0; c < output.ColumnCount(); c++) {
-		ConvertColumn(block[c], output.data[c], offset, count, column_names[c]);
+		auto source = projection_ids.empty() ? c : projection_ids[c];
+		ConvertColumn(block[source], output.data[c], offset, count, column_names[source]);
 	}
 	output.SetCardinality(count);
 }

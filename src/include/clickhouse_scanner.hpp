@@ -45,6 +45,8 @@ public:
 	static void SetReturnTypes(const ClickhouseScanBindData &bind_data, vector<LogicalType> &return_types,
 	                            vector<string> &names);
 	static bool IsClickhouseScan(const string &function_name);
+	//! ch_filter_pushdown
+	static bool FilterPushdownEnabled(ClientContext &context);
 };
 
 } // namespace duckdb
