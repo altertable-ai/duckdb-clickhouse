@@ -6,11 +6,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# FORCE: DuckDB's top-level CMakeLists.txt already sets this CACHE variable to "11" before our
-# extension's CMakeLists.txt is add_subdirectory()-ed in, so a plain `set(... CACHE ...)` here is a
-# no-op. We need real C++17 (clickhouse-cpp pulls in abseil headers that use C++14/17 std type-trait
-# aliases such as std::conditional_t under our compiler/libc++), so we force the override.
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce" FORCE)
+set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # clickhouse-cpp and its dependencies come from vcpkg (see vcpkg.json)
