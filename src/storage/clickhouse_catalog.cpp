@@ -1,7 +1,9 @@
 #include "storage/clickhouse_catalog.hpp"
 
 #include "clickhouse_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 
@@ -31,11 +33,11 @@ shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &na
 }
 
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	ClickhouseUtils::ThrowReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("CREATE SCHEMA");
 }
 
 void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	ClickhouseUtils::ThrowReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("DROP SCHEMA");
 }
 
 void ClickhouseCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -61,31 +63,41 @@ optional_ptr<SchemaCatalogEntry> ClickhouseCatalog::LookupSchema(CatalogTransact
 	return &entry->Cast<SchemaCatalogEntry>();
 }
 
+void ClickhouseCatalog::ThrowIfReadOnly() const {
+	if (GetAttached().IsReadOnly()) {
+		ClickhouseUtils::ThrowReadOnly(GetName());
+	}
+}
+
 PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,
                                                        PhysicalOperator &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowIfReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("CREATE TABLE AS");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &, PhysicalPlanGenerator &, LogicalInsert &,
                                                 optional_ptr<PhysicalOperator>) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowIfReadOnly();
+	// replaced in Task 3
+	ClickhouseUtils::ThrowUnsupportedWrite("INSERT");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &,
                                                 PhysicalOperator &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowIfReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("DELETE");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenerator &, LogicalUpdate &,
                                                 PhysicalOperator &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowIfReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("UPDATE");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &,
                                                    PhysicalOperator &) {
-	// the base Catalog::PlanMergeInto() throws NotImplementedException; MERGE INTO is a write like any
-	// other and must be rejected with the same read-only error
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowIfReadOnly();
+	throw NotImplementedException("MERGE INTO is not supported for ClickHouse tables");
 }
 
 unique_ptr<LogicalOperator> ClickhouseCatalog::BindCreateIndex(Binder &, CreateStatement &, TableCatalogEntry &,
@@ -93,14 +105,14 @@ unique_ptr<LogicalOperator> ClickhouseCatalog::BindCreateIndex(Binder &, CreateS
 	// must throw here, before the base implementation's IndexBinder::BindCreateIndex() gets anywhere near
 	// LogicalGet::bind_data: it assumes bind_data is a TableScanBindData and casts + writes through it,
 	// which is type confusion against our ClickhouseScanBindData
-	ClickhouseUtils::ThrowReadOnly();
+	throw NotImplementedException("Indexes are not supported for ClickHouse tables");
 }
 
 unique_ptr<LogicalOperator> ClickhouseCatalog::BindAlterAddIndex(Binder &, TableCatalogEntry &,
                                                                  unique_ptr<LogicalOperator>,
                                                                  unique_ptr<CreateIndexInfo>,
                                                                  unique_ptr<AlterTableInfo>) {
-	ClickhouseUtils::ThrowReadOnly();
+	throw NotImplementedException("Indexes are not supported for ClickHouse tables");
 }
 
 DatabaseSize ClickhouseCatalog::GetDatabaseSize(ClientContext &context) {

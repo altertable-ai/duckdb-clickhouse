@@ -1,0 +1,68 @@
+# name: test/sql/write/read_only_attach.test
+# description: an ATTACH with READ_ONLY rejects every write; reads keep working
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse, READ_ONLY);
+
+query I
+SELECT count(*) FROM ch.test_db.t1;
+----
+3
+
+statement error
+INSERT INTO ch.test_db.t1 (id, name) VALUES (4, 'Dan');
+----
+attached in read-only mode
+
+statement error
+UPDATE ch.test_db.t1 SET name = 'x';
+----
+attached in read-only mode
+
+statement error
+DELETE FROM ch.test_db.t1;
+----
+attached in read-only mode
+
+statement error
+CREATE TABLE ch.test_db.new_table (i INTEGER);
+----
+attached in read-only mode
+
+statement error
+DROP TABLE ch.test_db.t1;
+----
+attached in read-only mode
+
+statement error
+CREATE SCHEMA ch.new_db;
+----
+attached in read-only mode
+
+statement error
+MERGE INTO ch.test_db.t1 USING (VALUES (1)) src(id) ON t1.id = src.id
+WHEN MATCHED THEN UPDATE SET name = 'x';
+----
+attached in read-only mode
+
+# indexes are rejected while binding, before DuckDB's read-only check runs
+statement error
+CREATE INDEX idx ON ch.test_db.t1(id);
+----
+Indexes are not supported for ClickHouse tables
+
+query I
+SELECT count(*) FROM ch.test_db.t1;
+----
+3

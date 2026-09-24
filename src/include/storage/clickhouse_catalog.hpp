@@ -80,6 +80,11 @@ public:
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
+	//! Throws ClickhouseUtils::ThrowReadOnly() if this database was attached with READ_ONLY. DuckDB's own
+	//! read-only check runs only after physical planning; PlanInsert/PlanDelete/PlanUpdate/PlanCreateTableAs/
+	//! PlanMergeInto are invoked during physical planning itself, so DuckDB's check never gets a chance to run
+	//! for them and this extension must check first.
+	void ThrowIfReadOnly() const;
 
 	ClickhouseConnectionConfig config;
 	ClickhouseAttachOptions options;

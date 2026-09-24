@@ -6,46 +6,52 @@
 
 namespace duckdb {
 
+[[noreturn]] static void ThrowNotSupported(const string &what) {
+	throw NotImplementedException("%s cannot be created in a ClickHouse database", what);
+}
+
 ClickhouseSchemaEntry::ClickhouseSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
     : SchemaCatalogEntry(catalog, info), tables(*this, catalog) {
 }
 
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("CREATE TABLE");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Functions and macros");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &,
                                                               TableCatalogEntry &) {
-	ClickhouseUtils::ThrowReadOnly();
+	throw NotImplementedException("Indexes are not supported for ClickHouse tables");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	throw NotImplementedException(
+	    "CREATE VIEW is not supported for ClickHouse databases; create the view in ClickHouse with "
+	    "clickhouse_execute()");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Sequences");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Table functions");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Copy functions");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Pragma functions");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Collations");
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ThrowNotSupported("Types");
 }
 void ClickhouseSchemaEntry::Alter(CatalogTransaction, AlterInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("ALTER TABLE");
 }
 void ClickhouseSchemaEntry::DropEntry(ClientContext &, DropInfo &) {
-	ClickhouseUtils::ThrowReadOnly();
+	ClickhouseUtils::ThrowUnsupportedWrite("DROP");
 }
 
 void ClickhouseSchemaEntry::Scan(ClientContext &context, CatalogType type,

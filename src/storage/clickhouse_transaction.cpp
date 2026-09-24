@@ -1,6 +1,9 @@
 #include "storage/clickhouse_transaction.hpp"
 
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/attached_database.hpp"
 
 namespace duckdb {
 
@@ -9,6 +12,10 @@ ClickhouseTransaction::ClickhouseTransaction(TransactionManager &manager, Client
 }
 
 ClickhouseTransaction::~ClickhouseTransaction() = default;
+
+ClickhouseTransaction &ClickhouseTransaction::Get(ClientContext &context, Catalog &catalog) {
+	return Transaction::Get(context, catalog).Cast<ClickhouseTransaction>();
+}
 
 ClickhouseTransactionManager::ClickhouseTransactionManager(AttachedDatabase &db) : TransactionManager(db) {
 }
@@ -28,6 +35,15 @@ ErrorData ClickhouseTransactionManager::CommitTransaction(ClientContext &context
 }
 
 void ClickhouseTransactionManager::RollbackTransaction(Transaction &transaction) {
+	auto &clickhouse_transaction = transaction.Cast<ClickhouseTransaction>();
+	if (clickhouse_transaction.HasWritten()) {
+		auto context = clickhouse_transaction.context.lock();
+		if (context) {
+			DUCKDB_LOG_WARNING(*context, StringUtil::Format("ClickHouse writes made in this transaction were already "
+			                                                "committed and cannot be rolled back (database \"%s\")",
+			                                                db.GetName()));
+		}
+	}
 	lock_guard<mutex> guard(transaction_lock);
 	transactions.erase(transaction);
 }

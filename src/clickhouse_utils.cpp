@@ -70,8 +70,15 @@ bool ClickhouseUtils::IsValidUtf8(const char *data, idx_t size) {
 	return true;
 }
 
-void ClickhouseUtils::ThrowReadOnly() {
-	throw PermissionException("clickhouse_scanner is read-only: writing to ClickHouse is not supported");
+void ClickhouseUtils::ThrowUnsupportedWrite(const string &statement) {
+	throw NotImplementedException("%s is not supported on attached ClickHouse databases yet; run it in ClickHouse "
+	                              "with clickhouse_execute() instead",
+	                              statement);
+}
+
+void ClickhouseUtils::ThrowReadOnly(const string &database_name) {
+	throw PermissionException("Cannot write to ClickHouse database \"%s\": it is attached in read-only mode",
+	                          database_name);
 }
 
 } // namespace duckdb

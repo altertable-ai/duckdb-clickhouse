@@ -31,7 +31,7 @@ test_db
 statement error
 CREATE SCHEMA ch.new_db;
 ----
-clickhouse_scanner is read-only
+CREATE SCHEMA is not supported on attached ClickHouse databases yet
 
 statement ok
 DETACH ch;

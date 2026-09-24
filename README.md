@@ -1,8 +1,8 @@
 # DuckDB ClickHouse extension (`clickhouse_scanner`)
 
 Query [ClickHouse](https://clickhouse.com) from DuckDB. The extension attaches a ClickHouse service, including
-ClickHouse Cloud, as a read-only DuckDB database. It speaks the native protocol (with TLS) and pushes projections,
-filters and `LIMIT` / `ORDER BY … LIMIT` down into ClickHouse.
+ClickHouse Cloud, as a DuckDB database you can query and write to. It speaks the native protocol (with TLS) and
+pushes projections, filters and `LIMIT` / `ORDER BY … LIMIT` down into ClickHouse.
 
 ```sql
 INSTALL clickhouse_scanner FROM community;
@@ -111,7 +111,9 @@ single-threaded scan.
 
 ## Limitations
 
-- Read-only: `INSERT`, `UPDATE`, `DELETE` and DDL are rejected.
+- `UPDATE`, `DELETE` and DDL (`CREATE`/`DROP`/`ALTER`) are not supported yet; run them with `clickhouse_execute()`.
+  `MERGE INTO`, indexes and `CREATE VIEW` are not supported.
+- Attach with `(TYPE clickhouse, READ_ONLY)` to reject every write.
 - ClickHouse has no multi-statement transactions. Two scans in one DuckDB transaction may see different data.
 - Not available in DuckDB-WASM (the native protocol needs TCP).
 
