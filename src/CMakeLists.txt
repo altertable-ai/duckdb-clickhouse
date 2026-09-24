@@ -6,6 +6,7 @@ add_library(
   clickhouse_connection_config.cpp
   clickhouse_conversion.cpp
   clickhouse_error_codes.cpp
+  clickhouse_execute.cpp
   clickhouse_filter_pushdown.cpp
   clickhouse_query.cpp
   clickhouse_scanner.cpp

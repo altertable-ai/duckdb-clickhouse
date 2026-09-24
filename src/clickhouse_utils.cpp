@@ -1,6 +1,7 @@
 #include "clickhouse_utils.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
 
@@ -68,6 +69,15 @@ bool ClickhouseUtils::IsValidUtf8(const char *data, idx_t size) {
 		i += length;
 	}
 	return true;
+}
+
+string ClickhouseUtils::StripTrailingSemicolons(string sql) {
+	StringUtil::RTrim(sql);
+	while (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::RTrim(sql);
+	}
+	return sql;
 }
 
 void ClickhouseUtils::ThrowUnsupportedWrite(const string &statement) {

@@ -33,7 +33,7 @@ bool ClickhouseConnectionPool::TryRecoverConnection(ClickhouseConnection &connec
 	if (connection.IsQueryRunning()) {
 		connection.Cancel();
 	}
-	return !connection.IsBroken() && !connection.IsQueryRunning();
+	return !connection.IsBroken() && !connection.IsQueryRunning() && !connection.IsInserting();
 }
 
 dbconnector::pool::ConnectionPoolConfig ClickhouseConnectionPool::PoolConfigFromContext(ClientContext &context) {

@@ -12,6 +12,7 @@ vcpkg_from_github(
         fix-deps-and-build-type.patch
         werror.patch
         expose-low-cardinality-columns.patch
+        insert-query-settings.patch
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS

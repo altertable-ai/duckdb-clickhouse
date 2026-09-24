@@ -42,12 +42,18 @@ static bool IsUpperSnakeCase(const string &value) {
 //! exception class, e.g. "DB::Exception") if the code itself is unrecognized.
 static string ErrorCodeName(const clickhouse::Exception &error) {
 	const string &text = error.display_text;
-	idx_t search_end = text.size();
-	for (int attempt = 0; attempt < 3 && search_end > 0; attempt++) {
-		auto close = text.rfind(')', search_end - 1);
-		if (close == string::npos) {
+	idx_t end = text.size();
+	for (int attempt = 0; attempt < 3; attempt++) {
+		// only a "(NAME)" anchored to the end (ignoring trailing whitespace) counts -- a parenthesized token
+		// elsewhere in a long message (e.g. a syntax error echoing the offending token, "... (THIS): ...")
+		// is not the symbolic error code
+		while (end > 0 && StringUtil::CharacterIsSpace(text[end - 1])) {
+			end--;
+		}
+		if (end == 0 || text[end - 1] != ')') {
 			break;
 		}
+		auto close = end - 1;
 		auto open = text.rfind('(', close);
 		if (open == string::npos) {
 			break;
@@ -56,7 +62,7 @@ static string ErrorCodeName(const clickhouse::Exception &error) {
 		if (IsUpperSnakeCase(candidate)) {
 			return candidate;
 		}
-		search_end = open;
+		end = open;
 	}
 	auto looked_up = ClickhouseErrorCodeName(error.code);
 	if (looked_up[0] != '\0') {
@@ -248,8 +254,64 @@ vector<clickhouse::Block> ClickhouseConnection::Query(const string &sql) {
 	return result;
 }
 
+bool ClickhouseConnection::Execute(const string &sql) {
+	BeginQuery(sql);
+	while (auto block = NextBlock()) {
+		if (block->GetRowCount() > 0) {
+			Cancel();
+			return false;
+		}
+	}
+	return true;
+}
+
+clickhouse::Block ClickhouseConnection::BeginInsert(const string &sql) {
+	if (debug_print_queries) {
+		Printer::Print(sql + "\n");
+	}
+	last_used = std::chrono::steady_clock::now();
+	try {
+		return client->BeginInsert(MakeQuery(sql));
+	} catch (...) {
+		// clickhouse-cpp stays in its "inserting" state after a failed BeginInsert, even for a server error
+		// (e.g. an unknown table), so this connection cannot run anything else
+		broken = true;
+		RethrowAsDuckDBException(sql);
+	}
+}
+
+void ClickhouseConnection::SendInsertBlock(const clickhouse::Block &block) {
+	last_used = std::chrono::steady_clock::now();
+	try {
+		client->SendInsertBlock(block);
+	} catch (...) {
+		broken = true;
+		RethrowAsDuckDBException(string());
+	}
+}
+
+void ClickhouseConnection::EndInsert() {
+	last_used = std::chrono::steady_clock::now();
+	try {
+		client->EndInsert();
+	} catch (...) {
+		broken = true;
+		RethrowAsDuckDBException(string());
+	}
+}
+
+void ClickhouseConnection::AbortInsert() {
+	if (client->IsInserting()) {
+		broken = true;
+	}
+}
+
+bool ClickhouseConnection::IsInserting() const {
+	return client->IsInserting();
+}
+
 bool ClickhouseConnection::IsHealthy() {
-	if (broken || client->IsSelecting()) {
+	if (broken || client->IsSelecting() || client->IsInserting()) {
 		return false;
 	}
 	auto now = std::chrono::steady_clock::now();

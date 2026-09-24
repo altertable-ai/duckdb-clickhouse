@@ -50,6 +50,7 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 | Function | Description |
 |---|---|
 | `clickhouse_query(database, sql)` | Runs any ClickHouse query through an attached database. Projections, filters and LIMIT are pushed into it. |
+| `clickhouse_execute(database, sql)` | Runs a ClickHouse statement that returns no rows (DDL, `ALTER`, mutations, `OPTIMIZE`, `SYSTEM …`) and clears that database's metadata cache. Returns `Success = true`. |
 | `clickhouse_scan(connection, database, table [, secret := name])` | Reads one table without `ATTACH`. `connection` accepts the same `key=value`/URI forms as `ATTACH`. |
 | `clickhouse_clear_cache()` | Forgets cached databases, tables and columns. |
 | `clickhouse_type_mapping(type)` | Shows how a ClickHouse type is mapped and read. |
@@ -93,6 +94,27 @@ only when every filter on the scan was pushed into ClickHouse too, so turning of
 | `AggregateFunction` | not readable; use `clickhouse_query` with `finalizeAggregation` |
 
 `rowid` is always `NULL` for ClickHouse tables: ClickHouse has no row identifier.
+
+## Writing
+
+Attached databases are writable unless attached with `READ_ONLY`, which rejects every write, including
+`clickhouse_execute`:
+
+```sql
+ATTACH '' AS ch (TYPE clickhouse, SECRET ch, READ_ONLY);
+```
+
+**Every write is committed immediately.** ClickHouse has no multi-statement transactions: each write statement is
+sent to ClickHouse and committed when it runs. `COMMIT` does nothing, and `ROLLBACK` cannot undo writes that already
+reached ClickHouse. A `ROLLBACK` after a ClickHouse write logs a warning, which is visible after
+`CALL enable_logging(level = 'warning')` in `duckdb_logs`.
+
+`clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
+metadata cache is cleared, so the change is visible to DuckDB right away:
+
+```sql
+CALL clickhouse_execute('ch', 'CREATE TABLE analytics.daily (d Date, n UInt64) ENGINE = SummingMergeTree ORDER BY d');
+```
 
 ## Filter and LIMIT pushdown
 

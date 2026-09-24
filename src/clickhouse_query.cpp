@@ -1,4 +1,5 @@
 #include "clickhouse_scanner.hpp"
+#include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
@@ -7,15 +8,6 @@
 #include "storage/clickhouse_catalog.hpp"
 
 namespace duckdb {
-
-static string StripTrailingSemicolons(string sql) {
-	StringUtil::RTrim(sql);
-	while (!sql.empty() && sql.back() == ';') {
-		sql.pop_back();
-		StringUtil::RTrim(sql);
-	}
-	return sql;
-}
 
 static bool IsIdentifierCharacter(char c) {
 	return StringUtil::CharacterIsAlphaNumeric(c) || c == '_';
@@ -73,7 +65,7 @@ static unique_ptr<FunctionData> ClickhouseQueryBind(ClientContext &context, Tabl
 
 	auto result = make_uniq<ClickhouseScanBindData>();
 	result->pool = catalog.Cast<ClickhouseCatalog>().GetConnectionPoolPtr();
-	result->query = StripTrailingSemicolons(StringValue::Get(input.inputs[1]));
+	result->query = ClickhouseUtils::StripTrailingSemicolons(StringValue::Get(input.inputs[1]));
 	if (result->query.empty()) {
 		throw BinderException("clickhouse_query: the query cannot be empty");
 	}

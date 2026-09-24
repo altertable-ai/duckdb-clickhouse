@@ -43,7 +43,24 @@ public:
 	//! Runs a query to completion and returns all of its blocks
 	vector<clickhouse::Block> Query(const string &sql);
 
-	//! Usable for a new query: not broken, not mid-query, and answers a ping when it has been idle for 30s
+	//! Runs a statement that is not expected to return rows, e.g. DDL. Returns false -- after cancelling the rest
+	//! of the result -- as soon as the statement returns a row, true once it has finished without returning any
+	bool Execute(const string &sql);
+
+	//! Starts an INSERT (`INSERT INTO … VALUES` or `INSERT INTO … SELECT … FROM input(…)`) with the connection's
+	//! settings, and returns the server's header block: one empty column per value sent, in order
+	clickhouse::Block BeginInsert(const string &sql);
+	//! Sends one block of rows for the INSERT started by BeginInsert()
+	void SendInsertBlock(const clickhouse::Block &block);
+	//! Finishes the INSERT started by BeginInsert(); errors ClickHouse reports while writing surface here
+	void EndInsert();
+	//! Abandons the INSERT started by BeginInsert(). The native protocol cannot cancel an INSERT, so the connection is
+	//! marked broken: the pool closes it instead of reusing it, and ClickHouse aborts the query when the socket
+	//! closes. No-op when no INSERT is running
+	void AbortInsert();
+	bool IsInserting() const;
+
+	//! Usable for a new query: not broken, not mid-query or mid-insert, and answers a ping when it has been idle for 30s
 	bool IsHealthy();
 	//! True after a network or protocol error. Broken connections are never reused
 	bool IsBroken() const;

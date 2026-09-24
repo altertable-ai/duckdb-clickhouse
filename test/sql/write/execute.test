@@ -1,0 +1,150 @@
+# name: test/sql/write/execute.test
+# description: clickhouse_execute runs ClickHouse statements, clears the metadata cache and counts as a write
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_exec');
+
+# load the schema list first, so the next check proves clickhouse_execute clears it
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch' AND schema_name = 'w_exec';
+----
+0
+
+query I
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_exec');
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch' AND schema_name = 'w_exec';
+----
+1
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_exec.t (id UInt32, s String) ENGINE = MergeTree ORDER BY id');
+
+# trailing semicolons are ignored
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_exec.t VALUES (1, ''a''), (2, ''b'');');
+
+query II
+SELECT * FROM ch.w_exec.t ORDER BY id;
+----
+1	a
+2	b
+
+# the SELECT * FROM form works too, and ALTERs are visible right away
+query I
+SELECT Success FROM clickhouse_execute('ch', 'ALTER TABLE w_exec.t ADD COLUMN extra UInt8 DEFAULT 7');
+----
+true
+
+query III
+SELECT * FROM ch.w_exec.t ORDER BY id;
+----
+1	a	7
+2	b	7
+
+statement error
+CALL clickhouse_execute('ch', 'SELECT 1');
+----
+use clickhouse_query()
+
+statement error
+CALL clickhouse_execute('ch', 'THIS IS NOT SQL');
+----
+ClickHouse error 62 (SYNTAX_ERROR)
+
+statement error
+CALL clickhouse_execute('ch', NULL);
+----
+cannot be NULL
+
+statement error
+CALL clickhouse_execute('ch', '  ;  ');
+----
+cannot be empty
+
+statement error
+CALL clickhouse_execute('memory', 'SELECT 1');
+----
+is not a ClickHouse database
+
+statement error
+CALL clickhouse_execute('nope', 'SELECT 1');
+----
+Failed to find attached database
+
+# a READ_ONLY attachment rejects clickhouse_execute; nothing reaches ClickHouse
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch_ro (TYPE clickhouse, READ_ONLY);
+
+statement error
+CALL clickhouse_execute('ch_ro', 'CREATE DATABASE w_exec_never');
+----
+attached in read-only mode
+
+query I
+SELECT count(*) FROM clickhouse_query('ch', 'SELECT name FROM system.databases WHERE name = ''w_exec_never''');
+----
+0
+
+# ROLLBACK cannot undo a ClickHouse write: the write stays and a warning is logged
+statement ok
+CALL enable_logging(level = 'warning');
+
+statement ok
+BEGIN;
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_exec.t (id, s) VALUES (3, ''c'')');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ch.w_exec.t;
+----
+3
+
+query II
+SELECT log_level, message FROM duckdb_logs WHERE message LIKE '%cannot be rolled back%';
+----
+WARNING	ClickHouse writes made in this transaction were already committed and cannot be rolled back (database "ch")
+
+# a transaction that only read rolls back silently
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM ch.w_exec.t;
+----
+3
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back%';
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_exec');

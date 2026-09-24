@@ -25,6 +25,7 @@ protected:
 	//! CheckConnectionHealthy() is false while a query is running (IsHealthy() reports unusable-right-now,
 	//! not unrecoverable), which would otherwise make the pool discard every connection returned mid-query
 	//! (e.g. a LIMIT-terminated scan). Cancels the in-flight query so the connection can be reset and reused.
+	//! An INSERT cannot be cancelled, so a connection returned mid-insert is never recovered.
 	bool TryRecoverConnection(ClickhouseConnection &connection) override;
 
 private:
