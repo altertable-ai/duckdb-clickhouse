@@ -49,6 +49,9 @@ struct ClickhouseColumnInfo {
 	ClickhouseTypeNode type_node;
 	LogicalType type;
 	bool readable = true;
+	//! system.columns.default_kind for table columns: "", DEFAULT, MATERIALIZED or ALIAS (EPHEMERAL columns are not
+	//! loaded). Empty for query results
+	string default_kind;
 
 	static ClickhouseColumnInfo Create(const string &name, const string &clickhouse_type);
 };

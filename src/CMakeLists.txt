@@ -14,7 +14,8 @@ add_library(
   clickhouse_secrets.cpp
   clickhouse_type_mapping_function.cpp
   clickhouse_types.cpp
-  clickhouse_utils.cpp)
+  clickhouse_utils.cpp
+  clickhouse_writer.cpp)
 
 # DuckDB's top-level CMakeLists.txt sets CMAKE_CXX_STANDARD to 11 as a CACHE
 # variable before this extension is add_subdirectory()-ed in, so the CACHE

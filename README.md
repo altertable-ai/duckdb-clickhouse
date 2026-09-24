@@ -61,6 +61,7 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 |---|---|---|
 | `ch_filter_pushdown` | `true` | Push filters into ClickHouse queries |
 | `ch_order_pushdown` | `true` | Push `LIMIT` and `ORDER BY … LIMIT` into ClickHouse queries |
+| `ch_insert_block_size` | `65536` | Rows per block sent to ClickHouse during `INSERT` |
 | `ch_connect_timeout_ms` | `10000` | Connection timeout |
 | `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
 | `ch_pool_max_connections` | depends on CPU count | Connection pool size per attached database (new ATTACHes) |
@@ -108,6 +109,33 @@ ATTACH '' AS ch (TYPE clickhouse, SECRET ch, READ_ONLY);
 sent to ClickHouse and committed when it runs. `COMMIT` does nothing, and `ROLLBACK` cannot undo writes that already
 reached ClickHouse. A `ROLLBACK` after a ClickHouse write logs a warning, which is visible after
 `CALL enable_logging(level = 'warning')` in `duckdb_logs`.
+
+`INSERT` (with `VALUES` or a `SELECT`) and `COPY … FROM` stream rows into ClickHouse over the native protocol, in
+blocks of `ch_insert_block_size` rows:
+
+```sql
+INSERT INTO ch.analytics.events SELECT * FROM read_parquet('events/*.parquet');
+COPY ch.analytics.events FROM 'events.csv';
+```
+
+- **Defaults:** only the listed columns are sent, so ClickHouse fills the others with their `DEFAULT` expressions.
+  `MATERIALIZED` and `ALIAS` columns cannot be inserted into: list the other columns explicitly.
+- **Out-of-range values:** values ClickHouse cannot store are rejected, never clamped:
+  - dates and timestamps outside the range of `Date`, `Date32`, `DateTime` or `DateTime64`;
+  - strings longer than a `FixedString`;
+  - `NULL` in a non-`Nullable` column, including `Array`, `Tuple` and `Map` columns, which ClickHouse cannot make
+    `Nullable`.
+- **Precision:** timestamps and times are written at the column's precision, and anything finer is truncated.
+- **Atomicity:** an `INSERT` is not atomic. If it fails part-way, ClickHouse may already have committed the blocks sent
+  so far. On replicated tables, ClickHouse deduplicates identical blocks by default; attach with
+  `SETTINGS 'insert_deduplicate=0'` to turn that off.
+- **Unsupported:**
+  - `RETURNING` and `ON CONFLICT`;
+  - columns of type `Variant`, `Dynamic`, `AggregateFunction` or `SimpleAggregateFunction`, or nested types holding a
+    type that ClickHouse converts (e.g. `Array(IPv4)`). Leave these columns out of the column list, or use
+    `clickhouse_execute`;
+  - columns ClickHouse converts on read (`IPv4/6`, `(U)Int256`, `Decimal256`, `JSON`, geo types) are not supported
+    **yet**.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

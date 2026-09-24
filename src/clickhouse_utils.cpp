@@ -91,4 +91,27 @@ void ClickhouseUtils::ThrowReadOnly(const string &database_name) {
 	                          database_name);
 }
 
+int64_t ClickhouseUtils::PowerOfTen(idx_t exponent) {
+	int64_t result = 1;
+	for (idx_t i = 0; i < exponent; i++) {
+		result *= 10;
+	}
+	return result;
+}
+
+int64_t ClickhouseUtils::ScaleTicks(int64_t ticks, idx_t from_precision, idx_t to_precision) {
+	if (from_precision == to_precision) {
+		return ticks;
+	}
+	if (from_precision < to_precision) {
+		return ticks * PowerOfTen(to_precision - from_precision);
+	}
+	auto divisor = PowerOfTen(from_precision - to_precision);
+	auto result = ticks / divisor;
+	if (ticks % divisor != 0 && ticks < 0) {
+		result -= 1;
+	}
+	return result;
+}
+
 } // namespace duckdb

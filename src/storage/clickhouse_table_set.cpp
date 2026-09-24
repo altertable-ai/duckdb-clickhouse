@@ -35,20 +35,23 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 	}
 
 	// EPHEMERAL columns only exist for INSERTs and cannot be selected
-	auto columns_query = "SELECT table, name, type FROM system.columns WHERE database = " + database +
+	auto columns_query = "SELECT table, name, type, default_kind FROM system.columns WHERE database = " + database +
 	                     " AND default_kind != 'EPHEMERAL' ORDER BY table, position";
 	vector<ClickhouseTableDefinition> tables;
 	for (auto &block : connection->Query(columns_query)) {
 		auto table_names = block[0]->As<clickhouse::ColumnString>();
 		auto column_names = block[1]->As<clickhouse::ColumnString>();
 		auto column_types = block[2]->As<clickhouse::ColumnString>();
+		auto column_kinds = block[3]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {
 			string table_name(table_names->At(row));
 			if (tables.empty() || tables.back().name != table_name) {
 				tables.push_back(ClickhouseTableDefinition {table_name, {}});
 			}
-			tables.back().columns.push_back(
-			    ClickhouseColumnInfo::Create(string(column_names->At(row)), string(column_types->At(row))));
+			auto column =
+			    ClickhouseColumnInfo::Create(string(column_names->At(row)), string(column_types->At(row)));
+			column.default_kind = string(column_kinds->At(row));
+			tables.back().columns.push_back(std::move(column));
 		}
 	}
 

@@ -20,30 +20,6 @@ namespace ch = clickhouse;
 	                        column->Type()->GetName(), result.GetType().ToString());
 }
 
-static int64_t PowerOfTen(idx_t exponent) {
-	int64_t result = 1;
-	for (idx_t i = 0; i < exponent; i++) {
-		result *= 10;
-	}
-	return result;
-}
-
-//! Rescales ticks between decimal precisions, flooring when precision is lost
-static int64_t ScaleTicks(int64_t ticks, idx_t from_precision, idx_t to_precision) {
-	if (from_precision == to_precision) {
-		return ticks;
-	}
-	if (from_precision < to_precision) {
-		return ticks * PowerOfTen(to_precision - from_precision);
-	}
-	auto divisor = PowerOfTen(from_precision - to_precision);
-	auto result = ticks / divisor;
-	if (ticks % divisor != 0 && ticks < 0) {
-		result -= 1;
-	}
-	return result;
-}
-
 template <class T>
 static void ConvertNumeric(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,
                            const string &column_name) {
@@ -202,7 +178,7 @@ static void ConvertTimestamp(const ch::ColumnRef &column, Vector &result, idx_t 
 	if (auto typed = column->As<ch::ColumnDateTime64>()) {
 		auto precision = typed->GetPrecision();
 		for (idx_t i = 0; i < count; i++) {
-			data[i] = timestamp_tz_t(ScaleTicks(typed->At(offset + i), precision, 6));
+			data[i] = timestamp_tz_t(ClickhouseUtils::ScaleTicks(typed->At(offset + i), precision, 6));
 		}
 		return;
 	}
@@ -218,7 +194,7 @@ static void ConvertTime(const ch::ColumnRef &column, Vector &result, idx_t offse
 	}
 	idx_t precision = time32 ? 0 : time64->GetPrecision();
 	auto nanoseconds = result.GetType().id() == LogicalTypeId::TIME_NS;
-	auto max_ticks = Interval::SECS_PER_DAY * PowerOfTen(precision);
+	auto max_ticks = Interval::SECS_PER_DAY * ClickhouseUtils::PowerOfTen(precision);
 	auto &validity = FlatVector::Validity(result);
 	for (idx_t i = 0; i < count; i++) {
 		if (!validity.RowIsValid(i)) {
@@ -231,9 +207,9 @@ static void ConvertTime(const ch::ColumnRef &column, Vector &result, idx_t offse
 			    column_name);
 		}
 		if (nanoseconds) {
-			FlatVector::GetData<dtime_ns_t>(result)[i] = dtime_ns_t(ScaleTicks(ticks, precision, 9));
+			FlatVector::GetData<dtime_ns_t>(result)[i] = dtime_ns_t(ClickhouseUtils::ScaleTicks(ticks, precision, 9));
 		} else {
-			FlatVector::GetData<dtime_t>(result)[i] = dtime_t(ScaleTicks(ticks, precision, 6));
+			FlatVector::GetData<dtime_t>(result)[i] = dtime_t(ClickhouseUtils::ScaleTicks(ticks, precision, 6));
 		}
 	}
 }

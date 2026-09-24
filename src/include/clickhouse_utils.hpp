@@ -20,6 +20,10 @@ public:
 	//! itself rejects write statements on such databases; this covers what DuckDB cannot see, e.g.
 	//! clickhouse_execute()
 	[[noreturn]] static void ThrowReadOnly(const string &database_name);
+	//! 10^exponent (exponent <= 18)
+	static int64_t PowerOfTen(idx_t exponent);
+	//! Rescales ticks between decimal precisions, flooring when precision is lost
+	static int64_t ScaleTicks(int64_t ticks, idx_t from_precision, idx_t to_precision);
 };
 
 } // namespace duckdb

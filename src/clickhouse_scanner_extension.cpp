@@ -32,6 +32,12 @@ static void SetClickhouseDebugPrintQueries(ClientContext &context, SetScope scop
 	ClickhouseConnection::SetDebugPrintQueries(BooleanValue::Get(parameter));
 }
 
+static void SetClickhouseInsertBlockSize(ClientContext &context, SetScope scope, Value &parameter) {
+	if (UBigIntValue::Get(parameter) == 0) {
+		throw InvalidInputException("ch_insert_block_size must be greater than 0");
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction version_function("clickhouse_client_version", {}, LogicalType::VARCHAR,
 	                                ClickhouseClientVersionFunction);
@@ -75,6 +81,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis));
 	config.AddExtensionOption("ch_order_pushdown", "Push LIMIT and ORDER BY ... LIMIT down into ClickHouse queries",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("ch_insert_block_size", "Rows per block sent to ClickHouse during INSERT",
+	                          LogicalType::UBIGINT, Value::UBIGINT(65536), SetClickhouseInsertBlockSize);
 	OptimizerExtension clickhouse_optimizer;
 	clickhouse_optimizer.optimize_function = ClickhouseOptimizer::Optimize;
 	OptimizerExtension::Register(config, std::move(clickhouse_optimizer));

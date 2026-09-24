@@ -3,10 +3,14 @@
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "storage/clickhouse_insert.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
+#include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
 
@@ -90,11 +94,23 @@ PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &, Physical
 	ClickhouseUtils::ThrowUnsupportedWrite("CREATE TABLE AS");
 }
 
-PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &, PhysicalPlanGenerator &, LogicalInsert &,
-                                                optional_ptr<PhysicalOperator>) {
+PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
 	ThrowIfReadOnly();
-	// replaced in Task 3
-	ClickhouseUtils::ThrowUnsupportedWrite("INSERT");
+	if (op.return_chunk) {
+		throw NotImplementedException("RETURNING is not supported for ClickHouse tables");
+	}
+	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw NotImplementedException("ON CONFLICT is not supported for ClickHouse tables");
+	}
+	D_ASSERT(plan);
+	// DuckDB's own planner adds a projection filling in the DEFAULTs of unlisted columns
+	// (ResolveDefaultsProjection); it is skipped on purpose, so ClickHouse applies its own defaults instead
+	auto &table = op.table.Cast<ClickhouseTableEntry>();
+	auto columns = ClickhouseInsert::GetInsertColumns(table, op.column_index_map);
+	auto &insert = planner.Make<ClickhouseInsert>(op, table, std::move(columns));
+	insert.children.push_back(*plan);
+	return insert;
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &,
