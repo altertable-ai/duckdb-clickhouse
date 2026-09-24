@@ -2,9 +2,7 @@
 
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/main/attached_database.hpp"
 #include "storage/clickhouse_catalog.hpp"
-#include "storage/clickhouse_transaction.hpp"
 
 namespace duckdb {
 
@@ -32,9 +30,7 @@ struct ClickhouseExecuteGlobalState : public GlobalTableFunctionState {
 //! The writable ClickHouse catalog attached as `database_name`
 static ClickhouseCatalog &GetWritableCatalog(ClientContext &context, const string &database_name) {
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, database_name, "clickhouse_execute");
-	if (catalog.GetAttached().IsReadOnly()) {
-		ClickhouseUtils::ThrowReadOnly(database_name);
-	}
+	catalog.ThrowIfReadOnly();
 	return catalog;
 }
 
@@ -71,10 +67,7 @@ static void ClickhouseExecuteExecute(ClientContext &context, TableFunctionInput 
 	auto &catalog = GetWritableCatalog(context, bind_data.database_name);
 	bool returned_no_rows;
 	try {
-		auto connection = catalog.GetConnectionPool().GetConnection();
-		// only once the connection is in hand: if GetConnection() itself throws (e.g. the pool is exhausted),
-		// nothing was sent to ClickHouse, so a later ROLLBACK should not warn about an uncommitted write
-		ClickhouseTransaction::Get(context, catalog).MarkWritten();
+		auto connection = catalog.StartWrite(context);
 		returned_no_rows = connection->Execute(bind_data.sql);
 	} catch (...) {
 		// a failed statement can still have changed something (e.g. a multi-part ALTER)

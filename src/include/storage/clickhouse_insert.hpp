@@ -6,6 +6,7 @@
 
 namespace duckdb {
 class ClickhouseTableEntry;
+class ClickhouseInsertGlobalState;
 
 //! One column an INSERT writes: the ClickHouse column, and the input chunk column holding its values
 struct ClickhouseInsertColumn {
@@ -20,7 +21,14 @@ public:
 	ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseTableEntry &table,
 	                 vector<ClickhouseInsertColumn> columns);
 
-	ClickhouseTableEntry &table;
+	//! The attached database (DuckDB catalog) name, resolved again when the INSERT runs. No reference to the table
+	//! entry or the catalog is kept: the entry is freed by a ClearCache() (clickhouse_clear_cache(),
+	//! clickhouse_execute(), from any connection) that can happen between planning and execution, and a
+	//! DETACH can do the same to the catalog
+	string catalog_name;
+	//! The ClickHouse database and table names, for EXPLAIN and errors
+	string database_name;
+	string table_name;
 	//! The inserted columns, in table order
 	vector<ClickhouseInsertColumn> columns;
 	//! The statement BeginInsert() runs, e.g. INSERT INTO `db`.`t` (`a`, `b`) VALUES
@@ -31,6 +39,12 @@ public:
 	static vector<ClickhouseInsertColumn> GetInsertColumns(ClickhouseTableEntry &table,
 	                                                       const physical_index_vector_t<idx_t> &column_index_map);
 	static string BuildInsertQuery(ClickhouseTableEntry &table, const vector<ClickhouseInsertColumn> &columns);
+
+	//! Starts the ClickHouse INSERT: resolves the attached database again, takes a connection through
+	//! ClickhouseCatalog::StartWrite() and sends the INSERT statement. Called on the first row, not when the
+	//! sink state is created, which DuckDB does when it schedules the query -- possibly long before any upstream
+	//! ORDER BY, aggregate or join yields a row, which could outlast the server's receive_timeout
+	void StartInsert(ClientContext &context, ClickhouseInsertGlobalState &gstate) const;
 
 public:
 	// Source interface

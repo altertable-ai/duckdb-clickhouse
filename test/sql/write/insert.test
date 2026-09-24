@@ -434,6 +434,61 @@ SELECT count(*) FROM ch.w_insert.big WHERE n >= 20000;
 ----
 55
 
+# an empty INSERT … SELECT never reaches ClickHouse: the INSERT is opened by the first row, not when DuckDB
+# schedules the query (which happens before any upstream work, e.g. an ORDER BY, has produced a row)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.empty_target (n UInt64, s String) ENGINE = MergeTree ORDER BY n');
+
+query I
+INSERT INTO ch.w_insert.empty_target SELECT * FROM local_rows WHERE n < 0 ORDER BY n;
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.query_log WHERE query LIKE ''INSERT INTO `w_insert`.`empty_target`%''');
+----
+0
+
+# a prepared INSERT outlives a cache clear, which frees the table entry it was planned against
+statement ok
+PREPARE p AS INSERT INTO ch.w_insert.big VALUES ($1, $2);
+
+statement ok
+EXECUTE p(60000, 'p1');
+
+statement ok
+CALL clickhouse_clear_cache();
+
+statement ok
+EXECUTE p(60001, 'p2');
+
+# clickhouse_execute() clears the cache too
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+statement ok
+EXECUTE p(60002, 'p3');
+
+statement ok
+DEALLOCATE p;
+
+query II
+SELECT n, s FROM ch.w_insert.big WHERE n >= 60000 ORDER BY n;
+----
+60000	p1
+60001	p2
+60002	p3
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT n, s FROM w_insert.big WHERE n >= 60000 ORDER BY n');
+----
+60000	p1
+60001	p2
+60002	p3
+
 # the INSERT carried the connection's settings (the clickhouse-cpp patch). enable_time_time64_type is an alias for
 # allow_experimental_time_time64_type, and system.query_log.Settings records settings under their canonical name
 statement ok
@@ -483,6 +538,29 @@ query I
 SELECT count(*) FROM ch.w_insert.big WHERE n = 40000;
 ----
 1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
+----
+1
+
+# nothing was sent to ClickHouse: an empty INSERT, and one whose input fails before its first row. The transaction is
+# not marked as written, so this ROLLBACK does not warn
+statement ok
+BEGIN;
+
+query I
+INSERT INTO ch.w_insert.big SELECT * FROM local_rows WHERE n < 0;
+----
+0
+
+statement error
+INSERT INTO ch.w_insert.big SELECT range, error('upstream failure') FROM range(1);
+----
+upstream failure
+
+statement ok
+ROLLBACK;
 
 query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
@@ -551,6 +629,45 @@ query I
 INSERT INTO ch.w_insert.stale VALUES (1, 2);
 ----
 1
+
+# the read path: a SELECT through ch's stale metadata fails without invalidating the database
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.stale_read (id UInt8, n Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_insert.stale_read VALUES (1, 5)');
+
+# caches ch's metadata for w_insert.stale_read with n as Int32 (DuckDB INTEGER)
+query II
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+1	5
+
+statement ok
+CALL clickhouse_execute('ch2', 'ALTER TABLE w_insert.stale_read MODIFY COLUMN n String');
+
+statement error
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+clickhouse_clear_cache()
+
+query I
+SELECT 1;
+----
+1
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query II
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+1	5
+
+query T
+SELECT typeof(n) FROM ch.w_insert.stale_read;
+----
+VARCHAR
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_insert');

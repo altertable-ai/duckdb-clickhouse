@@ -9,15 +9,15 @@
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_table_entry.hpp"
-#include "storage/clickhouse_transaction.hpp"
 
 namespace duckdb {
 
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseTableEntry &table_p,
                                    vector<ClickhouseInsertColumn> columns_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(table_p),
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
+      catalog_name(table_p.catalog.GetName()), database_name(table_p.schema.name), table_name(table_p.name),
       columns(std::move(columns_p)) {
-	insert_sql = BuildInsertQuery(table, columns);
+	insert_sql = BuildInsertQuery(table_p, columns);
 }
 
 vector<ClickhouseInsertColumn>
@@ -97,7 +97,9 @@ class ClickhouseInsertGlobalState : public GlobalSinkState {
 public:
 	~ClickhouseInsertGlobalState() override {
 		// Finalize() did not run -- an error here, in a conversion, or upstream: abandon the INSERT so the connection
-		// is closed instead of being reused mid-insert. ClickHouse may already have committed the blocks sent so far
+		// is closed instead of being reused mid-insert. ClickHouse may already have committed the blocks sent so far.
+		// Without a connection the INSERT was never started (no rows yet, or StartInsert() failed before taking one)
+		// and there is nothing to abandon
 		if (connection && connection->IsInserting()) {
 			connection->AbortInsert();
 			connection.Invalidate();
@@ -118,6 +120,7 @@ public:
 		connection->SendInsertBlock(block);
 	}
 
+	//! Taken by the first Sink() (ClickhouseInsert::StartInsert()), returned to the pool by Finalize()
 	ClickhousePoolConnection connection;
 	//! What BeginInsert() returned: the names and types of the values to send, in order
 	clickhouse::Block header;
@@ -129,29 +132,33 @@ public:
 };
 
 unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &context) const {
-	auto &catalog = table.catalog.Cast<ClickhouseCatalog>();
-	ClickhouseTransaction::Get(context, catalog).MarkWritten();
+	// nothing is sent to ClickHouse yet: see StartInsert()
 	auto result = make_uniq<ClickhouseInsertGlobalState>();
 	Value block_size;
 	if (context.TryGetCurrentSetting("ch_insert_block_size", block_size) && !block_size.IsNull()) {
 		result->block_size = UBigIntValue::Get(block_size);
 	}
-	result->connection = catalog.GetConnectionPool().GetConnection();
-	result->header = result->connection->BeginInsert(insert_sql);
-	if (result->header.GetColumnCount() != columns.size()) {
+	return std::move(result);
+}
+
+void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGlobalState &gstate) const {
+	D_ASSERT(!gstate.connection);
+	// resolved again rather than kept from planning: see catalog_name
+	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, catalog_name, "INSERT");
+	gstate.connection = catalog.StartWrite(context);
+	gstate.header = gstate.connection->BeginInsert(insert_sql);
+	if (gstate.header.GetColumnCount() != columns.size()) {
 		// not InternalException: this means the cached column list is stale (another connection changed the
 		// table since it was cached), and InternalException would invalidate the whole DuckDB instance for
 		// every later query in DuckDB v1.5.4
 		throw InvalidInputException(
 		    "ClickHouse INSERT header for table \"%s\" has %d columns, expected %d: the table changed since its "
 		    "metadata was cached; run CALL clickhouse_clear_cache() and retry",
-		    table.name, static_cast<uint64_t>(result->header.GetColumnCount()),
-		    static_cast<uint64_t>(columns.size()));
+		    table_name, static_cast<uint64_t>(gstate.header.GetColumnCount()), static_cast<uint64_t>(columns.size()));
 	}
 	for (idx_t i = 0; i < columns.size(); i++) {
-		result->pending.push_back(result->header[i]->CloneEmpty());
+		gstate.pending.push_back(gstate.header[i]->CloneEmpty());
 	}
-	return std::move(result);
 }
 
 //===--------------------------------------------------------------------===//
@@ -159,6 +166,12 @@ unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &
 //===--------------------------------------------------------------------===//
 SinkResultType ClickhouseInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<ClickhouseInsertGlobalState>();
+	if (chunk.size() == 0) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	if (!gstate.connection) {
+		StartInsert(context.client, gstate);
+	}
 	for (idx_t i = 0; i < columns.size(); i++) {
 		ClickhouseWriter::AppendVector(chunk.data[columns[i].source_index], chunk.size(), gstate.pending[i],
 		                               columns[i].column.name);
@@ -174,6 +187,10 @@ SinkResultType ClickhouseInsert::Sink(ExecutionContext &context, DataChunk &chun
 SinkFinalizeType ClickhouseInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                             OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<ClickhouseInsertGlobalState>();
+	if (!gstate.connection) {
+		// no rows arrived (e.g. an INSERT … SELECT that selected nothing): nothing was started, nothing is sent
+		return SinkFinalizeType::READY;
+	}
 	gstate.Flush();
 	gstate.connection->EndInsert();
 	// back to the pool right away rather than when the query ends
@@ -198,7 +215,7 @@ string ClickhouseInsert::GetName() const {
 
 InsertionOrderPreservingMap<string> ClickhouseInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table"] = table.schema.name + "." + table.name;
+	result["Table"] = database_name + "." + table_name;
 	return result;
 }
 

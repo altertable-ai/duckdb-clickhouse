@@ -11,6 +11,7 @@
 #include "storage/clickhouse_insert.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 #include "storage/clickhouse_table_entry.hpp"
+#include "storage/clickhouse_transaction.hpp"
 
 namespace duckdb {
 
@@ -86,6 +87,15 @@ void ClickhouseCatalog::ThrowIfReadOnly() const {
 	if (GetAttached().IsReadOnly()) {
 		ClickhouseUtils::ThrowReadOnly(GetName());
 	}
+}
+
+ClickhousePoolConnection ClickhouseCatalog::StartWrite(ClientContext &context) {
+	ThrowIfReadOnly();
+	auto connection = connection_pool->GetConnection();
+	// only once the connection is in hand: if GetConnection() itself throws (e.g. the pool is exhausted), nothing
+	// was sent to ClickHouse, so a later ROLLBACK should not warn about an uncommitted write
+	ClickhouseTransaction::Get(context, *this).MarkWritten();
+	return connection;
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,

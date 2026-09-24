@@ -12,6 +12,11 @@ require-env CLICKHOUSE_TEST_USER
 
 require-env CLICKHOUSE_TEST_PASSWORD
 
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
 statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
@@ -102,6 +107,35 @@ query II
 SELECT * FROM clickhouse_query('ch', 'SELECT count(), sum(n) FROM w_conv.converted WHERE id >= 10');
 ----
 1000	499500
+
+# native types whose names hold quotes (and so are quoted again inside input()'s structure literal) next to a
+# converted column, in one INSERT
+statement ok
+RESET ch_insert_block_size;
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.mixed (
+    id UInt8, dt64 DateTime64(3, ''UTC''), e Enum8(''a'' = 1, ''b'' = 2), lc LowCardinality(String), ip IPv4
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_conv.mixed VALUES
+    (1, TIMESTAMPTZ '2024-01-02 03:04:05.678+00', 'b', 'it''s', '1.2.3.4'),
+    (2, TIMESTAMPTZ '1970-01-01 00:00:00+00', 'a', '', '255.255.255.255');
+----
+2
+
+query IIIII
+SELECT * FROM ch.w_conv.mixed ORDER BY id;
+----
+1	2024-01-02 03:04:05.678+00	b	it's	1.2.3.4
+2	1970-01-01 00:00:00+00	a	(empty)	255.255.255.255
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(dt64), toString(e), lc, toString(ip) FROM w_conv.mixed ORDER BY id');
+----
+1	2024-01-02 03:04:05.678	b	it's	1.2.3.4
+2	1970-01-01 00:00:00.000	a	(empty)	255.255.255.255
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_conv');

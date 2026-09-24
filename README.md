@@ -108,7 +108,9 @@ ATTACH '' AS ch (TYPE clickhouse, SECRET ch, READ_ONLY);
 **Every write is committed immediately.** ClickHouse has no multi-statement transactions: each write statement is
 sent to ClickHouse and committed when it runs. `COMMIT` does nothing, and `ROLLBACK` cannot undo writes that already
 reached ClickHouse. A `ROLLBACK` after a ClickHouse write logs a warning, which is visible after
-`CALL enable_logging(level = 'warning')` in `duckdb_logs`.
+`CALL enable_logging(level = 'warning')` in `duckdb_logs`. DuckDB allows a transaction to write to only one attached
+database, so `BEGIN; INSERT INTO local_table …; INSERT INTO ch.db.t …;` fails on the second `INSERT`: run the two
+writes in separate transactions.
 
 `INSERT` (with `VALUES` or a `SELECT`) and `COPY … FROM` stream rows into ClickHouse over the native protocol. A
 block is flushed once at least `ch_insert_block_size` rows have been appended, so blocks are always whole DuckDB
@@ -120,7 +122,9 @@ COPY ch.analytics.events FROM 'events.csv';
 ```
 
 - **Defaults:** only the listed columns are sent, so ClickHouse fills the others with their `DEFAULT` expressions.
-  `MATERIALIZED` and `ALIAS` columns cannot be inserted into: list the other columns explicitly.
+  `MATERIALIZED` and `ALIAS` columns cannot be inserted into: list the other columns explicitly. The `DEFAULT`
+  keyword inside `VALUES` (e.g. `VALUES (1, DEFAULT)`) sends DuckDB's default for the column, which is `NULL`, not
+  ClickHouse's `DEFAULT` expression; to get ClickHouse's default, leave the column out of the column list.
 - **Out-of-range values:** values ClickHouse cannot store are rejected, never clamped:
   - dates and timestamps outside the range of `Date`, `Date32`, `DateTime` or `DateTime64`;
   - strings longer than a `FixedString`;
@@ -137,7 +141,8 @@ COPY ch.analytics.events FROM 'events.csv';
   `SETTINGS 'insert_deduplicate=0'` to turn that off.
 - **Unsupported:**
   - `RETURNING` and `ON CONFLICT`;
-  - columns of type `Variant`, `Dynamic`, `AggregateFunction` or `SimpleAggregateFunction`, or nested types holding a
+  - columns of type `Object`, `Variant`, `Dynamic`, `AggregateFunction` or `SimpleAggregateFunction` (`Object`,
+    `Variant` and `Dynamic` are read as `JSON` but cannot be written), or nested types holding a
     type that ClickHouse converts (e.g. `Array(IPv4)`). Leave these columns out of the column list, or use
     `clickhouse_execute`.
 

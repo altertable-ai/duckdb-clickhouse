@@ -16,9 +16,10 @@ public:
 	static string StripTrailingSemicolons(string sql);
 	//! Throws the error for a write statement that attached ClickHouse databases do not support (yet)
 	[[noreturn]] static void ThrowUnsupportedWrite(const string &statement);
-	//! Throws the error for a write that reaches the extension on a database attached with READ_ONLY. DuckDB
-	//! itself rejects write statements on such databases; this covers what DuckDB cannot see, e.g.
-	//! clickhouse_execute()
+	//! Throws the error for a write that reaches the extension on a database attached with READ_ONLY. Raised
+	//! through ClickhouseCatalog::ThrowIfReadOnly() by every write path: the catalog's Plan* hooks (which run
+	//! before DuckDB's own read-only check), the INSERT sink (which resolves its database again when it runs) and
+	//! clickhouse_execute() (which DuckDB cannot see as a write)
 	[[noreturn]] static void ThrowReadOnly(const string &database_name);
 	//! 10^exponent (exponent <= 18)
 	static int64_t PowerOfTen(idx_t exponent);

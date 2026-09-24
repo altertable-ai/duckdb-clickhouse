@@ -23,8 +23,8 @@ public:
 	//! The ClickHouse catalog attached as `database_name`. Throws BinderException("Failed to find attached
 	//! database \"%s\" referenced in <function_name>") if no such database is attached, or
 	//! BinderException("Attached database \"%s\" is not a ClickHouse database") if it is attached through some
-	//! other extension. Callers that need to reject a read-only attach do so on top, with
-	//! GetAttached().IsReadOnly(). Named GetAttachedDatabase rather than the base class's GetAttached() --
+	//! other extension. Callers that need to reject a read-only attach do so on top, with ThrowIfReadOnly()
+	//! (or StartWrite()). Named GetAttachedDatabase rather than the base class's GetAttached() --
 	//! a static overload of that name would hide every inherited overload of it, including the one this
 	//! function itself and ThrowIfReadOnly() rely on.
 	static ClickhouseCatalog &GetAttachedDatabase(ClientContext &context, const string &database_name,
@@ -42,6 +42,16 @@ public:
 	shared_ptr<ClickhouseConnectionPool> GetConnectionPoolPtr() {
 		return connection_pool;
 	}
+	//! Throws ClickhouseUtils::ThrowReadOnly() if this database was attached with READ_ONLY. DuckDB's own
+	//! read-only check runs only after physical planning; PlanInsert/PlanDelete/PlanUpdate/PlanCreateTableAs/
+	//! PlanMergeInto are invoked during physical planning itself, so DuckDB's check never gets a chance to run
+	//! for them and this extension must check first. Also used by the INSERT sink and clickhouse_execute(),
+	//! which resolve the database again when they run.
+	void ThrowIfReadOnly() const;
+	//! Starts a write to this database: checks that it is writable, takes a pooled connection and only then --
+	//! once something can actually be sent -- marks the current transaction as written, so a ROLLBACK warns.
+	//! Every write path (clickhouse_execute(), the INSERT sink) starts here.
+	ClickhousePoolConnection StartWrite(ClientContext &context);
 	//! Forgets all cached databases, tables and columns
 	void ClearCache();
 	//! The shared_ptr owning the cached schema entry for the ClickHouse database `name`; null once the
@@ -90,11 +100,6 @@ public:
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
-	//! Throws ClickhouseUtils::ThrowReadOnly() if this database was attached with READ_ONLY. DuckDB's own
-	//! read-only check runs only after physical planning; PlanInsert/PlanDelete/PlanUpdate/PlanCreateTableAs/
-	//! PlanMergeInto are invoked during physical planning itself, so DuckDB's check never gets a chance to run
-	//! for them and this extension must check first.
-	void ThrowIfReadOnly() const;
 
 	ClickhouseConnectionConfig config;
 	ClickhouseAttachOptions options;
