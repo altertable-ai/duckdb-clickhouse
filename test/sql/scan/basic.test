@@ -1,0 +1,114 @@
+# name: test/sql/scan/basic.test
+# description: basic scans, projections, parallelism and early termination
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query IITT
+SELECT id, name, value, created_at FROM ch.test_db.t1 ORDER BY id;
+----
+1	Alice	99.5	2024-01-01 00:00:00+00
+2	Bob	150.25	2024-01-02 00:00:00+00
+3	Charlie	200.0	2024-01-03 00:00:00+00
+
+query II
+SELECT name, id FROM ch.test_db.t1 ORDER BY id;
+----
+Alice	1
+Bob	2
+Charlie	3
+
+query II
+SELECT * FROM ch.test_db.v1 ORDER BY id;
+----
+1	ALICE
+2	BOB
+3	CHARLIE
+
+query I
+SELECT count(*) FROM ch.test_db.empty;
+----
+0
+
+query I
+SELECT count(*) FROM ch.test_db.t1;
+----
+3
+
+# table lookups fall back to a case-insensitive match
+query I
+SELECT id FROM ch.test_db.mixedcase;
+----
+7
+
+query I
+SELECT "Id" FROM ch.test_db."MixedCase";
+----
+7
+
+query I
+SELECT x FROM ch.other_db.other_table;
+----
+1
+
+# the default schema is the database from the connection string
+statement ok
+USE ch;
+
+query I
+SELECT count(*) FROM t1;
+----
+3
+
+statement ok
+USE memory;
+
+statement ok
+SET threads = 4;
+
+query II
+SELECT count(*), sum(n) FROM ch.test_db.big;
+----
+10000000	49999995000000
+
+query I
+SELECT count(*) FROM ch.test_db.t1 a JOIN ch.test_db.t1 b ON a.id = b.id;
+----
+3
+
+# stopping a scan early cancels the ClickHouse query and returns a clean connection to the pool
+# (the expression filter keeps the LIMIT in DuckDB even once LIMIT pushdown exists)
+loop i 0 20
+
+query I
+SELECT count(*) FROM (SELECT n FROM ch.test_db.big WHERE n % 2 = 0 LIMIT 10);
+----
+10
+
+endloop
+
+query I
+SELECT count(*) FROM ch.test_db.t1;
+----
+3
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT name FROM ch.test_db.t1;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `name` FROM `test_db`.`t1`".*

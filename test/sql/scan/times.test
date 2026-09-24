@@ -1,0 +1,27 @@
+# name: test/sql/scan/times.test
+# description: Time and Time64
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=enable_time_time64_type=1' AS ch (TYPE clickhouse);
+
+query IIII
+SELECT * FROM ch.test_db.times ORDER BY id;
+----
+1	12:34:56	12:34:56.789	12:34:56.123456789
+2	00:00:00	00:00:00	00:00:00

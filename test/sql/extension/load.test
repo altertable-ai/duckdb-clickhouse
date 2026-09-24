@@ -1,0 +1,15 @@
+# name: test/sql/extension/load.test
+# description: the extension loads and links clickhouse-cpp
+# group: [extension]
+
+statement error
+SELECT clickhouse_client_version();
+----
+Catalog Error: Scalar Function with name clickhouse_client_version does not exist!
+
+require clickhouse_scanner
+
+query I
+SELECT clickhouse_client_version() LIKE '2.6.%';
+----
+true

@@ -1,0 +1,27 @@
+# name: test/sql/scan/nullables.test
+# description: NULLs and LowCardinality columns
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query IIIIIIIIII
+SELECT * FROM ch.test_db.nullables ORDER BY id;
+----
+1	NULL	NULL	NULL	NULL	NULL	NULL	x	NULL	NULL
+2	42	text	2024-01-01	2024-01-01 00:00:00+00	a	lc	y	3.14	10.0.0.1

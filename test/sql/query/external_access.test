@@ -1,0 +1,21 @@
+# name: test/sql/query/external_access.test
+# description: enable_external_access=false blocks every way into ClickHouse
+# group: [query]
+
+require clickhouse_scanner
+
+# DuckDB's lockdown switch, and it cannot be turned back on while the database is running, so nothing
+# else can follow it in this file. Both entry points have to refuse before they open any outbound
+# connection, which is why this needs no server: port 1 is never contacted.
+statement ok
+SET enable_external_access=false;
+
+statement error
+SELECT * FROM clickhouse_scan('host=127.0.0.1 port=1 user=duckdb password=duckdb', 'test_db', 't1');
+----
+Reading from ClickHouse is disabled through configuration
+
+statement error
+ATTACH 'host=127.0.0.1 port=1 user=duckdb password=duckdb database=test_db' AS ch (TYPE clickhouse);
+----
+Attaching ClickHouse databases is disabled through configuration

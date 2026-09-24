@@ -1,0 +1,254 @@
+# name: test/sql/types/type_mapping.test
+# description: ClickHouse type strings map to DuckDB types and server-side read expressions
+# group: [types]
+
+require clickhouse_scanner
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Int32');
+----
+INTEGER	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Nullable(Int32)');
+----
+INTEGER	c	true	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('LowCardinality(Nullable(String))');
+----
+VARCHAR	c	true	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('UInt64');
+----
+UBIGINT	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Int128');
+----
+HUGEINT	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('UInt128');
+----
+UHUGEINT	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Int256');
+----
+VARCHAR	toString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Float64');
+----
+DOUBLE	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('BFloat16');
+----
+FLOAT	toFloat32(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Decimal(10, 2)');
+----
+DECIMAL(10,2)	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Decimal64(4)');
+----
+DECIMAL(18,4)	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Decimal(76, 5)');
+----
+VARCHAR	toString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('FixedString(3)');
+----
+VARCHAR	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Date32');
+----
+DATE	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('DateTime(''UTC'')');
+----
+TIMESTAMP WITH TIME ZONE	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Nullable(DateTime64(9, ''Asia/Tokyo''))');
+----
+TIMESTAMP WITH TIME ZONE	c	true	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('DateTime64(3, ''UTC'')');
+----
+TIMESTAMP WITH TIME ZONE	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Time');
+----
+TIME	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Time64(9)');
+----
+TIME_NS	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('UUID');
+----
+UUID	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('IPv6');
+----
+VARCHAR	toString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Point');
+----
+VARCHAR	wkt(c)	false	false	true
+
+# enum labels are ordered by their numeric value, like ClickHouse sorts them
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Enum8(''red'' = 1, ''green'' = 2, ''blue'' = -3)');
+----
+ENUM('blue', 'red', 'green')	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Enum16(''it\''s'' = 1000)');
+----
+ENUM('it''s')	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Array(Int32)');
+----
+INTEGER[]	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Array(IPv4)');
+----
+VARCHAR[]	arrayMap(x0 -> toString(x0), c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Array(Array(Nullable(IPv4)))');
+----
+VARCHAR[][]	arrayMap(x0 -> arrayMap(x1 -> toString(x1), x0), c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Tuple(a Int32, b String)');
+----
+STRUCT(a INTEGER, b VARCHAR)	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Tuple(Int32, String)');
+----
+STRUCT("1" INTEGER, "2" VARCHAR)	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Tuple(ip IPv4, n Int8)');
+----
+STRUCT(ip VARCHAR, n TINYINT)	tuple(toString(tupleElement(c, 1)), tupleElement(c, 2))	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Array(Tuple(`x y` Int32))');
+----
+STRUCT("x y" INTEGER)[]	c	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Map(LowCardinality(String), UInt64)');
+----
+MAP(VARCHAR, UBIGINT)	arrayZip(mapKeys(c), mapValues(c))	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Map(String, IPv4)');
+----
+MAP(VARCHAR, VARCHAR)	arrayZip(mapKeys(c), arrayMap(x0 -> toString(x0), mapValues(c)))	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('JSON');
+----
+JSON	toJSONString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Variant(String, UInt64)');
+----
+JSON	toJSONString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Dynamic');
+----
+JSON	toJSONString(c)	false	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('SimpleAggregateFunction(anyLast, String)');
+----
+VARCHAR	c	false	true	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('AggregateFunction(sum, UInt64)');
+----
+VARCHAR	c	false	false	false
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Array(AggregateFunction(sum, UInt64))');
+----
+VARCHAR[]	c	false	false	false
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('Nullable(Nothing)');
+----
+VARCHAR	c	true	false	true
+
+query TTTTT
+SELECT * FROM clickhouse_type_mapping('IntervalSecond');
+----
+VARCHAR	toString(c)	false	false	true
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Array(Int32');
+----
+Malformed ClickHouse type "Array(Int32"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Array(Int32))');
+----
+Malformed ClickHouse type "Array(Int32))"
+
+# a type nested past the maximum depth must throw a clean error instead of overflowing the stack
+statement error
+SELECT * FROM clickhouse_type_mapping(repeat('Array(', 100) || 'Int32' || repeat(')', 100));
+----
+nested too deeply
+
+# comfortably below the depth limit, mapping must still succeed
+query I
+SELECT duckdb_type = 'INTEGER' || repeat('[]', 50)
+FROM clickhouse_type_mapping(repeat('Array(', 50) || 'Int32' || repeat(')', 50));
+----
+true
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(-1, 2)');
+----
+Malformed ClickHouse type "Decimal(-1, 2)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(10, 999)');
+----
+Malformed ClickHouse type "Decimal(10, 999)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal(10, 50)');
+----
+Malformed ClickHouse type "Decimal(10, 50)"
+
+statement error
+SELECT * FROM clickhouse_type_mapping('Decimal64(40)');
+----
+Malformed ClickHouse type "Decimal64(40)"

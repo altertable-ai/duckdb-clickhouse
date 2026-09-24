@@ -1,0 +1,118 @@
+# name: test/sql/attach/attach.test
+# description: ATTACH through key=value strings, URIs and secrets
+# group: [attach]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+# the path never contains the password
+query II
+SELECT type, path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch';
+----
+clickhouse	true
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch' ORDER BY schema_name;
+----
+default
+other_db
+test_db
+
+statement error
+CREATE SCHEMA ch.new_db;
+----
+clickhouse_scanner is read-only
+
+statement ok
+DETACH ch;
+
+# the storage extension is also reachable under its full name
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch_full (TYPE clickhouse_scanner);
+
+# the unnamed secret supplies credentials; the URI supplies host, port and database
+statement ok
+CREATE SECRET (TYPE clickhouse, USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}');
+
+statement ok
+ATTACH 'clickhouse://${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/other_db' AS ch_uri (TYPE clickhouse);
+
+query I
+SELECT path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/other_db' FROM duckdb_databases() WHERE database_name = 'ch_uri';
+----
+true
+
+statement ok
+CREATE SECRET named_secret (TYPE clickhouse, HOST '${CLICKHOUSE_TEST_HOST}', PORT '${CLICKHOUSE_TEST_PORT}', USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}', DATABASE 'test_db');
+
+statement ok
+ATTACH '' AS ch_secret (TYPE clickhouse, SECRET named_secret);
+
+query I
+SELECT path = 'clickhouse://${CLICKHOUSE_TEST_USER}@${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT}/test_db' FROM duckdb_databases() WHERE database_name = 'ch_secret';
+----
+true
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_sys (TYPE clickhouse, SHOW_SYSTEM true);
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch_sys' AND schema_name = 'system';
+----
+1
+
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=wrong_pw_7f3a' AS ch_bad (TYPE clickhouse);
+----
+Failed to connect to ClickHouse at
+
+# the wrong password itself never appears in the error
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=wrong_pw_7f3a' AS ch_bad2 (TYPE clickhouse);
+----
+<!REGEX>:.*wrong_pw_7f3a.*
+
+# --- compression regression guard ---
+# guards the vendored-cityhash fix, which the default lz4 path above already exercises
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} compression=zstd' AS ch_zstd (TYPE clickhouse);
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_zstd' ORDER BY schema_name;
+----
+default
+other_db
+test_db
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} compression=none' AS ch_none (TYPE clickhouse);
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_none' ORDER BY schema_name;
+----
+default
+other_db
+test_db
+
+# --- the ClickHouse error message names the symbolic error code ---
+# LoadEntries() is lazy, so the bad setting only surfaces once a query actually runs against ch_bad_setting.
+# nonexistent_setting_xyz is rejected server-side as UNKNOWN_SETTING (verified against the running server).
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} settings=nonexistent_setting_xyz=1' AS ch_bad_setting (TYPE clickhouse);
+
+statement error
+SELECT * FROM ch_bad_setting.default.anything;
+----
+<REGEX>:.*ClickHouse error 115 \(UNKNOWN_SETTING\).*
