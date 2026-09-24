@@ -147,7 +147,9 @@ COPY ch.analytics.events FROM 'events.csv';
     type that ClickHouse converts (e.g. `Array(IPv4)`). Leave these columns out of the column list, or use
     `clickhouse_execute`.
 
-`CREATE TABLE` (with `IF NOT EXISTS` / `OR REPLACE`) and `DROP TABLE` work on attached databases:
+`CREATE TABLE` (with `IF NOT EXISTS` / `OR REPLACE`), `DROP TABLE`, `CREATE SCHEMA` / `DROP SCHEMA` (ClickHouse
+databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` /
+`RENAME TO` work on attached databases:
 
 - Column types map back as in the type table, reversed: `VARCHAR`/`BLOB` → `String`, `DATE` → `Date32`,
   `TIMESTAMP`/`TIMESTAMPTZ` → `DateTime64(6, 'UTC')` (`TIMESTAMP_S`/`_MS`/`_NS` → `DateTime('UTC')` /
@@ -164,6 +166,8 @@ COPY ch.analytics.events FROM 'events.csv';
   `PARTITIONED BY` / `SORTED BY` are not supported; use `clickhouse_execute` for those, and for `CREATE VIEW`.
 - `DROP TABLE` does not drop ClickHouse views or dictionaries, and `DROP VIEW` cannot reach them (DuckDB only looks
   for DuckDB views); drop them with `clickhouse_execute`.
+- Other `ALTER TABLE` forms (changing a column's type or default, constraints) are not supported; use
+  `clickhouse_execute`. Columns added with `ALTER TABLE … ADD COLUMN` are always `Nullable`.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

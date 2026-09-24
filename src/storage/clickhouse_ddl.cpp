@@ -9,6 +9,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/list.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
@@ -267,6 +268,38 @@ ClickhouseTableEntry &ClickhouseDdl::CreateTable(ClientContext &context, Clickho
 		                            database, info.table);
 	}
 	return *entry;
+}
+
+string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &database, const string &table,
+                                    AlterTableInfo &info) {
+	auto qualified = ClickhouseUtils::QuoteIdentifier(database) + "." + ClickhouseUtils::QuoteIdentifier(table);
+	switch (info.alter_table_type) {
+	case AlterTableType::ADD_COLUMN: {
+		auto &add = info.Cast<AddColumnInfo>();
+		// added columns are always Nullable: DuckDB's ADD COLUMN carries no NOT NULL constraint
+		return "ALTER TABLE " + qualified + " ADD COLUMN " + (add.if_column_not_exists ? "IF NOT EXISTS " : "") +
+		       ColumnSql(context, add.new_column, true);
+	}
+	case AlterTableType::REMOVE_COLUMN: {
+		auto &remove = info.Cast<RemoveColumnInfo>();
+		return "ALTER TABLE " + qualified + " DROP COLUMN " + (remove.if_column_exists ? "IF EXISTS " : "") +
+		       ClickhouseUtils::QuoteIdentifier(remove.removed_column);
+	}
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename = info.Cast<RenameColumnInfo>();
+		return "ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(rename.old_name) +
+		       " TO " + ClickhouseUtils::QuoteIdentifier(rename.new_name);
+	}
+	case AlterTableType::RENAME_TABLE: {
+		auto &rename = info.Cast<RenameTableInfo>();
+		return "RENAME TABLE " + qualified + " TO " + ClickhouseUtils::QuoteIdentifier(database) + "." +
+		       ClickhouseUtils::QuoteIdentifier(rename.new_table_name);
+	}
+	default:
+		throw NotImplementedException("This ALTER TABLE operation is not supported for ClickHouse tables (only ADD "
+		                              "COLUMN, DROP COLUMN, RENAME COLUMN and RENAME TO are); run it with "
+		                              "clickhouse_execute() instead");
+	}
 }
 
 } // namespace duckdb

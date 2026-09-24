@@ -6,8 +6,11 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "storage/clickhouse_ddl.hpp"
 #include "storage/clickhouse_insert.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 #include "storage/clickhouse_table_entry.hpp"
@@ -53,11 +56,53 @@ shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &na
 }
 
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	ClickhouseUtils::ThrowUnsupportedWrite("CREATE SCHEMA");
+	auto &context = transaction.GetContext();
+	string sql = "CREATE DATABASE ";
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+		sql += "IF NOT EXISTS ";
+	} else if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+		throw NotImplementedException("CREATE OR REPLACE SCHEMA is not supported for ClickHouse databases");
+	}
+	ClickhouseDdl::Execute(context, *this, sql + ClickhouseUtils::QuoteIdentifier(info.schema));
+	auto entry = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.schema),
+	                          OnEntryNotFound::RETURN_NULL);
+	return entry.get();
 }
 
 void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	ClickhouseUtils::ThrowUnsupportedWrite("DROP SCHEMA");
+	auto transaction = GetCatalogTransaction(context);
+	auto schema = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.name),
+	                           OnEntryNotFound::RETURN_NULL);
+	if (!schema) {
+		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+			return;
+		}
+		throw CatalogException("Schema with name \"%s\" does not exist!", info.name);
+	}
+	auto database = schema->name;
+	if (!info.cascade) {
+		// DROP DATABASE drops everything in it: match DuckDB, which refuses to drop a non-empty schema without
+		// CASCADE
+		idx_t table_count = 0;
+		{
+			auto connection = connection_pool->GetConnection();
+			for (auto &block : connection->Query("SELECT count() FROM system.tables WHERE database = " +
+			                                     ClickhouseUtils::QuoteLiteral(database))) {
+				if (block.GetRowCount() > 0) {
+					table_count = block[0]->As<clickhouse::ColumnUInt64>()->At(0);
+				}
+			}
+		}
+		if (table_count > 0) {
+			throw CatalogException("Cannot drop ClickHouse database \"%s\": it contains %d table(s); use DROP SCHEMA "
+			                       "… CASCADE to drop it with everything in it",
+			                       database, table_count);
+		}
+	}
+	ClickhouseDdl::Execute(context, *this,
+	                       "DROP DATABASE " +
+	                           string(info.if_not_found == OnEntryNotFound::RETURN_NULL ? "IF EXISTS " : "") +
+	                           ClickhouseUtils::QuoteIdentifier(database));
 }
 
 void ClickhouseCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {

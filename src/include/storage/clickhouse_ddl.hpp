@@ -8,6 +8,7 @@ class ClientContext;
 class ClickhouseCatalog;
 class ClickhouseTableEntry;
 class ColumnDefinition;
+struct AlterTableInfo;
 struct CreateTableInfo;
 
 //! Builds and runs the ClickHouse DDL for DuckDB DDL statements
@@ -37,6 +38,10 @@ public:
 	//! an existing table, returns the existing table's entry
 	static ClickhouseTableEntry &CreateTable(ClientContext &context, ClickhouseCatalog &catalog,
 	                                         const string &database, CreateTableInfo &info);
+	//! ALTER TABLE ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] / RENAME COLUMN, or RENAME TABLE; anything
+	//! else throws NotImplementedException
+	static string AlterTableSql(ClientContext &context, const string &database, const string &table,
+	                            AlterTableInfo &info);
 };
 
 } // namespace duckdb

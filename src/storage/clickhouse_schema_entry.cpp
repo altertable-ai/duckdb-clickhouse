@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
@@ -59,8 +60,25 @@ optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateCollation(CatalogTransac
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
 	ThrowNotSupported("Types");
 }
-void ClickhouseSchemaEntry::Alter(CatalogTransaction, AlterInfo &) {
-	ClickhouseUtils::ThrowUnsupportedWrite("ALTER TABLE");
+void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	if (info.type != AlterType::ALTER_TABLE) {
+		throw NotImplementedException("This ALTER statement is not supported for ClickHouse databases; run it with "
+		                              "clickhouse_execute() instead");
+	}
+	auto &context = transaction.GetContext();
+	auto &alter = info.Cast<AlterTableInfo>();
+	auto entry = tables.GetEntry(context, alter.name);
+	if (!entry) {
+		if (alter.if_not_found == OnEntryNotFound::RETURN_NULL) {
+			return;
+		}
+		throw CatalogException("Table with name %s does not exist!", alter.name);
+	}
+	// build the SQL before Execute() clears the cache and frees `entry`
+	auto sql = ClickhouseDdl::AlterTableSql(context, name, entry->name, alter);
+	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
+	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
+	ClickhouseDdl::Execute(context, ch_catalog, sql);
 }
 
 //! ClickHouse table engines that are not tables: DROP TABLE refuses them

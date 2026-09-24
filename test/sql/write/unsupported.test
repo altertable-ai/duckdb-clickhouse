@@ -31,14 +31,9 @@ CREATE TABLE ch.test_db.new_table AS SELECT 42 AS i;
 not supported on attached ClickHouse databases yet
 
 statement error
-ALTER TABLE ch.test_db.t1 ADD COLUMN extra INTEGER;
+ALTER TABLE ch.test_db.t1 ALTER COLUMN name TYPE INTEGER;
 ----
-ALTER TABLE is not supported on attached ClickHouse databases yet
-
-statement error
-CREATE SCHEMA ch.new_db;
-----
-CREATE SCHEMA is not supported on attached ClickHouse databases yet
+is not supported for ClickHouse tables
 
 statement error
 CREATE VIEW ch.test_db.new_view AS SELECT 42;

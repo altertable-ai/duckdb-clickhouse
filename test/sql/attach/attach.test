@@ -28,11 +28,6 @@ default
 other_db
 test_db
 
-statement error
-CREATE SCHEMA ch.new_db;
-----
-CREATE SCHEMA is not supported on attached ClickHouse databases yet
-
 statement ok
 DETACH ch;
 
