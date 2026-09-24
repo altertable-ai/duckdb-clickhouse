@@ -172,12 +172,16 @@ void ClickhouseConnection::SetDebugPrintQueries(bool print) {
 	debug_print_queries = print;
 }
 
-clickhouse::Query ClickhouseConnection::MakeQuery(const string &sql) const {
+clickhouse::Query ClickhouseConnection::MakeQuery(const string &sql,
+                                                  const vector<std::pair<string, string>> &query_settings) const {
 	clickhouse::Query query(sql);
 	for (auto &setting : config.settings) {
 		// IMPORTANT makes the server reject unknown settings instead of silently ignoring them
 		query.SetSetting(setting.first,
 		                 clickhouse::QuerySettingsField {setting.second, clickhouse::QuerySettingsField::IMPORTANT});
+	}
+	for (auto &setting : query_settings) {
+		query.SetSetting(setting.first, clickhouse::QuerySettingsField {setting.second, 0});
 	}
 	// Applied last, after the user's settings, so a "settings=" value can never re-enable LowCardinality's
 	// dictionary encoding: AddSettings() also rejects this key outright, this is a second line of defense.
@@ -204,13 +208,13 @@ void ClickhouseConnection::RethrowAsDuckDBException(const string &sql) {
 	}
 }
 
-void ClickhouseConnection::BeginQuery(const string &sql) {
+void ClickhouseConnection::BeginQuery(const string &sql, const vector<std::pair<string, string>> &query_settings) {
 	if (debug_print_queries) {
 		Printer::Print(sql + "\n");
 	}
 	last_used = std::chrono::steady_clock::now();
 	try {
-		client->BeginSelect(MakeQuery(sql));
+		client->BeginSelect(MakeQuery(sql, query_settings));
 	} catch (...) {
 		RethrowAsDuckDBException(sql);
 	}
@@ -255,7 +259,11 @@ vector<clickhouse::Block> ClickhouseConnection::Query(const string &sql) {
 }
 
 bool ClickhouseConnection::Execute(const string &sql) {
-	BeginQuery(sql);
+	return Execute(sql, {});
+}
+
+bool ClickhouseConnection::Execute(const string &sql, const vector<std::pair<string, string>> &query_settings) {
+	BeginQuery(sql, query_settings);
 	while (auto block = NextBlock()) {
 		if (block->GetRowCount() > 0) {
 			Cancel();

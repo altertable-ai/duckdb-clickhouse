@@ -14,6 +14,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "storage/clickhouse_clear_cache.hpp"
+#include "storage/clickhouse_ddl.hpp"
 #include "storage/clickhouse_optimizer.hpp"
 #include "storage/clickhouse_storage_extension.hpp"
 
@@ -36,6 +37,10 @@ static void SetClickhouseInsertBlockSize(ClientContext &context, SetScope scope,
 	if (UBigIntValue::Get(parameter) == 0) {
 		throw InvalidInputException("ch_insert_block_size must be greater than 0");
 	}
+}
+
+static void SetClickhouseDefaultTableEngine(ClientContext &context, SetScope scope, Value &parameter) {
+	ClickhouseDdl::ValidateEngine(StringValue::Get(parameter));
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -84,6 +89,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("ch_insert_block_size",
 	                          "Minimum rows per block sent to ClickHouse during INSERT (rounded up to whole chunks)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(65536), SetClickhouseInsertBlockSize);
+	config.AddExtensionOption("ch_default_table_engine",
+	                          "Table engine for CREATE TABLE in attached ClickHouse databases, e.g. MergeTree or "
+	                          "ReplicatedMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}')",
+	                          LogicalType::VARCHAR, Value("MergeTree"), SetClickhouseDefaultTableEngine);
 	OptimizerExtension clickhouse_optimizer;
 	clickhouse_optimizer.optimize_function = ClickhouseOptimizer::Optimize;
 	OptimizerExtension::Register(config, std::move(clickhouse_optimizer));

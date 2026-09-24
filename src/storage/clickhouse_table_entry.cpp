@@ -8,8 +8,10 @@
 namespace duckdb {
 
 ClickhouseTableEntry::ClickhouseTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                           vector<ClickhouseColumnInfo> columns, optional_idx approx_rows)
-    : TableCatalogEntry(catalog, schema, info), clickhouse_columns(std::move(columns)), approx_rows(approx_rows) {
+                                           vector<ClickhouseColumnInfo> columns, optional_idx approx_rows,
+                                           string engine)
+    : TableCatalogEntry(catalog, schema, info), clickhouse_columns(std::move(columns)), approx_rows(approx_rows),
+      engine(std::move(engine)) {
 }
 
 unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &context, column_t column_id) {

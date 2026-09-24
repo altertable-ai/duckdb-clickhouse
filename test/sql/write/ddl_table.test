@@ -1,0 +1,292 @@
+# name: test/sql/write/ddl_table.test
+# description: CREATE TABLE and DROP TABLE on an attached ClickHouse database
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+require json
+
+statement ok
+SET TimeZone = 'UTC';
+
+# enable_time_time64_type lets INSERT write into the Time64 column CREATE TABLE makes below (see test/sql/write/insert.test)
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse, SETTINGS 'enable_time_time64_type=1');
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_ddl');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_ddl');
+
+# ---------------------------------------------------------------------------
+# every mapped type; PRIMARY KEY and NOT NULL columns are not Nullable
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.all_types (
+    id INTEGER PRIMARY KEY,
+    b BOOLEAN, i8 TINYINT, i16 SMALLINT, i64 BIGINT, u8 UTINYINT, u16 USMALLINT, u32 UINTEGER, u64 UBIGINT,
+    h HUGEINT, uh UHUGEINT, f FLOAT, d DOUBLE, dec DECIMAL(18, 4), s VARCHAR NOT NULL, bl BLOB, dt DATE,
+    ts_s TIMESTAMP_S, ts_ms TIMESTAMP_MS, ts TIMESTAMP, tstz TIMESTAMPTZ, ts_ns TIMESTAMP_NS,
+    t TIME, u UUID, e ENUM('x', 'y'), l INTEGER[], st STRUCT(a INTEGER, b VARCHAR), m MAP(VARCHAR, DOUBLE), j JSON
+);
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ddl'' AND table = ''all_types'' ORDER BY position');
+----
+id	Int32
+b	Nullable(Bool)
+i8	Nullable(Int8)
+i16	Nullable(Int16)
+i64	Nullable(Int64)
+u8	Nullable(UInt8)
+u16	Nullable(UInt16)
+u32	Nullable(UInt32)
+u64	Nullable(UInt64)
+h	Nullable(Int128)
+uh	Nullable(UInt128)
+f	Nullable(Float32)
+d	Nullable(Float64)
+dec	Nullable(Decimal(18, 4))
+s	String
+bl	Nullable(String)
+dt	Nullable(Date32)
+ts_s	Nullable(DateTime('UTC'))
+ts_ms	Nullable(DateTime64(3, 'UTC'))
+ts	Nullable(DateTime64(6, 'UTC'))
+tstz	Nullable(DateTime64(6, 'UTC'))
+ts_ns	Nullable(DateTime64(9, 'UTC'))
+t	Nullable(Time64(6))
+u	Nullable(UUID)
+e	Nullable(Enum8('x' = 1, 'y' = 2))
+l	Array(Nullable(Int32))
+st	Tuple(a Nullable(Int32), b Nullable(String))
+m	Map(String, Nullable(Float64))
+j	JSON
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT engine, sorting_key FROM system.tables WHERE database = ''w_ddl'' AND name = ''all_types''');
+----
+MergeTree	id
+
+# visible to DuckDB right away, with the read-path types
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 'all_types' ORDER BY ordinal_position;
+----
+id	INTEGER
+b	BOOLEAN
+i8	TINYINT
+i16	SMALLINT
+i64	BIGINT
+u8	UTINYINT
+u16	USMALLINT
+u32	UINTEGER
+u64	UBIGINT
+h	HUGEINT
+uh	UHUGEINT
+f	FLOAT
+d	DOUBLE
+dec	DECIMAL(18,4)
+s	VARCHAR
+bl	VARCHAR
+dt	DATE
+ts_s	TIMESTAMP WITH TIME ZONE
+ts_ms	TIMESTAMP WITH TIME ZONE
+ts	TIMESTAMP WITH TIME ZONE
+tstz	TIMESTAMP WITH TIME ZONE
+ts_ns	TIMESTAMP WITH TIME ZONE
+t	TIME
+u	UUID
+e	ENUM('x', 'y')
+l	INTEGER[]
+st	STRUCT(a INTEGER, b VARCHAR)
+m	MAP(VARCHAR, DOUBLE)
+j	JSON
+
+query I
+INSERT INTO ch.w_ddl.all_types VALUES (1, true, -1, -2, -3, 4, 5, 6, 7, 8, 9, 1.5, 2.5, 3.1416, 's', 'blob',
+    DATE '2024-02-29', TIMESTAMPTZ '2024-02-29 12:34:56.123456+00', TIMESTAMPTZ '2024-02-29 12:34:56.123456+00',
+    TIMESTAMPTZ '2024-02-29 12:34:56.123456+00', TIMESTAMPTZ '2024-02-29 12:34:56.123456+00',
+    TIMESTAMPTZ '2024-02-29 12:34:56.123456+00', TIME '12:34:56.123456', 'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'y',
+    [1, NULL], ROW(1, 'x'), MAP {'k': 1.5}, '{"a": "x"}');
+----
+1
+
+query IIIIIIIIIIIIIII
+SELECT id, b, i8, uh, dec, s, dt, ts_s, ts_ms, ts, t, e, l, st, j FROM ch.w_ddl.all_types;
+----
+1	true	-1	9	3.1416	s	2024-02-29	2024-02-29 12:34:56+00	2024-02-29 12:34:56.123+00	2024-02-29 12:34:56.123456+00	12:34:56.123456	y	[1, NULL]	{'a': 1, 'b': x}	{"a":"x"}
+
+# ---------------------------------------------------------------------------
+# constant DEFAULTs are folded by DuckDB and applied by ClickHouse
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.defaults (id INTEGER PRIMARY KEY, s VARCHAR DEFAULT 'dflt', n BIGINT DEFAULT 40 + 2,
+    d DATE DEFAULT DATE '2024-01-01', x DOUBLE DEFAULT -1.5, flag BOOLEAN DEFAULT true);
+
+query I
+INSERT INTO ch.w_ddl.defaults (id) VALUES (1);
+----
+1
+
+query IIIIII
+SELECT * FROM ch.w_ddl.defaults;
+----
+1	dflt	42	2024-01-01	-1.5	true
+
+statement error
+CREATE TABLE ch.w_ddl.bad (id INTEGER, t TIMESTAMPTZ DEFAULT now());
+----
+DEFAULT value of column "t" must be a constant
+
+# ---------------------------------------------------------------------------
+# rejected definitions create nothing
+# ---------------------------------------------------------------------------
+statement error
+CREATE TABLE ch.w_ddl.bad (id INTEGER UNIQUE);
+----
+UNIQUE constraints are not supported for ClickHouse tables
+
+statement error
+CREATE TABLE ch.w_ddl.bad (id INTEGER CHECK (id > 0));
+----
+CHECK constraints are not supported for ClickHouse tables
+
+statement error
+CREATE TABLE ch.w_ddl.bad (id INTEGER, id2 INTEGER AS (id + 1));
+----
+Generated columns are not supported for ClickHouse tables
+
+statement error
+CREATE TABLE ch.w_ddl.bad (i INTERVAL);
+----
+has no ClickHouse equivalent
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ddl'' AND name = ''bad''');
+----
+0
+
+# ---------------------------------------------------------------------------
+# IF NOT EXISTS, OR REPLACE, duplicates
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.t (id INTEGER);
+
+statement error
+CREATE TABLE ch.w_ddl.t (id INTEGER);
+----
+TABLE_ALREADY_EXISTS
+
+statement ok
+CREATE TABLE IF NOT EXISTS ch.w_ddl.t (other VARCHAR);
+
+query I
+SELECT column_name FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 't';
+----
+id
+
+statement ok
+CREATE OR REPLACE TABLE ch.w_ddl.t (replaced VARCHAR);
+
+query I
+SELECT column_name FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 't';
+----
+replaced
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT engine, sorting_key FROM system.tables WHERE database = ''w_ddl'' AND name = ''t''');
+----
+MergeTree	(empty)
+
+# ---------------------------------------------------------------------------
+# ch_default_table_engine
+# ---------------------------------------------------------------------------
+statement error
+SET ch_default_table_engine = 'Merge Tree';
+----
+Invalid ch_default_table_engine
+
+statement error
+SET ch_default_table_engine = 'MergeTree() SETTINGS index_granularity = 1';
+----
+Invalid ch_default_table_engine
+
+statement ok
+SET ch_default_table_engine = 'ReplacingMergeTree';
+
+statement ok
+CREATE TABLE ch.w_ddl.replacing (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+SET ch_default_table_engine = 'Memory';
+
+# no ORDER BY for engines outside the MergeTree family
+statement ok
+CREATE TABLE ch.w_ddl.memory (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+RESET ch_default_table_engine;
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT name, engine, sorting_key FROM system.tables WHERE database = ''w_ddl'' AND name IN (''replacing'', ''memory'') ORDER BY name');
+----
+memory	Memory	(empty)
+replacing	ReplacingMergeTree	id
+
+# ---------------------------------------------------------------------------
+# DROP TABLE
+# ---------------------------------------------------------------------------
+statement ok
+DROP TABLE ch.w_ddl.memory;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ddl'' AND name = ''memory''');
+----
+0
+
+statement error
+SELECT * FROM ch.w_ddl.memory;
+----
+does not exist
+
+statement ok
+DROP TABLE IF EXISTS ch.w_ddl.memory;
+
+statement error
+DROP TABLE ch.w_ddl.memory;
+----
+does not exist
+
+# ClickHouse views show up as tables, but DROP TABLE does not drop them
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_ddl.v AS SELECT 1 AS one');
+
+statement error
+DROP TABLE ch.w_ddl.v;
+----
+is a ClickHouse view
+
+# DuckDB looks DROP VIEW up among DuckDB views, where ClickHouse views never appear
+statement error
+DROP VIEW ch.w_ddl.v;
+----
+does not exist
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ddl'' AND name = ''v''');
+----
+1
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_ddl');

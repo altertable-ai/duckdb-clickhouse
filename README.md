@@ -62,6 +62,7 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 | `ch_filter_pushdown` | `true` | Push filters into ClickHouse queries |
 | `ch_order_pushdown` | `true` | Push `LIMIT` and `ORDER BY … LIMIT` into ClickHouse queries |
 | `ch_insert_block_size` | `65536` | Minimum rows per block sent to ClickHouse during `INSERT` (rounded up to whole chunks) |
+| `ch_default_table_engine` | `MergeTree` | Table engine used by `CREATE TABLE` |
 | `ch_connect_timeout_ms` | `10000` | Connection timeout |
 | `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
 | `ch_pool_max_connections` | depends on CPU count | Connection pool size per attached database (new ATTACHes) |
@@ -146,6 +147,24 @@ COPY ch.analytics.events FROM 'events.csv';
     type that ClickHouse converts (e.g. `Array(IPv4)`). Leave these columns out of the column list, or use
     `clickhouse_execute`.
 
+`CREATE TABLE` (with `IF NOT EXISTS` / `OR REPLACE`) and `DROP TABLE` work on attached databases:
+
+- Column types map back as in the type table, reversed: `VARCHAR`/`BLOB` → `String`, `DATE` → `Date32`,
+  `TIMESTAMP`/`TIMESTAMPTZ` → `DateTime64(6, 'UTC')` (`TIMESTAMP_S`/`_MS`/`_NS` → `DateTime('UTC')` /
+  `DateTime64(3|9, 'UTC')`), `TIME` → `Time64(6)`, `ENUM` → `Enum8`/`Enum16`, `LIST`/`STRUCT`/`MAP` →
+  `Array`/`Tuple`/`Map`, `JSON` → `JSON`. Types with no ClickHouse equivalent (`INTERVAL`, `BIT`, `UNION`, …) are
+  rejected. Naive `TIMESTAMP` columns are stored as UTC and read back as `TIMESTAMP WITH TIME ZONE`, and `BLOB` reads
+  back as `VARCHAR`.
+- Nullable columns become `Nullable(T)`; `PRIMARY KEY` and `NOT NULL` columns do not. `Array`, `Tuple`, `Map` and
+  `JSON` columns cannot be `Nullable` in ClickHouse, so they cannot hold `NULL`.
+- The engine is `ch_default_table_engine` (default `MergeTree`, e.g. `SET ch_default_table_engine =
+  'ReplicatedMergeTree'` on a self-hosted cluster). MergeTree-family tables are `ORDER BY` the `PRIMARY KEY`, or
+  `tuple()` without one.
+- `DEFAULT` values must be constants. `UNIQUE`, `CHECK` and `FOREIGN KEY` constraints, generated columns and
+  `PARTITIONED BY` / `SORTED BY` are not supported; use `clickhouse_execute` for those, and for `CREATE VIEW`.
+- `DROP TABLE` does not drop ClickHouse views or dictionaries, and `DROP VIEW` cannot reach them (DuckDB only looks
+  for DuckDB views); drop them with `clickhouse_execute`.
+
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:
 
@@ -170,7 +189,7 @@ single-threaded scan.
 
 ## Limitations
 
-- `UPDATE`, `DELETE` and DDL (`CREATE`/`DROP`/`ALTER`) are not supported yet; run them with `clickhouse_execute()`.
+- `UPDATE` and `DELETE` are not supported yet; run them with `clickhouse_execute()`.
   `MERGE INTO`, indexes and `CREATE VIEW` are not supported.
 - Attach with `(TYPE clickhouse, READ_ONLY)` to reject every write.
 - ClickHouse has no multi-statement transactions. Two scans in one DuckDB transaction may see different data.

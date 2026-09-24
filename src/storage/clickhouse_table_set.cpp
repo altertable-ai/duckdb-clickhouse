@@ -24,13 +24,17 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 	auto database = ClickhouseUtils::QuoteLiteral(schema.name);
 
 	unordered_map<string, idx_t> row_counts;
-	for (auto &block : connection->Query("SELECT name, total_rows FROM system.tables WHERE database = " + database)) {
+	unordered_map<string, string> engines;
+	for (auto &block :
+	    connection->Query("SELECT name, total_rows, engine FROM system.tables WHERE database = " + database)) {
 		auto names = block[0]->As<clickhouse::ColumnString>();
 		auto totals = block[1]->As<clickhouse::ColumnNullable>();
+		auto table_engines = block[2]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {
 			if (!totals->IsNull(row)) {
 				row_counts[string(names->At(row))] = totals->Nested()->As<clickhouse::ColumnUInt64>()->At(row);
 			}
+			engines[string(names->At(row))] = string(table_engines->At(row));
 		}
 	}
 
@@ -69,7 +73,8 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 		if (row_count != row_counts.end()) {
 			approx_rows = row_count->second;
 		}
-		CreateEntry(make_uniq<ClickhouseTableEntry>(catalog, schema, info, std::move(table.columns), approx_rows));
+		CreateEntry(make_uniq<ClickhouseTableEntry>(catalog, schema, info, std::move(table.columns), approx_rows,
+		                                            engines[table.name]));
 	}
 }
 

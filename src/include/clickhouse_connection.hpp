@@ -31,7 +31,7 @@ public:
 	                                             const ClickhouseTimeouts &timeouts);
 
 	//! Starts a streaming query; read its blocks with NextBlock()
-	void BeginQuery(const string &sql);
+	void BeginQuery(const string &sql, const vector<std::pair<string, string>> &query_settings = {});
 	//! The next block (possibly with zero rows); nullopt once the query has finished
 	std::optional<clickhouse::Block> NextBlock();
 	//! Cancels the running query (if any): sends a cancel and reads (drains) the blocks the server sends
@@ -46,6 +46,9 @@ public:
 	//! Runs a statement that is not expected to return rows, e.g. DDL. Returns false -- after cancelling the rest
 	//! of the result -- as soon as the statement returns a row, true once it has finished without returning any
 	bool Execute(const string &sql);
+	//! Same as Execute(sql), with extra query-level settings. They are sent as non-IMPORTANT settings (a server that
+	//! does not know one ignores it), after the connection's own settings
+	bool Execute(const string &sql, const vector<std::pair<string, string>> &query_settings);
 
 	//! Starts an INSERT (`INSERT INTO … VALUES` or `INSERT INTO … SELECT … FROM input(…)`) with the connection's
 	//! settings, and returns the server's header block: one empty column per value sent, in order
@@ -68,7 +71,8 @@ public:
 	static void SetDebugPrintQueries(bool print);
 
 private:
-	clickhouse::Query MakeQuery(const string &sql) const;
+	clickhouse::Query MakeQuery(const string &sql,
+	                            const vector<std::pair<string, string>> &query_settings = {}) const;
 	//! Translates the in-flight exception into a DuckDB exception
 	[[noreturn]] void RethrowAsDuckDBException(const string &sql);
 
