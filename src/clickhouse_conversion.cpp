@@ -16,8 +16,11 @@ namespace ch = clickhouse;
 
 [[noreturn]] static void ThrowUnexpectedColumn(const ch::ColumnRef &column, const Vector &result,
                                                const string &column_name) {
-	throw InternalException("ClickHouse column \"%s\" of type %s cannot be converted to DuckDB %s", column_name,
-	                        column->Type()->GetName(), result.GetType().ToString());
+	// not InternalException, which would invalidate the whole DuckDB instance: this is reachable from user input,
+	// e.g. a column whose type changed in ClickHouse after an attached database cached the table's metadata
+	throw InvalidInputException("Cannot read ClickHouse column \"%s\" of type %s as DuckDB %s: the table changed "
+	                            "since its metadata was cached; run CALL clickhouse_clear_cache() and retry",
+	                            column_name, column->Type()->GetName(), result.GetType().ToString());
 }
 
 template <class T>
@@ -427,9 +430,11 @@ void ClickhouseConversion::ConvertBlock(const ch::Block &block, DataChunk &outpu
 		return;
 	}
 	if (block.GetColumnCount() != column_names.size()) {
-		throw InternalException("ClickHouse returned %llu columns, expected %llu",
-		                        static_cast<uint64_t>(block.GetColumnCount()),
-		                        static_cast<uint64_t>(column_names.size()));
+		// user-reachable (e.g. the table behind a prepared clickhouse_query() changed): never InternalException
+		throw InvalidInputException("ClickHouse returned %llu columns, expected %llu: the table or query changed "
+		                            "since it was bound; run CALL clickhouse_clear_cache() and retry",
+		                            static_cast<uint64_t>(block.GetColumnCount()),
+		                            static_cast<uint64_t>(column_names.size()));
 	}
 	auto projected_count = projection_ids.empty() ? output.ColumnCount() : projection_ids.size();
 	if (projected_count != output.ColumnCount()) {
