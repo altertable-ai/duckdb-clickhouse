@@ -6,8 +6,10 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
+#include "storage/clickhouse_ddl.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -18,6 +20,13 @@ ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator 
       catalog_name(table_p.catalog.GetName()), database_name(table_p.schema.name), table_name(table_p.name),
       columns(std::move(columns_p)) {
 	insert_sql = BuildInsertQuery(table_p, columns);
+}
+
+ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
+                                   const string &database, unique_ptr<BoundCreateTableInfo> create_info_p)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
+      catalog_name(catalog.GetName()), database_name(database), table_name(create_info_p->Base().table),
+      create_info(std::move(create_info_p)) {
 }
 
 vector<ClickhouseInsertColumn>
@@ -129,7 +138,38 @@ public:
 	idx_t pending_rows = 0;
 	idx_t block_size = 65536;
 	idx_t insert_count = 0;
+	//! The target: copied from the operator for INSERT, resolved after creating the table for CTAS
+	vector<ClickhouseInsertColumn> columns;
+	string insert_sql;
+	//! Set once `columns` / `insert_sql` are ready (see PrepareTarget)
+	bool target_ready = false;
+	//! CTAS with IF NOT EXISTS on an existing table: write nothing
+	bool skip = false;
 };
+
+//! Makes gstate.columns / insert_sql ready. For CTAS, creates the table first, or finds that IF NOT EXISTS applies
+static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, ClickhouseInsertGlobalState &gstate) {
+	if (gstate.target_ready) {
+		return;
+	}
+	gstate.target_ready = true;
+	if (!op.create_info) {
+		gstate.columns = op.columns;
+		gstate.insert_sql = op.insert_sql;
+		return;
+	}
+	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, op.catalog_name, "CREATE TABLE AS");
+	auto &info = op.create_info->Base();
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+	    ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.table)) {
+		gstate.skip = true;
+		return;
+	}
+	auto &table = ClickhouseDdl::CreateTable(context, catalog, op.database_name, info);
+	// every column, in query order: the CTAS input chunk has one column per created column
+	gstate.columns = ClickhouseInsert::GetInsertColumns(table, physical_index_vector_t<idx_t>());
+	gstate.insert_sql = ClickhouseInsert::BuildInsertQuery(table, gstate.columns);
+}
 
 unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &context) const {
 	// nothing is sent to ClickHouse yet: see StartInsert()
@@ -143,22 +183,24 @@ unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &
 
 void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGlobalState &gstate) const {
 	D_ASSERT(!gstate.connection);
+	PrepareTarget(*this, context, gstate);
 	// resolved again rather than kept from planning: see catalog_name
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, catalog_name, "INSERT");
 	gstate.connection = catalog.StartWrite(context);
 	// Time/Time64 columns need this setting (ClickHouse 25.x); servers that do not know it ignore it. Tables
 	// DuckDB creates map TIME to Time64 (see ClickhouseDdlTypes), so every INSERT needs it, not just DDL
-	gstate.header = gstate.connection->BeginInsert(insert_sql, {{"enable_time_time64_type", "1"}});
-	if (gstate.header.GetColumnCount() != columns.size()) {
+	gstate.header = gstate.connection->BeginInsert(gstate.insert_sql, {{"enable_time_time64_type", "1"}});
+	if (gstate.header.GetColumnCount() != gstate.columns.size()) {
 		// not InternalException: this means the cached column list is stale (another connection changed the
 		// table since it was cached), and InternalException would invalidate the whole DuckDB instance for
 		// every later query in DuckDB v1.5.4
 		throw InvalidInputException(
 		    "ClickHouse INSERT header for table \"%s\" has %d columns, expected %d: the table changed since its "
 		    "metadata was cached; run CALL clickhouse_clear_cache() and retry",
-		    table_name, static_cast<uint64_t>(gstate.header.GetColumnCount()), static_cast<uint64_t>(columns.size()));
+		    table_name, static_cast<uint64_t>(gstate.header.GetColumnCount()),
+		    static_cast<uint64_t>(gstate.columns.size()));
 	}
-	for (idx_t i = 0; i < columns.size(); i++) {
+	for (idx_t i = 0; i < gstate.columns.size(); i++) {
 		gstate.pending.push_back(gstate.header[i]->CloneEmpty());
 	}
 }
@@ -171,12 +213,18 @@ SinkResultType ClickhouseInsert::Sink(ExecutionContext &context, DataChunk &chun
 	if (chunk.size() == 0) {
 		return SinkResultType::NEED_MORE_INPUT;
 	}
+	if (!gstate.target_ready) {
+		PrepareTarget(*this, context.client, gstate);
+	}
+	if (gstate.skip) {
+		return SinkResultType::FINISHED;
+	}
 	if (!gstate.connection) {
 		StartInsert(context.client, gstate);
 	}
-	for (idx_t i = 0; i < columns.size(); i++) {
-		ClickhouseWriter::AppendVector(chunk.data[columns[i].source_index], chunk.size(), gstate.pending[i],
-		                               columns[i].column.name);
+	for (idx_t i = 0; i < gstate.columns.size(); i++) {
+		ClickhouseWriter::AppendVector(chunk.data[gstate.columns[i].source_index], chunk.size(), gstate.pending[i],
+		                               gstate.columns[i].column.name);
 	}
 	gstate.pending_rows += chunk.size();
 	gstate.insert_count += chunk.size();
@@ -189,6 +237,10 @@ SinkResultType ClickhouseInsert::Sink(ExecutionContext &context, DataChunk &chun
 SinkFinalizeType ClickhouseInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                             OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<ClickhouseInsertGlobalState>();
+	if (create_info) {
+		// an empty CTAS (no rows arrived) still creates the table
+		PrepareTarget(*this, context, gstate);
+	}
 	if (!gstate.connection) {
 		// no rows arrived (e.g. an INSERT … SELECT that selected nothing): nothing was started, nothing is sent
 		return SinkFinalizeType::READY;
@@ -212,7 +264,7 @@ SourceResultType ClickhouseInsert::GetDataInternal(ExecutionContext &context, Da
 }
 
 string ClickhouseInsert::GetName() const {
-	return "CLICKHOUSE_INSERT";
+	return create_info ? "CLICKHOUSE_CREATE_TABLE_AS" : "CLICKHOUSE_INSERT";
 }
 
 InsertionOrderPreservingMap<string> ClickhouseInsert::ParamsToString() const {

@@ -1,6 +1,8 @@
 #include "storage/clickhouse_catalog.hpp"
 
+#include "clickhouse_ddl_types.hpp"
 #include "clickhouse_utils.hpp"
+#include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -8,7 +10,9 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "storage/clickhouse_ddl.hpp"
 #include "storage/clickhouse_insert.hpp"
@@ -143,10 +147,23 @@ ClickhousePoolConnection ClickhouseCatalog::StartWrite(ClientContext &context) {
 	return connection;
 }
 
-PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,
-                                                       PhysicalOperator &) {
+PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                       LogicalCreateTable &op, PhysicalOperator &plan) {
 	ThrowIfReadOnly();
-	ClickhouseUtils::ThrowUnsupportedWrite("CREATE TABLE AS");
+	auto &info = op.info->Base();
+	// fail now, before anything is created, for columns ClickHouse cannot hold or that the INSERT cannot write
+	ClickhouseDdl::CreateTableSql(context, op.schema.name, info);
+	for (auto &column : info.columns.Logical()) {
+		auto type = ClickhouseDdlTypes::ToClickhouse(column.Type(), true);
+		if (ClickhouseWriter::GetWriteMode(ClickhouseTypeParser::Parse(type)) == ClickhouseWriteMode::UNSUPPORTED) {
+			throw NotImplementedException("Column \"%s\" (%s) cannot be written into ClickHouse by CREATE TABLE AS; "
+			                              "create the table with clickhouse_execute() instead",
+			                              column.Name(), column.Type().ToString());
+		}
+	}
+	auto &insert = planner.Make<ClickhouseInsert>(op, *this, op.schema.name, std::move(op.info));
+	insert.children.push_back(plan);
+	return insert;
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,

@@ -66,6 +66,11 @@ INSERT INTO ch.test_db.t1 SELECT * FROM ch.test_db.t1;
 ----
 attached in read-only mode
 
+statement error
+CREATE TABLE ch.test_db.ctas AS SELECT 42 AS i;
+----
+attached in read-only mode
+
 statement ok
 COPY (SELECT * FROM ch.test_db.t1 ORDER BY id LIMIT 1) TO '__TEST_DIR__/ro_t1.csv' (HEADER);
 

@@ -26,11 +26,6 @@ DELETE FROM ch.test_db.t1;
 DELETE is not supported on attached ClickHouse databases yet
 
 statement error
-CREATE TABLE ch.test_db.new_table AS SELECT 42 AS i;
-----
-not supported on attached ClickHouse databases yet
-
-statement error
 ALTER TABLE ch.test_db.t1 ALTER COLUMN name TYPE INTEGER;
 ----
 is not supported for ClickHouse tables

@@ -307,32 +307,59 @@ static void AppendDate(const AppendInput &input, const ch::ColumnRef &target) {
 	ThrowMismatch(input.source, target, input.column_name);
 }
 
-static string TimestampText(timestamp_tz_t value) {
-	return Timestamp::ToString(timestamp_t(value.value)) + "+00";
+//! Decimal digits of a second in a DuckDB timestamp type's int64 ticks; false for non-timestamp types
+static bool TimestampPrecision(LogicalTypeId id, idx_t &precision) {
+	switch (id) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+		precision = 0;
+		return true;
+	case LogicalTypeId::TIMESTAMP_MS:
+		precision = 3;
+		return true;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		precision = 6;
+		return true;
+	case LogicalTypeId::TIMESTAMP_NS:
+		precision = 9;
+		return true;
+	default:
+		return false;
+	}
 }
 
-//! `micros` expressed with `precision` decimal digits (floored); false when that overflows int64
-static bool TryScaleMicros(int64_t micros, idx_t precision, int64_t &result) {
-	if (precision <= 6) {
-		result = ClickhouseUtils::ScaleTicks(micros, 6, precision);
+//! `ticks` at `from` digits rescaled to `to` digits (floored); false when that overflows int64
+static bool TryRescaleTicks(int64_t ticks, idx_t from, idx_t to, int64_t &result) {
+	if (to <= from) {
+		result = ClickhouseUtils::ScaleTicks(ticks, from, to);
 		return true;
 	}
-	return TryMultiplyOperator::Operation<int64_t, int64_t, int64_t>(
-	    micros, ClickhouseUtils::PowerOfTen(precision - 6), result);
+	return TryMultiplyOperator::Operation<int64_t, int64_t, int64_t>(ticks, ClickhouseUtils::PowerOfTen(to - from),
+	                                                                  result);
+}
+
+//! The value, for errors; infinities and values beyond int64 microseconds have no timestamp text
+static string TimestampText(int64_t ticks, idx_t precision) {
+	int64_t micros;
+	if (!TryRescaleTicks(ticks, precision, 6, micros) || !Timestamp::IsFinite(timestamp_t(micros))) {
+		return "an infinite or out-of-range timestamp";
+	}
+	return Timestamp::ToString(timestamp_t(micros)) + " (UTC)";
 }
 
 static void AppendTimestamp(const AppendInput &input, const ch::ColumnRef &target) {
-	if (input.source.GetType().id() != LogicalTypeId::TIMESTAMP_TZ) {
+	idx_t source_precision;
+	if (!TimestampPrecision(input.source.GetType().id(), source_precision)) {
 		ThrowMismatch(input.source, target, input.column_name);
 	}
 	if (auto typed = target->As<ch::ColumnDateTime>()) {
 		// seconds since the epoch as UInt32: 1970-01-01 00:00:00 to 2106-02-07 06:28:15
-		ForEachValue<timestamp_tz_t>(
+		ForEachValue<int64_t>(
 		    input, target,
-		    [&](timestamp_tz_t value) {
-			    auto seconds = ClickhouseUtils::ScaleTicks(value.value, 6, 0);
+		    [&](int64_t ticks) {
+			    auto seconds = ClickhouseUtils::ScaleTicks(ticks, source_precision, 0);
 			    if (seconds < 0 || seconds > NumericLimits<uint32_t>::Maximum()) {
-				    ThrowOutOfRange(TimestampText(value), target, input.column_name);
+				    ThrowOutOfRange(TimestampText(ticks, source_precision), target, input.column_name);
 			    }
 			    typed->AppendRaw(static_cast<uint32_t>(seconds));
 		    },
@@ -343,16 +370,17 @@ static void AppendTimestamp(const AppendInput &input, const ch::ColumnRef &targe
 		static const auto MIN_MICROS = Timestamp::FromDatetime(Date::FromDate(1900, 1, 1), dtime_t(0)).value;
 		static const auto MAX_MICROS =
 		    Timestamp::FromDatetime(Date::FromDate(2299, 12, 31), Time::FromTime(23, 59, 59, 999999)).value;
-		auto precision = typed->GetPrecision();
-		ForEachValue<timestamp_tz_t>(
+		auto target_precision = typed->GetPrecision();
+		ForEachValue<int64_t>(
 		    input, target,
-		    [&](timestamp_tz_t value) {
-			    int64_t ticks;
-			    if (value.value < MIN_MICROS || value.value > MAX_MICROS ||
-			        !TryScaleMicros(value.value, precision, ticks)) {
-				    ThrowOutOfRange(TimestampText(value), target, input.column_name);
+		    [&](int64_t ticks) {
+			    int64_t micros;
+			    int64_t result;
+			    if (!TryRescaleTicks(ticks, source_precision, 6, micros) || micros < MIN_MICROS ||
+			        micros > MAX_MICROS || !TryRescaleTicks(ticks, source_precision, target_precision, result)) {
+				    ThrowOutOfRange(TimestampText(ticks, source_precision), target, input.column_name);
 			    }
-			    typed->Append(ticks);
+			    typed->Append(result);
 		    },
 		    [&]() { typed->Append(0); });
 		return;

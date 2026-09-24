@@ -5,8 +5,10 @@
 #include "duckdb/execution/physical_operator.hpp"
 
 namespace duckdb {
+class ClickhouseCatalog;
 class ClickhouseTableEntry;
 class ClickhouseInsertGlobalState;
+struct BoundCreateTableInfo;
 
 //! One column an INSERT writes: the ClickHouse column, and the input chunk column holding its values
 struct ClickhouseInsertColumn {
@@ -14,12 +16,17 @@ struct ClickhouseInsertColumn {
 	idx_t source_index;
 };
 
-//! INSERT, INSERT … SELECT and COPY … FROM into a ClickHouse table: streams the input into one native INSERT on one
-//! pooled connection, a block every ch_insert_block_size rows
+//! INSERT, INSERT … SELECT, COPY … FROM and CREATE TABLE … AS SELECT into a ClickHouse table: streams the input into
+//! one native INSERT on one pooled connection, a block every ch_insert_block_size rows
 class ClickhouseInsert : public PhysicalOperator {
 public:
 	ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseTableEntry &table,
 	                 vector<ClickhouseInsertColumn> columns);
+
+	//! CREATE TABLE … AS SELECT: the table is created when the statement runs (on the first row, or in Finalize
+	//! when the query yields none), then filled like an INSERT listing every column
+	ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
+	                 const string &database, unique_ptr<BoundCreateTableInfo> create_info);
 
 	//! The attached database (DuckDB catalog) name, resolved again when the INSERT runs. No reference to the table
 	//! entry or the catalog is kept: the entry is freed by a ClearCache() (clickhouse_clear_cache(),
@@ -29,10 +36,14 @@ public:
 	//! The ClickHouse database and table names, for EXPLAIN and errors
 	string database_name;
 	string table_name;
-	//! The inserted columns, in table order
+	//! The INSERT target resolved at plan time: the inserted columns, in table order. Empty for CTAS, whose target
+	//! is only known once the table is created (see ClickhouseInsertGlobalState::columns)
 	vector<ClickhouseInsertColumn> columns;
-	//! The statement BeginInsert() runs, e.g. INSERT INTO `db`.`t` (`a`, `b`) VALUES
+	//! The INSERT target resolved at plan time: the statement BeginInsert() runs, e.g.
+	//! INSERT INTO `db`.`t` (`a`, `b`) VALUES. Empty for CTAS, see `columns`
 	string insert_sql;
+	//! CTAS only: the table to create
+	unique_ptr<BoundCreateTableInfo> create_info;
 
 	//! The columns an INSERT with this column_index_map writes (every column when the map is empty), in table order.
 	//! Throws for columns that cannot be inserted into

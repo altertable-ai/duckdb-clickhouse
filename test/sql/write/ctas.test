@@ -1,0 +1,137 @@
+# name: test/sql/write/ctas.test
+# description: CREATE TABLE … AS SELECT into an attached ClickHouse database
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_ctas');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_ctas');
+
+# many blocks, nested and naive-timestamp columns
+statement ok
+SET ch_insert_block_size = 1000;
+
+query I
+CREATE TABLE ch.w_ctas.t1 AS
+SELECT range::INTEGER AS id, 'v' || range AS s, (range * 1.5)::DOUBLE AS d,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (range) HOUR AS ts, [range, NULL] AS l
+FROM range(5000);
+----
+5000
+
+statement ok
+RESET ch_insert_block_size;
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ctas'' AND table = ''t1'' ORDER BY position');
+----
+id	Nullable(Int32)
+s	Nullable(String)
+d	Nullable(Float64)
+ts	Nullable(DateTime64(6, 'UTC'))
+l	Array(Nullable(Int64))
+
+query IIII
+SELECT count(*), sum(id), max(ts), max(len(l)) FROM ch.w_ctas.t1;
+----
+5000	12497500	2024-07-27 07:00:00+00	2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(max(ts)) FROM w_ctas.t1');
+----
+2024-07-27 07:00:00.000000
+
+# an empty result still creates the table
+query I
+CREATE TABLE ch.w_ctas.empty AS SELECT 1::INTEGER AS x WHERE false;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.columns WHERE database = ''w_ctas'' AND table = ''empty''');
+----
+1
+
+# IF NOT EXISTS leaves an existing table alone and writes nothing. DuckDB's own planner plans a plain
+# PhysicalCreateTable (not our ClickhouseInsert) for CREATE TABLE IF NOT EXISTS ... AS SELECT once the table already
+# exists, since CreatePlan() only reaches PlanCreateTableAs when there is no existing entry or OR REPLACE is used;
+# that path yields an empty result instead of a one-row 0
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.t1 AS SELECT 1 AS other;
+----
+
+query I
+SELECT count(*) FROM ch.w_ctas.t1;
+----
+5000
+
+# OR REPLACE replaces it
+query I
+CREATE OR REPLACE TABLE ch.w_ctas.t1 AS SELECT 42::INTEGER AS answer;
+----
+1
+
+query I
+SELECT * FROM ch.w_ctas.t1;
+----
+42
+
+# naive timestamp family, BLOB and ENUM sources keep their values
+query I
+CREATE TABLE ch.w_ctas.types AS SELECT
+    TIMESTAMP_S '2024-01-01 00:00:01' AS ts_s, TIMESTAMP_MS '2024-01-01 00:00:00.123' AS ts_ms,
+    TIMESTAMP_NS '2024-01-01 00:00:00.123456789' AS ts_ns, 'abc'::BLOB AS bl, 'y'::ENUM('x', 'y') AS e;
+----
+1
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ts_s), toString(ts_ms), toString(ts_ns), hex(bl), toString(e) FROM w_ctas.types');
+----
+2024-01-01 00:00:01	2024-01-01 00:00:00.123	2024-01-01 00:00:00.123456789	616263	y
+
+# from a DuckDB table
+statement ok
+CREATE TABLE local_rows AS SELECT range AS n FROM range(3);
+
+query I
+CREATE TABLE ch.w_ctas.from_local AS SELECT * FROM local_rows;
+----
+3
+
+query I
+SELECT sum(n) FROM ch.w_ctas.from_local;
+----
+3
+
+# types ClickHouse cannot hold fail before anything is created
+statement error
+CREATE TABLE ch.w_ctas.bad AS SELECT INTERVAL 1 DAY AS i;
+----
+has no ClickHouse equivalent
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ctas'' AND name = ''bad''');
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_ctas');
