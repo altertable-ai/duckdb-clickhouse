@@ -4,6 +4,10 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
+// required, not just tidy: without ClientContext's definition, context.lock() below instantiates
+// duckdb::shared_ptr<ClientContext>'s converting constructor with the no-op enable_shared_from_this hook, and
+// the linker may keep that instantiation for the whole binary (it does at -O0), breaking shared_from_this()
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
