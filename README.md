@@ -127,6 +127,11 @@ COPY ch.analytics.events FROM 'events.csv';
   - `NULL` in a non-`Nullable` column, including `Array`, `Tuple` and `Map` columns, which ClickHouse cannot make
     `Nullable`.
 - **Precision:** timestamps and times are written at the column's precision, and anything finer is truncated.
+- **Types ClickHouse converts:** columns that the extension reads through ClickHouse conversions (`IPv4/6`,
+  `(U)Int256`, `Decimal256`, `BFloat16`, `JSON`, geo types) are written the same way in reverse. DuckDB sends the text
+  (or float) form and ClickHouse converts it (`INSERT … SELECT … FROM input(…)`), so they accept exactly what reading
+  them produces: `'192.168.0.1'`, `'POINT(1 2)'`, a JSON document. Text ClickHouse cannot parse fails the `INSERT`
+  with ClickHouse's error.
 - **Atomicity:** an `INSERT` is not atomic. If it fails part-way, ClickHouse may already have committed the blocks sent
   so far. On replicated tables, ClickHouse deduplicates identical blocks by default; attach with
   `SETTINGS 'insert_deduplicate=0'` to turn that off.
@@ -134,9 +139,7 @@ COPY ch.analytics.events FROM 'events.csv';
   - `RETURNING` and `ON CONFLICT`;
   - columns of type `Variant`, `Dynamic`, `AggregateFunction` or `SimpleAggregateFunction`, or nested types holding a
     type that ClickHouse converts (e.g. `Array(IPv4)`). Leave these columns out of the column list, or use
-    `clickhouse_execute`;
-  - columns ClickHouse converts on read (`IPv4/6`, `(U)Int256`, `Decimal256`, `JSON`, geo types) are not supported
-    **yet**.
+    `clickhouse_execute`.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

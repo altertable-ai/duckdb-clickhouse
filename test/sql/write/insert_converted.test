@@ -1,0 +1,107 @@
+# name: test/sql/write/insert_converted.test
+# description: INSERT into column types ClickHouse converts: values travel as the read path's text and are converted back
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_conv');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_conv');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.source (
+    id UInt8, ip4 IPv4, ip6 Nullable(IPv6), i256 Int256, u256 UInt256, d76 Decimal(76, 5), bf BFloat16, j JSON,
+    p Point, r Ring, ls LineString, mls MultiLineString, poly Polygon, mpoly MultiPolygon, n Int32
+) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.converted AS w_conv.source');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_conv.source VALUES
+    (1, ''192.168.0.1'', ''2001:db8::1'', -1, 1, 12345.67891, 1.5, ''{"a": "x", "b": {"c": "y"}}'',
+     (1, 2), [(0, 0), (1, 0), (1, 1), (0, 0)], [(0, 0), (1, 1)], [[(0, 0), (1, 1)], [(2, 2), (3, 3)]],
+     [[(0, 0), (4, 0), (4, 4), (0, 0)]], [[[(0, 0), (1, 0), (1, 1), (0, 0)]]], 7),
+    (2, ''0.0.0.0'', NULL, 0, 0, 0, 0, ''{}'', (0, 0), [(0, 0), (2, 0), (2, 2), (0, 0)], [(5, 5), (6, 6)],
+     [[(1, 1), (2, 2)]], [[(0, 0), (3, 0), (3, 3), (0, 0)]], [[[(0, 0), (2, 0), (2, 2), (0, 0)]]], 0)');
+
+# ClickHouse -> DuckDB -> ClickHouse
+query I
+INSERT INTO ch.w_conv.converted SELECT * FROM ch.w_conv.source;
+----
+2
+
+# DuckDB's view: identical
+query I
+SELECT count(*) FROM (SELECT * FROM ch.w_conv.converted EXCEPT SELECT * FROM ch.w_conv.source);
+----
+0
+
+# ClickHouse's own view: identical values, compared as ClickHouse types
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_conv.source AS s INNER JOIN w_conv.converted AS c ON s.id = c.id
+    WHERE s.ip4 = c.ip4 AND ((s.ip6 IS NULL AND c.ip6 IS NULL) OR s.ip6 = c.ip6) AND s.i256 = c.i256 AND s.u256 = c.u256
+    AND s.d76 = c.d76 AND s.bf = c.bf AND toJSONString(s.j) = toJSONString(c.j) AND wkt(s.p) = wkt(c.p)
+    AND wkt(s.r) = wkt(c.r) AND wkt(s.ls) = wkt(c.ls) AND wkt(s.mls) = wkt(c.mls) AND wkt(s.poly) = wkt(c.poly)
+    AND wkt(s.mpoly) = wkt(c.mpoly) AND s.n = c.n');
+----
+2
+
+# literal values, a column subset and a NULL
+query I
+INSERT INTO ch.w_conv.converted (id, ip4, ip6, i256, d76, j, p) VALUES
+    (3, '10.0.0.1', NULL, '-57896044618658097711785492504343953926634992332820282019728792003956564819968', '-1.5',
+     '{"k": "v"}', 'POINT (3 4)');
+----
+1
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip4), ip6 IS NULL, toString(i256), toString(d76), toJSONString(j), wkt(p) FROM w_conv.converted WHERE id = 3');
+----
+10.0.0.1	1	-57896044618658097711785492504343953926634992332820282019728792003956564819968	-1.5	{"k":"v"}	POINT(3 4)
+
+# ClickHouse rejects text it cannot convert; nothing is written and the next INSERT works
+statement error
+INSERT INTO ch.w_conv.converted (id, ip4) VALUES (4, 'not an ip');
+----
+ClickHouse error
+
+query I
+SELECT count(*) FROM ch.w_conv.converted WHERE id = 4;
+----
+0
+
+query I
+INSERT INTO ch.w_conv.converted (id, ip4) VALUES (5, '1.1.1.1');
+----
+1
+
+# natively written columns keep working alongside converted ones, including many blocks
+statement ok
+SET ch_insert_block_size = 100;
+
+query I
+INSERT INTO ch.w_conv.converted (id, ip4, n) SELECT 10 + (range % 200), '10.0.' || (range // 256) || '.' || (range % 256), range::INTEGER FROM range(1000);
+----
+1000
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT count(), sum(n) FROM w_conv.converted WHERE id >= 10');
+----
+1000	499500
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_conv');

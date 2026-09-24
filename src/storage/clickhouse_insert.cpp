@@ -42,12 +42,8 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		}
 		switch (ClickhouseWriter::GetWriteMode(column.type_node)) {
 		case ClickhouseWriteMode::NATIVE:
-			break;
 		case ClickhouseWriteMode::SERVER_CONVERSION:
-			// Task 4 replaces this case
-			throw NotImplementedException("Inserting into ClickHouse column \"%s\" of type %s is not supported yet; "
-			                              "use clickhouse_execute() instead",
-			                              column.name, column.clickhouse_type);
+			break;
 		case ClickhouseWriteMode::UNSUPPORTED:
 			throw NotImplementedException("Cannot insert into ClickHouse column \"%s\" of type %s; insert into it "
 			                              "with clickhouse_execute() instead",
@@ -64,11 +60,34 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 
 string ClickhouseInsert::BuildInsertQuery(ClickhouseTableEntry &table, const vector<ClickhouseInsertColumn> &columns) {
 	vector<string> names;
-	for (auto &column : columns) {
-		names.push_back(ClickhouseUtils::QuoteIdentifier(column.column.name));
+	vector<string> input_columns;
+	vector<string> select_list;
+	bool server_conversion = false;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto &column = columns[i].column;
+		names.push_back(ClickhouseUtils::QuoteIdentifier(column.name));
+		// input() columns get generated names, so column names never need quoting inside the structure literal
+		auto input_name = "c" + to_string(i + 1);
+		if (ClickhouseWriter::GetWriteMode(column.type_node) == ClickhouseWriteMode::SERVER_CONVERSION) {
+			server_conversion = true;
+			input_columns.push_back(input_name + " " + ClickhouseWriter::ServerInputType(column.type_node));
+			select_list.push_back(ClickhouseWriter::ServerConversion(column.type_node, input_name));
+		} else {
+			input_columns.push_back(input_name + " " + column.clickhouse_type);
+			select_list.push_back(input_name);
+		}
 	}
-	return "INSERT INTO " + ClickhouseUtils::QuoteIdentifier(table.schema.name) + "." +
-	       ClickhouseUtils::QuoteIdentifier(table.name) + " (" + StringUtil::Join(names, ", ") + ") VALUES";
+	auto target = "INSERT INTO " + ClickhouseUtils::QuoteIdentifier(table.schema.name) + "." +
+	              ClickhouseUtils::QuoteIdentifier(table.name) + " (" + StringUtil::Join(names, ", ") + ")";
+	if (!server_conversion) {
+		return target + " VALUES";
+	}
+	// values ClickHouse converts are sent as input() columns and converted by the SELECT; the header BeginInsert()
+	// returns then describes input()'s structure, which ClickhouseWriter fills like any other INSERT.
+	// FORMAT Native must trail the whole SELECT (input() otherwise fails with "Unknown format"); it must not sit
+	// between the column list and SELECT, which makes the server read the rest of the query text as literal data
+	return target + " SELECT " + StringUtil::Join(select_list, ", ") + " FROM input(" +
+	       ClickhouseUtils::QuoteLiteral(StringUtil::Join(input_columns, ", ")) + ") FORMAT Native";
 }
 
 //===--------------------------------------------------------------------===//

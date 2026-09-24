@@ -28,6 +28,12 @@ public:
 	//! out-of-range dates and timestamps, oversized FixedStrings, NULLs in non-Nullable columns
 	static void AppendVector(Vector &source, idx_t count, const clickhouse::ColumnRef &target,
 	                         const string &column_name);
+	//! For a SERVER_CONVERSION column: the input() column type its values are sent as -- (Nullable) String, or
+	//! (Nullable) Float32 for BFloat16, matching what the read path produces for it
+	static string ServerInputType(const ClickhouseTypeNode &node);
+	//! For a SERVER_CONVERSION column: the ClickHouse expression converting `expr` (of ServerInputType) to the
+	//! column's own type
+	static string ServerConversion(const ClickhouseTypeNode &node, const string &expr);
 };
 
 } // namespace duckdb

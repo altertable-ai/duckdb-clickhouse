@@ -381,14 +381,6 @@ SELECT id FROM ch.w_insert.unsupported;
 ----
 1
 
-statement ok
-CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.converted (id UInt8, ip IPv4) ENGINE = MergeTree ORDER BY id');
-
-statement error
-INSERT INTO ch.w_insert.converted VALUES (1, '1.2.3.4');
-----
-is not supported yet
-
 # ---------------------------------------------------------------------------
 # many blocks, INSERT … SELECT from DuckDB, COPY, empty inserts
 # ---------------------------------------------------------------------------

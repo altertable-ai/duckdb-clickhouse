@@ -9,6 +9,7 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 
 #include <clickhouse/columns/array.h>
@@ -73,6 +74,25 @@ ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &nod
 		return ClickhouseWriteMode::NATIVE;
 	}
 	return ClickhouseWriteMode::UNSUPPORTED;
+}
+
+string ClickhouseWriter::ServerInputType(const ClickhouseTypeNode &node) {
+	auto base = UnwrapNullable(node).name == "BFloat16" ? "Float32" : "String";
+	return ClickhouseTypes::IsNullable(node) ? "Nullable(" + string(base) + ")" : string(base);
+}
+
+string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const string &expr) {
+	// geo types are read as WKT (wkt()); CAST cannot parse WKT, the readWKT* functions can
+	static const unordered_map<string, string> WKT_READERS = {
+	    {"Point", "readWKTPoint"},           {"Ring", "readWKTRing"},       {"LineString", "readWKTLineString"},
+	    {"MultiLineString", "readWKTMultiLineString"}, {"Polygon", "readWKTPolygon"},
+	    {"MultiPolygon", "readWKTMultiPolygon"}};
+	auto reader = WKT_READERS.find(UnwrapNullable(node).name);
+	if (reader != WKT_READERS.end()) {
+		return reader->second + "(" + expr + ")";
+	}
+	// the column's full type, wrappers included: CAST(Nullable(String) AS Nullable(IPv4)) keeps NULLs
+	return "CAST(" + expr + " AS " + node.text + ")";
 }
 
 //===--------------------------------------------------------------------===//
