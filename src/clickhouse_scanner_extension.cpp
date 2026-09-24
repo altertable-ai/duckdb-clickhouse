@@ -81,7 +81,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis));
 	config.AddExtensionOption("ch_order_pushdown", "Push LIMIT and ORDER BY ... LIMIT down into ClickHouse queries",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("ch_insert_block_size", "Rows per block sent to ClickHouse during INSERT",
+	config.AddExtensionOption("ch_insert_block_size",
+	                          "Minimum rows per block sent to ClickHouse during INSERT (rounded up to whole chunks)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(65536), SetClickhouseInsertBlockSize);
 	OptimizerExtension clickhouse_optimizer;
 	clickhouse_optimizer.optimize_function = ClickhouseOptimizer::Optimize;

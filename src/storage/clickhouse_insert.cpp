@@ -120,9 +120,14 @@ unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &
 	result->connection = catalog.GetConnectionPool().GetConnection();
 	result->header = result->connection->BeginInsert(insert_sql);
 	if (result->header.GetColumnCount() != columns.size()) {
-		throw InternalException("ClickHouse INSERT header has %d columns, expected %d",
-		                        static_cast<uint64_t>(result->header.GetColumnCount()),
-		                        static_cast<uint64_t>(columns.size()));
+		// not InternalException: this means the cached column list is stale (another connection changed the
+		// table since it was cached), and InternalException would invalidate the whole DuckDB instance for
+		// every later query in DuckDB v1.5.4
+		throw InvalidInputException(
+		    "ClickHouse INSERT header for table \"%s\" has %d columns, expected %d: the table changed since its "
+		    "metadata was cached; run CALL clickhouse_clear_cache() and retry",
+		    table.name, static_cast<uint64_t>(result->header.GetColumnCount()),
+		    static_cast<uint64_t>(columns.size()));
 	}
 	for (idx_t i = 0; i < columns.size(); i++) {
 		result->pending.push_back(result->header[i]->CloneEmpty());

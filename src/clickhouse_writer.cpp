@@ -78,9 +78,14 @@ ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &nod
 //===--------------------------------------------------------------------===//
 // Errors
 //===--------------------------------------------------------------------===//
+//! Not InternalException: a mismatch here almost always means the cached column type is stale (another connection
+//! changed it since it was cached), and InternalException would invalidate the whole DuckDB instance for every
+//! later query in DuckDB v1.5.4
 [[noreturn]] static void ThrowMismatch(const Vector &source, const ch::ColumnRef &target, const string &column_name) {
-	throw InternalException("Cannot write DuckDB %s values into ClickHouse column \"%s\" of type %s",
-	                        source.GetType().ToString(), column_name, target->Type()->GetName());
+	throw InvalidInputException(
+	    "Cannot write DuckDB %s values into ClickHouse column \"%s\" of type %s: the table changed since its "
+	    "metadata was cached; run CALL clickhouse_clear_cache() and retry",
+	    source.GetType().ToString(), column_name, target->Type()->GetName());
 }
 
 [[noreturn]] static void ThrowNull(const ch::ColumnRef &target, const string &column_name) {

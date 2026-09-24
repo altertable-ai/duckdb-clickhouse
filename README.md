@@ -61,7 +61,7 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 |---|---|---|
 | `ch_filter_pushdown` | `true` | Push filters into ClickHouse queries |
 | `ch_order_pushdown` | `true` | Push `LIMIT` and `ORDER BY … LIMIT` into ClickHouse queries |
-| `ch_insert_block_size` | `65536` | Rows per block sent to ClickHouse during `INSERT` |
+| `ch_insert_block_size` | `65536` | Minimum rows per block sent to ClickHouse during `INSERT` (rounded up to whole chunks) |
 | `ch_connect_timeout_ms` | `10000` | Connection timeout |
 | `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
 | `ch_pool_max_connections` | depends on CPU count | Connection pool size per attached database (new ATTACHes) |
@@ -110,8 +110,9 @@ sent to ClickHouse and committed when it runs. `COMMIT` does nothing, and `ROLLB
 reached ClickHouse. A `ROLLBACK` after a ClickHouse write logs a warning, which is visible after
 `CALL enable_logging(level = 'warning')` in `duckdb_logs`.
 
-`INSERT` (with `VALUES` or a `SELECT`) and `COPY … FROM` stream rows into ClickHouse over the native protocol, in
-blocks of `ch_insert_block_size` rows:
+`INSERT` (with `VALUES` or a `SELECT`) and `COPY … FROM` stream rows into ClickHouse over the native protocol. A
+block is flushed once at least `ch_insert_block_size` rows have been appended, so blocks are always whole DuckDB
+chunks (up to 2048 rows each) and can be somewhat larger than `ch_insert_block_size`:
 
 ```sql
 INSERT INTO ch.analytics.events SELECT * FROM read_parquet('events/*.parquet');

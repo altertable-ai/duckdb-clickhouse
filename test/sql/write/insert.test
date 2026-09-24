@@ -143,6 +143,27 @@ SELECT * FROM clickhouse_query('ch', 'SELECT toString(m_nested), toString(tup_ne
 ----
 {'a':[1,NULL],'b':[]}	(['p','q'],NULL)
 
+# constant/dictionary input vectors: arr/tup/m are the same literal on every row, spanning several chunks
+query I
+INSERT INTO ch.w_insert.nested (id, arr, tup, m) SELECT 100 + (range % 100), [1, 2], ROW(7, 'k'), MAP {'a': 3} FROM range(3000);
+----
+3000
+
+query I
+SELECT count(*) FROM ch.w_insert.nested WHERE id >= 100;
+----
+3000
+
+query III
+SELECT arr, tup, m FROM ch.w_insert.nested WHERE id = 150 LIMIT 1;
+----
+[1, 2]	{'a': 7, 'b': k}	{a=3}
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(arr), toString(tup), toString(m) FROM w_insert.nested WHERE id = 150 LIMIT 1');
+----
+[1,2]	(7,'k')	{'a':3}
+
 # ---------------------------------------------------------------------------
 # Time / Time64
 # ---------------------------------------------------------------------------
@@ -284,6 +305,31 @@ query I
 SELECT * FROM clickhouse_query('ch', 'SELECT hex(fs) FROM w_insert.limits');
 ----
 6100
+
+# failing after a block has already been flushed: with ch_insert_block_size=1000, the first 4096 rows (two full
+# 2048-row chunks) are flushed before the NULL at range=5000 (in the third chunk) is rejected. ClickHouse may or
+# may not have committed those blocks, so nothing about their row count is asserted -- only that the connection
+# was discarded rather than reused mid-insert, proven by the INSERT below succeeding
+statement ok
+SET ch_insert_block_size = 1000;
+
+statement error
+INSERT INTO ch.w_insert.limits (id, n) SELECT 2, CASE WHEN range = 5000 THEN NULL ELSE range END FROM range(6000);
+----
+is not Nullable
+
+statement ok
+RESET ch_insert_block_size;
+
+query I
+INSERT INTO ch.w_insert.limits (id, fs) VALUES (9, 'zz');
+----
+1
+
+query I
+SELECT count(*) FROM ch.w_insert.limits WHERE id = 9;
+----
+1
 
 # ---------------------------------------------------------------------------
 # column types that cannot be written natively
@@ -476,6 +522,41 @@ UNKNOWN_TABLE
 
 query I
 INSERT INTO ch.w_insert.big VALUES (50000, 'after error');
+----
+1
+
+# ---------------------------------------------------------------------------
+# stale metadata: a column's type changes behind ch's back; the mismatch must not invalidate the database
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.stale (id UInt8, n Int32) ENGINE = MergeTree ORDER BY id');
+
+# caches ch's metadata for w_insert.stale with n as Int32
+query I
+SELECT count(*) FROM ch.w_insert.stale;
+----
+0
+
+# widened behind ch's back; ch2's cache is cleared, ch's is not
+statement ok
+CALL clickhouse_execute('ch2', 'ALTER TABLE w_insert.stale MODIFY COLUMN n Int64');
+
+statement error
+INSERT INTO ch.w_insert.stale VALUES (1, 2);
+----
+clickhouse_clear_cache()
+
+# an ordinary query still works: the mismatch did not invalidate the database
+query I
+SELECT 1;
+----
+1
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+INSERT INTO ch.w_insert.stale VALUES (1, 2);
 ----
 1
 
