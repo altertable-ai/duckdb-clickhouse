@@ -149,7 +149,7 @@ Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected c
 
 - Every write error names the table (and the column/value where relevant) and never contains the password.
 - Conversion failures are `ConversionException`; unsupported statements and shapes are `NotImplementedException` suggesting `clickhouse_execute()`; server errors use `ClickHouse error <code> (<NAME>): <message>`.
-- ROLLBACK after a write: `ClickhouseTransactionManager::RollbackTransaction` emits `DUCKDB_LOG_WARNING(context, "ClickHouse writes made in this transaction were already committed and cannot be rolled back (database <name>)")`. It never throws. DuckDB v1.5.4 has no other warning channel for extensions, so the warning only appears when logging is enabled (`CALL enable_logging(level = 'warning')`, visible in `duckdb_logs`). The README therefore states the auto-commit behaviour prominently, and the Phase 1 test checks the log entry.
+- ROLLBACK after a write: `ClickhouseTransactionManager::RollbackTransaction` emits `DUCKDB_LOG_WARNING(context, "ClickHouse writes made in this transaction were already committed and cannot be rolled back (database \"<name>\")")`. It never throws. DuckDB v1.5.4 has no other warning channel for extensions, so the warning only appears when logging is enabled (`CALL enable_logging(level = 'warning')`, visible in `duckdb_logs`). The README therefore states the auto-commit behaviour prominently, and the Phase 1 test checks the log entry.
 
 ## 9. Testing
 
