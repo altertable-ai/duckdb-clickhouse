@@ -1,0 +1,204 @@
+# clickhouse_scanner: write support — Design
+
+- **Date:** 2026-09-24
+- **Status:** Approved (brainstorming). Pending the three implementation plans.
+- **Goal:** Lift the read-only limitation. Attached ClickHouse databases become writable from DuckDB: INSERT / INSERT … SELECT / COPY, CREATE / DROP / ALTER / CTAS, UPDATE / DELETE, plus a raw `clickhouse_execute()` escape hatch.
+- **Builds on:** the read path described in `docs/superpowers/specs/2026-09-23-clickhouse-scanner-design.md` on branch `feature/clickhouse-scanner`. It was imported as `su/init` without its docs. Everything in that spec still holds except the read-only rule, which this spec replaces.
+
+## 1. Decisions
+
+| # | Decision |
+|---|---|
+| D1 | Scope: all of INSERT/COPY/CTAS, CREATE/DROP (tables, databases), ALTER (add/drop/rename column, rename table), UPDATE/DELETE/TRUNCATE, and `clickhouse_execute()`. |
+| D2 | Writable by default, like duckdb-postgres. `ATTACH … (TYPE clickhouse, READ_ONLY)` restores today's read-only behaviour. |
+| D3 | DELETE uses ClickHouse lightweight `DELETE FROM … WHERE …`, synchronously. UPDATE uses `ALTER TABLE … UPDATE … WHERE …` with `mutations_sync` (default 2). |
+| D4 | CREATE TABLE produces `ENGINE = <ch_default_table_engine>` (default `MergeTree`) and `ORDER BY` the DuckDB PRIMARY KEY columns, else `tuple()`. |
+| D5 | Transactions: every write statement is sent and committed immediately. COMMIT is a no-op. ROLLBACK cannot undo ClickHouse writes: it emits a warning, and the README documents it. |
+| D6 | UPDATE/DELETE use statement translation (approach A). The whole statement becomes one ClickHouse statement when its shape and expressions are translatable; otherwise it is an error pointing to `clickhouse_execute()`. Key-based two-phase execution was rejected: ClickHouse does not enforce key uniqueness, so it could modify rows that were not selected. |
+| D7 | UPDATE/DELETE report the number of affected rows through a `SELECT count()` run just before the statement. This count is not atomic with respect to concurrent writers. |
+
+## 2. User surface
+
+| DuckDB statement | ClickHouse effect |
+|---|---|
+| `INSERT INTO ch.db.t [(cols)] VALUES … / SELECT …`, `COPY ch.db.t FROM 'file'` | One native `INSERT INTO db.t (cols)` streamed in blocks. Only the listed columns are sent. |
+| `CREATE TABLE [IF NOT EXISTS / OR REPLACE] ch.db.t (…)` | `CREATE TABLE … ENGINE = … ORDER BY …` |
+| `CREATE TABLE ch.db.t AS SELECT …` | `CREATE TABLE`, then the same insert path |
+| `DROP TABLE [IF EXISTS]` / `DROP VIEW [IF EXISTS]` | `DROP TABLE` / `DROP VIEW`, chosen from the table's engine |
+| `CREATE SCHEMA ch.db` / `DROP SCHEMA ch.db [CASCADE]` | `CREATE DATABASE` / `DROP DATABASE` (a non-empty database requires CASCADE) |
+| `ALTER TABLE ch.db.t ADD COLUMN [IF NOT EXISTS] c T [DEFAULT e]` / `DROP COLUMN [IF EXISTS] c` / `RENAME COLUMN a TO b` / `RENAME TO u` | `ALTER TABLE db.t ADD/DROP/RENAME COLUMN …` / `RENAME TABLE db.t TO db.u` |
+| `DELETE FROM ch.db.t WHERE p` | `DELETE FROM db.t WHERE p SETTINGS lightweight_deletes_sync = 2` |
+| `DELETE FROM ch.db.t` (no WHERE), `TRUNCATE ch.db.t` | `TRUNCATE TABLE db.t` |
+| `UPDATE ch.db.t SET c = e, … WHERE p` | `ALTER TABLE db.t UPDATE c = CAST(e AS T), … WHERE p SETTINGS mutations_sync = <ch_mutations_sync>` |
+| `CALL clickhouse_execute('ch', 'sql')` / `SELECT * FROM clickhouse_execute(...)` | Runs the SQL as is. Returns `Success BOOLEAN`. Clears that catalog's cache. |
+
+The following are rejected with a clear exception:
+- `ON CONFLICT` / `RETURNING`;
+- `MERGE INTO`, `CREATE INDEX` (already guarded);
+- `CREATE VIEW`, sequences, temp tables in a ClickHouse schema;
+- UNIQUE / CHECK / FOREIGN KEY constraints;
+- ALTER variants other than those listed above (type change, SET/DROP DEFAULT, constraints);
+- UPDATE/DELETE with joins, subqueries, `UPDATE … FROM`, or untranslatable expressions;
+- `clickhouse_execute` with a statement that returns rows (the error points to `clickhouse_query`).
+
+**Settings:**
+
+| Setting | Type | Default | Meaning |
+|---|---|---|---|
+| `ch_default_table_engine` | VARCHAR | `MergeTree` | Engine for `CREATE TABLE`/CTAS, e.g. `ReplicatedMergeTree` on self-hosted clusters. Validated as an identifier optionally followed by `(…)`. |
+| `ch_insert_block_size` | UBIGINT | 65536 | Rows per block sent during INSERT. Must be greater than 0. |
+| `ch_mutations_sync` | UBIGINT | 2 | Value sent as `mutations_sync` with UPDATE (0 = async, 1 = wait locally, 2 = wait on all replicas). |
+
+## 3. Architecture
+
+New units follow the existing layout; each has one responsibility:
+
+- `src/clickhouse_writer.cpp` / `.hpp`: converts DuckDB vectors into clickhouse-cpp columns for a given ClickHouse type string. It is the mirror image of `clickhouse_conversion.cpp`.
+- `src/clickhouse_ddl_types.cpp` / `.hpp`: the reverse type mapping, DuckDB `LogicalType` (+ nullability) → ClickHouse type string.
+- `src/clickhouse_expression.cpp` / `.hpp`: translates DuckDB bound expressions into ClickHouse SQL using an allow-list. It is used by DML (WHERE/SET) and DDL (DEFAULT).
+- `src/storage/clickhouse_insert.cpp` / `.hpp`: `ClickhouseInsert` physical sink (INSERT, COPY, CTAS).
+- `src/storage/clickhouse_ddl.cpp` / `.hpp`: builds the CREATE/DROP/ALTER SQL and runs it.
+- `src/storage/clickhouse_dml.cpp` / `.hpp`: checks and translates DELETE/UPDATE plans. `ClickhouseDmlOperator` is a source that runs the count and then the statement.
+- `src/clickhouse_execute.cpp`: the `clickhouse_execute()` table function.
+- Changes to `ClickhouseCatalog` (`PlanInsert`, `PlanCreateTableAs`, logical `PlanDelete`/`PlanUpdate`, `CreateSchema`, `DropSchema`), `ClickhouseSchemaEntry` (`CreateTable`, `DropEntry`, `Alter`), `ClickhouseTableEntry` (remember `engine` from `system.tables.engine`), and `ClickhouseTransaction` (records whether it wrote, for the ROLLBACK warning).
+
+Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected catalog entries through the existing retire-don't-free mechanism (`ClickhouseCatalogSet::ClearEntries`), so plans that are already bound stay safe.
+
+## 4. INSERT / COPY / CTAS
+
+- `ClickhouseCatalog::PlanInsert` returns `ClickhouseInsert`. DuckDB has already cast the inserted values to the columns' DuckDB types (the read-path mapping), so the writer only converts along known pairs.
+- **Column subsets:** only the statement's target columns are sent (`INSERT INTO db.t (a, c)`), so ClickHouse fills the rest with its own DEFAULT/MATERIALIZED values. The column mapping comes from `LogicalInsert::column_index_map`.
+- **Streaming:** each sink takes one pooled connection and runs `BeginInsert("INSERT INTO db.t (cols) VALUES")`. Rows accumulate into a block, which is sent every `ch_insert_block_size` rows; `EndInsert` runs at finalize. The sink is single-threaded (`ParallelSink() == false`) and returns the inserted row count. On any error the insert is cancelled and the connection is discarded (`Invalidate`).
+- **Atomicity:** each block is atomic; a failure part-way can leave earlier blocks committed (documented). ClickHouse block deduplication on Replicated/Shared tables is left at its server default; the README says how to disable it (`settings=insert_deduplicate=0`).
+- **Value conversion** (`clickhouse_writer`):
+  - ints, floats, BOOLEAN, HUGEINT/UHUGEINT, DECIMAL(P ≤ 38) are written directly.
+  - VARCHAR → String. VARCHAR → FixedString(N) must be at most N bytes and is zero-padded; longer values are a `ConversionException`.
+  - DATE → Date/Date32; a value outside the target range (1970-01-01..2149-06-06 / 1900-01-01..2299-12-31) is a `ConversionException`, never clamped.
+  - TIMESTAMPTZ → DateTime (seconds, range checked) / DateTime64(p) (ticks at precision p, range checked).
+  - TIME/TIME_NS → Time/Time64(p).
+  - UUID. ENUM → Enum8/16 by label; a missing label is an error.
+  - LIST/STRUCT/MAP → Array/Tuple/Map, recursively. Nullable and LowCardinality wrappers are honoured; NULL into a non-Nullable column is an error.
+  - AggregateFunction target columns are an error.
+  - Types the read path converts on the server (IPv4/IPv6, (U)Int256, Decimal P > 38, JSON/Object/Variant/Dynamic, geo types) are written as String and converted by the server: `INSERT INTO db.t (cols) SELECT <conversion>(c), … FROM input('c String, …')`. **Plan-time spike:** check that clickhouse-cpp's `BeginInsert` works with `input()`. If it does not, INSERT into those column types is rejected with an error pointing to `clickhouse_execute`, and the README says so.
+- **CTAS:** `PlanCreateTableAs` creates the table (Section 5), then plans `ClickhouseInsert` on the new entry.
+- **COPY:** `COPY ch.db.t FROM 'file'` goes through DuckDB's insert planning and needs nothing extra.
+
+## 5. DDL
+
+**Reverse type mapping** (`clickhouse_ddl_types`):
+
+| DuckDB | ClickHouse |
+|---|---|
+| BOOLEAN | Bool |
+| TINYINT … BIGINT / UTINYINT … UBIGINT | Int8 … Int64 / UInt8 … UInt64 |
+| HUGEINT / UHUGEINT | Int128 / UInt128 |
+| FLOAT / DOUBLE | Float32 / Float64 |
+| DECIMAL(p, s) | Decimal(p, s) |
+| VARCHAR, BLOB | String |
+| DATE | Date32 |
+| TIMESTAMP_S | DateTime('UTC') |
+| TIMESTAMP_MS | DateTime64(3, 'UTC') |
+| TIMESTAMP, TIMESTAMPTZ | DateTime64(6, 'UTC') |
+| TIMESTAMP_NS | DateTime64(9, 'UTC') |
+| TIME / TIME_NS | Time64(6) / Time64(9) (the CREATE statement carries `enable_time_time64_type = 1`) |
+| UUID | UUID |
+| ENUM | Enum8 (≤ 127 labels) or Enum16, labels numbered 1…n in DuckDB order |
+| LIST(T) / STRUCT / MAP(K, V) | Array(T) / Tuple(name T, …) / Map(K, V) |
+| JSON | JSON |
+| anything else (INTERVAL, BIT, VARINT, UNION, …) | `NotImplementedException` |
+
+**Nullability:** a nullable DuckDB column becomes `Nullable(T)`, except for Array/Tuple/Map, which ClickHouse cannot make Nullable. Those are created non-Nullable, and inserting a NULL into them is an error. PRIMARY KEY columns are NOT NULL. Naive `TIMESTAMP` reads back as `TIMESTAMPTZ` (UTC); this is documented.
+
+- **CREATE TABLE** builds `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] db.t (col T [DEFAULT e], …) ENGINE = <engine> ORDER BY (<pk cols>) | ORDER BY tuple()`.
+  - DEFAULT expressions go through `clickhouse_expression`; an untranslatable default is an error.
+  - UNIQUE / CHECK / FOREIGN KEY constraints are rejected.
+- **CREATE / DROP SCHEMA:** `CREATE DATABASE [IF NOT EXISTS] db`, `DROP DATABASE [IF EXISTS] db`. Without CASCADE, dropping a database that still has tables is an error, which we check ourselves.
+- **DROP TABLE / VIEW:** the engine recorded in the table entry picks `DROP TABLE` or `DROP VIEW`. `DROP VIEW` on a table, or `DROP TABLE` on a view, is rejected, matching DuckDB semantics.
+- **ALTER:** add, drop and rename column, and rename table, as in Section 2. Anything else is `NotImplementedException("… use clickhouse_execute()")`.
+- After each DDL statement: invalidate the schema's table set (or the schema set, for database DDL).
+
+## 6. UPDATE / DELETE
+
+- **Hook:** `ClickhouseCatalog` overrides the logical-level `PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &)` and `PlanUpdate(…, LogicalUpdate &)`. DuckDB calls these before it plans the child (`Catalog::PlanDelete` → `planner.CreatePlan(*op.children[0])`), so the logical child is still intact.
+- **Accepted shape:** `LogicalDelete/Update → [LogicalProjection]* → [LogicalFilter] → LogicalGet`, where the `LogicalGet` is a ClickHouse scan of the table being modified. Anything else raises `NotImplementedException("UPDATE/DELETE on ClickHouse tables must filter only the modified table with translatable expressions; use clickhouse_execute() for anything else")`: joins, subqueries, `UPDATE … FROM`, other tables, or `RETURNING`.
+- **Predicate:** the AND of every `get.table_filters` entry (via `ClickhouseFilterPushdown::TransformFilter`; each must translate, and optional/dynamic filters are skipped because the real predicate is also present in the LogicalFilter) and every expression in the `LogicalFilter` (via `clickhouse_expression`).
+- **Expression allow-list** (`clickhouse_expression`):
+  - column references, resolved through projections to base column names;
+  - constants (existing literal writer);
+  - comparisons, AND/OR/NOT, IS [NOT] NULL, IN (constant list), BETWEEN;
+  - `+ - * / // %`;
+  - LIKE/ILIKE, `starts_with`, `ends_with`, `contains`, `lower`, `upper`, `length`;
+  - `coalesce`, CASE WHEN;
+  - CAST to types that have a reverse mapping.
+
+  Anything else makes the statement untranslatable. No part of a predicate is ever dropped.
+- **Semantics:** translated DML follows ClickHouse semantics where it differs from DuckDB (NaN comparisons, UUID ordering, integer division by zero). This is documented in the README; SELECT pushdown remains exact-only.
+- **Statements** are listed in Section 2. `ClickhouseDmlOperator` (a source, `ParallelSource() == false`) runs `SELECT count() FROM db.t WHERE p`, then the statement, and returns the count as DuckDB's affected-row count. It marks the transaction as having written.
+- ClickHouse server errors surface in the existing format, e.g. updating a sort-key column, or a lightweight delete on an engine that doesn't support it.
+- With `READ_ONLY` attach, DuckDB rejects the statement before these hooks run.
+
+## 7. `clickhouse_execute`
+
+`clickhouse_execute(database VARCHAR, sql VARCHAR) → (Success BOOLEAN)`:
+- It works like `clickhouse_query`: the attached database is resolved, and anything that isn't a ClickHouse catalog is an error.
+- It runs the SQL through the pool with the connection's settings. If the statement returns any rows, it raises an error pointing to `clickhouse_query()`.
+- It invalidates the whole catalog cache of that database and marks the transaction as having written.
+- A `READ_ONLY` attachment rejects it with the read-only PermissionException.
+
+## 8. Errors
+
+- Every write error names the table (and the column/value where relevant) and never contains the password.
+- Conversion failures are `ConversionException`; unsupported statements and shapes are `NotImplementedException` suggesting `clickhouse_execute()`; server errors use `ClickHouse error <code> (<NAME>): <message>`.
+- ROLLBACK after a write: `ClickhouseTransactionManager::RollbackTransaction` emits `DUCKDB_LOG_WARNING(context, "ClickHouse writes made in this transaction were already committed and cannot be rolled back (database <name>)")`. It never throws. DuckDB v1.5.4 has no other warning channel for extensions, so the warning only appears when logging is enabled (`CALL enable_logging(level = 'warning')`, visible in `duckdb_logs`). The README therefore states the auto-commit behaviour prominently, and the Phase 1 test checks the log entry.
+
+## 9. Testing
+
+- All write tests run through `make smoke` against a real ClickHouse 25.8. No mocks.
+- Each write test file creates and drops its own database (`w_insert`, `w_ddl`, `w_dml`, …), so the shared read fixtures are never mutated and existing counts (e.g. 13 tables in `test_db`) stay valid.
+- Every write is verified twice: read back through DuckDB, and independently through `clickhouse_query` (ClickHouse's own view, e.g. `SHOW CREATE TABLE`, `SELECT … FROM system.columns`).
+- The existing read-only tests move to `ATTACH … (READ_ONLY)`, and a writable counterpart is added.
+- **Phase 1:**
+  - INSERT round-trips for every mappable type;
+  - column-subset inserts with ClickHouse defaults;
+  - multi-block inserts (more than `ch_insert_block_size` rows);
+  - INSERT … SELECT from a DuckDB table;
+  - `COPY … FROM` a CSV;
+  - conversion errors (out-of-range dates, FixedString overflow, NULL into non-Nullable);
+  - `clickhouse_execute` (incl. cache invalidation and the error when rows are returned);
+  - the ROLLBACK warning;
+  - `READ_ONLY` rejecting every write;
+  - the `input()` spike outcome.
+- **Phase 2:**
+  - CREATE/DROP TABLE and SCHEMA with IF [NOT] EXISTS, OR REPLACE, CASCADE;
+  - CTAS;
+  - each ALTER variant;
+  - `ch_default_table_engine`;
+  - rejected constraints and CREATE VIEW;
+  - DROP VIEW vs DROP TABLE;
+  - generated DDL checked via `SHOW CREATE TABLE`.
+- **Phase 3:**
+  - DELETE/UPDATE with translatable predicates and SET expressions, checking the affected-row counts;
+  - TRUNCATE and DELETE without WHERE;
+  - rejections (joins, subqueries, `UPDATE … FROM`, untranslatable functions, `RETURNING`);
+  - the server error on sort-key update;
+  - a regression test that an untranslatable predicate never results in a partial statement.
+- Each phase's tests also run under the debug build (`make smoke SMOKE_BUILD=debug`).
+
+## 10. Phasing
+
+One spec and three plans, each shippable and executed with subagent-driven development on branch `su/init`:
+
+1. **Write foundation:** read-write by default, the READ_ONLY opt-in, transaction write-tracking and the ROLLBACK warning, `clickhouse_writer`, `ClickhouseInsert` (INSERT/COPY), `clickhouse_execute`, the settings, the README update.
+2. **DDL:** reverse type mapping, CREATE/DROP TABLE and SCHEMA, CTAS, ALTER, `ch_default_table_engine`, engine-aware DROP.
+3. **DML:** `clickhouse_expression`, DELETE/UPDATE/TRUNCATE translation, `ch_mutations_sync`.
+
+## 11. Out of scope
+
+- `ON CONFLICT` / upserts, `RETURNING`, `MERGE INTO`;
+- CREATE VIEW / materialized views from DuckDB SQL;
+- CREATE INDEX, sequences;
+- `ON CLUSTER` DDL;
+- parallel (multi-connection) INSERT;
+- buffering writes until COMMIT;
+- key-based UPDATE/DELETE fallback;
+- lightweight `UPDATE` (patch parts).
