@@ -18,6 +18,18 @@ namespace duckdb {
 	throw NotImplementedException("%s cannot be created in a ClickHouse database", what);
 }
 
+//! ClickHouse table engines that are not tables: DROP TABLE and ALTER TABLE refuse them
+static bool IsViewLikeEngine(const string &engine) {
+	return engine == "View" || engine == "MaterializedView" || engine == "LiveView" || engine == "WindowView" ||
+	       engine == "Dictionary";
+}
+
+//! "dictionary" for engine Dictionary, "view" for the rest of IsViewLikeEngine's engines -- shared error-message
+//! wording between DropEntry and Alter
+static const char *ViewLikeKind(const string &engine) {
+	return engine == "Dictionary" ? "dictionary" : "view";
+}
+
 ClickhouseSchemaEntry::ClickhouseSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
     : SchemaCatalogEntry(catalog, info), tables(*this, catalog) {
 }
@@ -74,17 +86,18 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		}
 		throw CatalogException("Table with name %s does not exist!", alter.name);
 	}
+	auto &table = entry->Cast<ClickhouseTableEntry>();
+	if (IsViewLikeEngine(table.GetEngine())) {
+		throw NotImplementedException(
+		    "\"%s\" is a ClickHouse %s (engine %s), which ALTER TABLE cannot modify; alter it with "
+		    "clickhouse_execute() instead",
+		    table.name, ViewLikeKind(table.GetEngine()), table.GetEngine());
+	}
 	// build the SQL before Execute() clears the cache and frees `entry`
-	auto sql = ClickhouseDdl::AlterTableSql(context, name, entry->name, alter);
+	auto sql = ClickhouseDdl::AlterTableSql(context, name, table.name, alter);
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
 	ClickhouseDdl::Execute(context, ch_catalog, sql);
-}
-
-//! ClickHouse table engines that are not tables: DROP TABLE refuses them
-static bool IsViewLikeEngine(const string &engine) {
-	return engine == "View" || engine == "MaterializedView" || engine == "LiveView" || engine == "WindowView" ||
-	       engine == "Dictionary";
 }
 
 void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
@@ -101,9 +114,8 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 	auto &table = entry->Cast<ClickhouseTableEntry>();
 	if (IsViewLikeEngine(table.GetEngine())) {
-		bool is_dictionary = table.GetEngine() == "Dictionary";
-		auto kind = is_dictionary ? "dictionary" : "view";
-		auto drop_keyword = is_dictionary ? "DICTIONARY" : "VIEW";
+		auto kind = ViewLikeKind(table.GetEngine());
+		auto drop_keyword = table.GetEngine() == "Dictionary" ? "DICTIONARY" : "VIEW";
 		throw NotImplementedException(
 		    "\"%s\" is a ClickHouse %s (engine %s), which DROP TABLE does not drop; drop it with "
 		    "clickhouse_execute('%s', 'DROP %s %s.%s') instead",

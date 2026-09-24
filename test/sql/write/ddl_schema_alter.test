@@ -119,6 +119,21 @@ ALTER TABLE ch.w_ddl2.u ALTER COLUMN b SET DEFAULT 'z';
 ----
 is not supported for ClickHouse tables
 
+# ALTER TABLE refuses ClickHouse views and dictionaries: forwarding e.g. RENAME TO to a MaterializedView's storage
+# would silently succeed in an inconsistent way
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_ddl2.v AS SELECT 1 AS one');
+
+statement error
+ALTER TABLE ch.w_ddl2.v RENAME TO v2;
+----
+is a ClickHouse view
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.tables WHERE database = ''w_ddl2'' AND name = ''v''');
+----
+v
+
 # ---------------------------------------------------------------------------
 # DROP SCHEMA
 # ---------------------------------------------------------------------------
