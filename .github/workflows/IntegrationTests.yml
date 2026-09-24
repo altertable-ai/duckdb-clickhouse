@@ -1,6 +1,10 @@
 name: Integration Tests
 on:
   push:
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/**'
+      - '!.github/workflows/IntegrationTests.yml'
   pull_request:
   workflow_dispatch:
 
@@ -12,33 +16,88 @@ jobs:
   linux-tests:
     name: Linux tests against ClickHouse
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       GEN: ninja
+      CC: 'ccache gcc'
+      CXX: 'ccache g++'
+      CCACHE_DIR: ${{ github.workspace }}/ccache
       VCPKG_TARGET_TRIPLET: x64-linux-release
       VCPKG_HOST_TRIPLET: x64-linux-release
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      # clickhouse-cpp and some of its vcpkg deps still declare cmake_minimum_required < 3.5
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:25.8
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: 'true'
+          submodules: recursive
 
       - name: Install dependencies
         run: |
-          sudo apt-get update -y -q
-          sudo apt-get install -y -q build-essential ninja-build
+          sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
+          sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
+            build-essential \
+            ccache \
+            cmake \
+            ninja-build \
+            openssl
+
+      - name: Verify Docker
+        run: |
+          docker info
+          docker version
+
+      # GitHub Actions `services:` start before checkout, so they cannot mount the TLS
+      # config and generated certs from this repo. ClickHouse is started the same way as
+      # locally: `make smoke` → scripts/test_with_clickhouse.sh (docker run, random ports,
+      # fixtures, then unittest). Pulling here fails fast on a registry problem instead of
+      # after a 30-minute DuckDB build.
+      - name: Pull ClickHouse
+        run: docker pull "${CLICKHOUSE_IMAGE}"
+
+      - name: Cache key
+        id: cache_key
+        working-directory: ./duckdb
+        run: |
+          DUCKDB_VERSION=$(git rev-parse --short=10 HEAD)
+          KEY="${{ runner.os }}-${{ runner.arch }}-${DUCKDB_VERSION}"
+          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/ccache
+          key: ${{ steps.cache_key.outputs.value }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11.1
         with:
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
           vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgJsonGlob: vcpkg.json
 
       - name: Build extension
         run: make release
 
-      # same entry point as locally; not a service container, because the TLS config and test
-      # certificates have to be mounted from the checkout
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/ccache
+          key: ${{ steps.cache_key.outputs.value }}
+
       - name: Smoke tests against ClickHouse
+        env:
+          CLICKHOUSE_TEST_KEEP: '1'
         run: make smoke
+
+      - name: ClickHouse logs
+        if: failure()
+        run: docker logs --tail 200 clickhouse-scanner-test || true
+
+      - name: Remove ClickHouse container
+        if: always()
+        run: docker rm -f clickhouse-scanner-test || true
