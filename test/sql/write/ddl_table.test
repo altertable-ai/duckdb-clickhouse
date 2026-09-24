@@ -19,9 +19,8 @@ require json
 statement ok
 SET TimeZone = 'UTC';
 
-# enable_time_time64_type lets INSERT write into the Time64 column CREATE TABLE makes below (see test/sql/write/insert.test)
 statement ok
-ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse, SETTINGS 'enable_time_time64_type=1');
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_ddl');
@@ -149,6 +148,113 @@ CREATE TABLE ch.w_ddl.bad (id INTEGER, t TIMESTAMPTZ DEFAULT now());
 ----
 DEFAULT value of column "t" must be a constant
 
+statement error
+CREATE TABLE ch.w_ddl.bad (id INTEGER, t TIMESTAMPTZ DEFAULT 'infinity');
+----
+DEFAULT value infinity of column "t" (type TIMESTAMP WITH TIME ZONE) cannot be written as a ClickHouse literal
+
+# TimeZone-aware: the naive-looking literal is parsed as Europe/Paris local time (session TimeZone), converted to
+# UTC by the bind-time cast (DefaultValueSql binds with the column's own type as the target type), then folded
+statement ok
+SET TimeZone = 'Europe/Paris';
+
+statement ok
+CREATE TABLE ch.w_ddl.tz_default (id INTEGER PRIMARY KEY, t TIMESTAMPTZ DEFAULT '2024-06-01 10:00:00');
+
+# switch back to UTC before reading, so the result below is the canonical UTC instant, not just re-displayed in
+# Europe/Paris (which would also "look right" even if the DEFAULT had been parsed as plain UTC)
+statement ok
+SET TimeZone = 'UTC';
+
+query I
+INSERT INTO ch.w_ddl.tz_default (id) VALUES (1);
+----
+1
+
+query I
+SELECT t FROM ch.w_ddl.tz_default;
+----
+2024-06-01 08:00:00+00
+
+# ---------------------------------------------------------------------------
+# table-level composite PRIMARY KEY
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.composite_pk (a INTEGER, b INTEGER, v VARCHAR, PRIMARY KEY (a, b));
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ddl'' AND table = ''composite_pk'' ORDER BY position');
+----
+a	Int32
+b	Int32
+v	Nullable(String)
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT engine, sorting_key FROM system.tables WHERE database = ''w_ddl'' AND name = ''composite_pk''');
+----
+MergeTree	a, b
+
+query II
+SELECT column_name, is_nullable FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 'composite_pk' ORDER BY ordinal_position;
+----
+a	NO
+b	NO
+v	YES
+
+# ---------------------------------------------------------------------------
+# column names with a space or a quote
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.quoting (id INTEGER PRIMARY KEY, "a b" VARCHAR, "c""d" INTEGER);
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ddl'' AND table = ''quoting'' ORDER BY position');
+----
+id	Int32
+a b	Nullable(String)
+c"d	Nullable(Int32)
+
+query I
+SELECT column_name FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 'quoting' ORDER BY ordinal_position;
+----
+id
+a b
+c"d
+
+query I
+INSERT INTO ch.w_ddl.quoting VALUES (1, 'x', 2);
+----
+1
+
+query III
+SELECT id, "a b", "c""d" FROM ch.w_ddl.quoting;
+----
+1	x	2
+
+# ---------------------------------------------------------------------------
+# an ENUM label with a quote: the CREATE side (type text sent to, and echoed back by, ClickHouse) round-trips
+# correctly. INSERT/SELECT of the column's actual data is not exercised here: clickhouse-cpp 2.6.2's own type-string
+# parser (clickhouse/types/type_parser.cpp, TypeParser::NextToken's quoted-string case) does not handle a
+# backslash-escaped quote inside an Enum value list -- "TODO (nemkov): handle escaping ?" in its source -- and
+# raises "pos must be less than len" while parsing the block header, for a plain SELECT of such a column just as
+# much as for an INSERT, regardless of which extension code created the table. That is a client-library limitation
+# outside CREATE TABLE/DROP TABLE, not something introduced here
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl.enum_quote (id INTEGER PRIMARY KEY, e ENUM('it''s', 'b'));
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ddl'' AND table = ''enum_quote'' ORDER BY position');
+----
+id	Int32
+e	Nullable(Enum8('it\'s' = 1, 'b' = 2))
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 'enum_quote' ORDER BY ordinal_position;
+----
+id	INTEGER
+e	ENUM('it''s', 'b')
+
 # ---------------------------------------------------------------------------
 # rejected definitions create nothing
 # ---------------------------------------------------------------------------
@@ -222,6 +328,28 @@ SET ch_default_table_engine = 'MergeTree() SETTINGS index_granularity = 1';
 ----
 Invalid ch_default_table_engine
 
+# the "one parenthesized group closing the string" check must actually track paren depth, not just look at the
+# first and last characters: the "()" group here closes long before the string ends
+statement error
+SET ch_default_table_engine = 'MergeTree() ORDER BY (id)';
+----
+Invalid ch_default_table_engine
+
+statement error
+SET ch_default_table_engine = 'Memory() SETTINGS x = (1)';
+----
+Invalid ch_default_table_engine
+
+statement error
+SET ch_default_table_engine = NULL;
+----
+ch_default_table_engine cannot be NULL
+
+# parens inside single-quoted arguments (none here, but braces are not parens either) and a nested/balanced group
+# stay valid as long as it closes exactly at the end of the string
+statement ok
+SET ch_default_table_engine = 'ReplicatedMergeTree(''/clickhouse/tables/{shard}/w_ddl/rmt'', ''{replica}'')';
+
 statement ok
 SET ch_default_table_engine = 'ReplacingMergeTree';
 
@@ -275,7 +403,7 @@ CALL clickhouse_execute('ch', 'CREATE VIEW w_ddl.v AS SELECT 1 AS one');
 statement error
 DROP TABLE ch.w_ddl.v;
 ----
-is a ClickHouse view
+is a ClickHouse view (engine View), which DROP TABLE does not drop; drop it with clickhouse_execute('ch', 'DROP VIEW `w_ddl`.`v`') instead
 
 # DuckDB looks DROP VIEW up among DuckDB views, where ClickHouse views never appear
 statement error

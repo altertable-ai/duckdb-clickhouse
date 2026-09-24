@@ -40,6 +40,9 @@ static void SetClickhouseInsertBlockSize(ClientContext &context, SetScope scope,
 }
 
 static void SetClickhouseDefaultTableEngine(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("ch_default_table_engine cannot be NULL");
+	}
 	ClickhouseDdl::ValidateEngine(StringValue::Get(parameter));
 }
 

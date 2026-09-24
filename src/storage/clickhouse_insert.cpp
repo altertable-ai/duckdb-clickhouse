@@ -146,7 +146,9 @@ void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGloba
 	// resolved again rather than kept from planning: see catalog_name
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, catalog_name, "INSERT");
 	gstate.connection = catalog.StartWrite(context);
-	gstate.header = gstate.connection->BeginInsert(insert_sql);
+	// Time/Time64 columns need this setting (ClickHouse 25.x); servers that do not know it ignore it. Tables
+	// DuckDB creates map TIME to Time64 (see ClickhouseDdlTypes), so every INSERT needs it, not just DDL
+	gstate.header = gstate.connection->BeginInsert(insert_sql, {{"enable_time_time64_type", "1"}});
 	if (gstate.header.GetColumnCount() != columns.size()) {
 		// not InternalException: this means the cached column list is stale (another connection changed the
 		// table since it was cached), and InternalException would invalidate the whole DuckDB instance for

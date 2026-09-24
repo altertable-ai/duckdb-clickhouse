@@ -51,8 +51,9 @@ public:
 	bool Execute(const string &sql, const vector<std::pair<string, string>> &query_settings);
 
 	//! Starts an INSERT (`INSERT INTO … VALUES` or `INSERT INTO … SELECT … FROM input(…)`) with the connection's
-	//! settings, and returns the server's header block: one empty column per value sent, in order
-	clickhouse::Block BeginInsert(const string &sql);
+	//! settings plus `query_settings` (same semantics as Execute's), and returns the server's header block: one
+	//! empty column per value sent, in order
+	clickhouse::Block BeginInsert(const string &sql, const vector<std::pair<string, string>> &query_settings = {});
 	//! Sends one block of rows for the INSERT started by BeginInsert()
 	void SendInsertBlock(const clickhouse::Block &block);
 	//! Finishes the INSERT started by BeginInsert(); errors ClickHouse reports while writing surface here

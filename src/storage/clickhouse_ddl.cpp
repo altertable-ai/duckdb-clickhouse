@@ -22,35 +22,38 @@ static string LiteralSql(const Value &value, const string &column_name) {
 	if (value.IsNull()) {
 		return "NULL";
 	}
-	switch (value.type().id()) {
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE: {
-		auto number = value.GetValue<double>();
-		if (std::isnan(number)) {
-			return "nan";
+	// the whole translation -- including the TIMESTAMP family, which itself calls into TransformConstant() and can
+	// throw for an infinite timestamp -- is wrapped in one try/catch, so every unsupported DEFAULT (not just the
+	// default: branch) gets this DEFAULT-specific message instead of TransformConstant's filter-pushdown wording
+	try {
+		switch (value.type().id()) {
+		case LogicalTypeId::FLOAT:
+		case LogicalTypeId::DOUBLE: {
+			auto number = value.GetValue<double>();
+			if (std::isnan(number)) {
+				return "nan";
+			}
+			if (std::isinf(number)) {
+				return number > 0 ? "inf" : "-inf";
+			}
+			return value.ToString();
 		}
-		if (std::isinf(number)) {
-			return number > 0 ? "inf" : "-inf";
-		}
-		return value.ToString();
-	}
-	case LogicalTypeId::UUID:
-		return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-		// naive timestamps are stored as UTC (see ClickhouseDdlTypes)
-		return ClickhouseFilterPushdown::TransformConstant(
-		    Value::TIMESTAMPTZ(timestamp_tz_t(value.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>())));
-	default:
-		try {
+		case LogicalTypeId::UUID:
+			return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS:
+		case LogicalTypeId::TIMESTAMP_NS:
+			// naive timestamps are stored as UTC (see ClickhouseDdlTypes)
+			return ClickhouseFilterPushdown::TransformConstant(
+			    Value::TIMESTAMPTZ(timestamp_tz_t(value.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>())));
+		default:
 			return ClickhouseFilterPushdown::TransformConstant(value);
-		} catch (NotImplementedException &) {
-			throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
-			                              "ClickHouse literal; create the table with clickhouse_execute() instead",
-			                              value.ToString(), column_name, value.type().ToString());
 		}
+	} catch (NotImplementedException &) {
+		throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
+		                              "ClickHouse literal; create the table with clickhouse_execute() instead",
+		                              value.ToString(), column_name, value.type().ToString());
 	}
 }
 
@@ -61,6 +64,10 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 	auto expression = column.DefaultValue().Copy();
 	auto binder = Binder::CreateBinder(context);
 	ConstantBinder constant_binder(*binder, context, "DEFAULT value");
+	// ExpressionBinder::target_type (not Bind()'s "result_type" out-parameter, which only reports back the type
+	// actually bound) is what makes Bind() add the cast itself, with the client context available: a plain
+	// Value::DefaultCastAs() after the fact has no context and so ignores session settings such as TimeZone
+	constant_binder.target_type = column.Type();
 	auto bound = constant_binder.Bind(expression);
 	// IsFoldable() alone is not enough: now()/current_timestamp/current_database() etc. have
 	// FunctionStability::CONSISTENT_WITHIN_QUERY, which DuckDB still considers foldable (it is constant for the
@@ -72,7 +79,7 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 		                              "%s); create the table with clickhouse_execute() instead",
 		                              column.Name(), column.DefaultValue().ToString());
 	}
-	auto value = ExpressionExecutor::EvaluateScalar(context, *bound).DefaultCastAs(column.Type());
+	auto value = ExpressionExecutor::EvaluateScalar(context, *bound);
 	return " DEFAULT " + LiteralSql(value, column.Name());
 }
 
@@ -94,8 +101,43 @@ void ClickhouseDdl::ValidateEngine(const string &engine) {
 		position++;
 	}
 	if (valid && position < engine.size()) {
-		// one parenthesized argument list, closing the string
-		valid = engine[position] == '(' && engine.back() == ')';
+		if (engine[position] != '(') {
+			valid = false;
+		} else {
+			// one parenthesized argument list, balanced and closing exactly at the end of the string. Parens
+			// inside a single-quoted string (e.g. a ZooKeeper path argument) do not count, and a backslash
+			// escapes the character after it (matching ClickhouseUtils::QuoteLiteral's own escaping), so a
+			// quote or backslash inside the string never ends it early
+			idx_t depth = 0;
+			bool in_string = false;
+			for (idx_t i = position; valid && i < engine.size(); i++) {
+				char c = engine[i];
+				if (in_string) {
+					if (c == '\\' && i + 1 < engine.size()) {
+						i++;
+					} else if (c == '\'') {
+						in_string = false;
+					}
+				} else if (c == '\'') {
+					in_string = true;
+				} else if (c == '(') {
+					depth++;
+				} else if (c == ')') {
+					if (depth == 0) {
+						valid = false;
+					} else {
+						depth--;
+						if (depth == 0 && i != engine.size() - 1) {
+							// the group closed before the end of the string (e.g. trailing "ORDER BY (id)")
+							valid = false;
+						}
+					}
+				}
+			}
+			if (in_string || depth != 0) {
+				valid = false;
+			}
+		}
 	}
 	if (!valid) {
 		throw InvalidInputException("Invalid ch_default_table_engine \"%s\": expected an engine name, optionally "

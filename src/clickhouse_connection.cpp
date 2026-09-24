@@ -273,13 +273,14 @@ bool ClickhouseConnection::Execute(const string &sql, const vector<std::pair<str
 	return true;
 }
 
-clickhouse::Block ClickhouseConnection::BeginInsert(const string &sql) {
+clickhouse::Block ClickhouseConnection::BeginInsert(const string &sql,
+                                                    const vector<std::pair<string, string>> &query_settings) {
 	if (debug_print_queries) {
 		Printer::Print(sql + "\n");
 	}
 	last_used = std::chrono::steady_clock::now();
 	try {
-		return client->BeginInsert(MakeQuery(sql));
+		return client->BeginInsert(MakeQuery(sql, query_settings));
 	} catch (...) {
 		// clickhouse-cpp stays in its "inserting" state after a failed BeginInsert, even for a server error
 		// (e.g. an unknown table), so this connection cannot run anything else

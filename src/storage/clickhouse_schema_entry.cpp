@@ -83,9 +83,14 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 	auto &table = entry->Cast<ClickhouseTableEntry>();
 	if (IsViewLikeEngine(table.GetEngine())) {
-		throw NotImplementedException("\"%s\" is a ClickHouse view (engine %s), which DROP TABLE does not drop; "
-		                              "drop it with clickhouse_execute('%s', 'DROP VIEW %s.%s') instead",
-		                              table.name, table.GetEngine(), catalog.GetName(), name, table.name);
+		bool is_dictionary = table.GetEngine() == "Dictionary";
+		auto kind = is_dictionary ? "dictionary" : "view";
+		auto drop_keyword = is_dictionary ? "DICTIONARY" : "VIEW";
+		throw NotImplementedException(
+		    "\"%s\" is a ClickHouse %s (engine %s), which DROP TABLE does not drop; drop it with "
+		    "clickhouse_execute('%s', 'DROP %s %s.%s') instead",
+		    table.name, kind, table.GetEngine(), catalog.GetName(), drop_keyword,
+		    ClickhouseUtils::QuoteIdentifier(name), ClickhouseUtils::QuoteIdentifier(table.name));
 	}
 	auto sql = "DROP TABLE " + string(info.if_not_found == OnEntryNotFound::RETURN_NULL ? "IF EXISTS " : "") +
 	           ClickhouseUtils::QuoteIdentifier(name) + "." + ClickhouseUtils::QuoteIdentifier(table.name);
