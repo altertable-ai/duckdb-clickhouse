@@ -20,6 +20,16 @@ public:
 
 	static constexpr const char *CATALOG_TYPE = "clickhouse";
 
+	//! The ClickHouse catalog attached as `database_name`. Throws BinderException("Failed to find attached
+	//! database \"%s\" referenced in <function_name>") if no such database is attached, or
+	//! BinderException("Attached database \"%s\" is not a ClickHouse database") if it is attached through some
+	//! other extension. Callers that need to reject a read-only attach do so on top, with
+	//! GetAttached().IsReadOnly(). Named GetAttachedDatabase rather than the base class's GetAttached() --
+	//! a static overload of that name would hide every inherited overload of it, including the one this
+	//! function itself and ThrowIfReadOnly() rely on.
+	static ClickhouseCatalog &GetAttachedDatabase(ClientContext &context, const string &database_name,
+	                                              const string &function_name);
+
 	const ClickhouseConnectionConfig &GetConfig() const {
 		return config;
 	}

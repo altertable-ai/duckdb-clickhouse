@@ -3,8 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
-#include "duckdb/main/attached_database.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "storage/clickhouse_catalog.hpp"
 
 namespace duckdb {
@@ -54,17 +52,10 @@ static unique_ptr<FunctionData> ClickhouseQueryBind(ClientContext &context, Tabl
 		throw BinderException("Parameters to clickhouse_query cannot be NULL");
 	}
 	auto database_name = StringValue::Get(input.inputs[0]);
-	auto database = DatabaseManager::Get(context).GetDatabase(context, database_name);
-	if (!database) {
-		throw BinderException("Failed to find attached database \"%s\" referenced in clickhouse_query", database_name);
-	}
-	auto &catalog = database->GetCatalog();
-	if (catalog.GetCatalogType() != ClickhouseCatalog::CATALOG_TYPE) {
-		throw BinderException("Attached database \"%s\" is not a ClickHouse database", database_name);
-	}
+	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, database_name, "clickhouse_query");
 
 	auto result = make_uniq<ClickhouseScanBindData>();
-	result->pool = catalog.Cast<ClickhouseCatalog>().GetConnectionPoolPtr();
+	result->pool = catalog.GetConnectionPoolPtr();
 	result->query = ClickhouseUtils::StripTrailingSemicolons(StringValue::Get(input.inputs[1]));
 	if (result->query.empty()) {
 		throw BinderException("clickhouse_query: the query cannot be empty");

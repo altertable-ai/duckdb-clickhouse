@@ -3,7 +3,6 @@
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/attached_database.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_transaction.hpp"
 
@@ -32,19 +31,11 @@ struct ClickhouseExecuteGlobalState : public GlobalTableFunctionState {
 
 //! The writable ClickHouse catalog attached as `database_name`
 static ClickhouseCatalog &GetWritableCatalog(ClientContext &context, const string &database_name) {
-	auto database = DatabaseManager::Get(context).GetDatabase(context, database_name);
-	if (!database) {
-		throw BinderException("Failed to find attached database \"%s\" referenced in clickhouse_execute",
-		                      database_name);
-	}
-	auto &catalog = database->GetCatalog();
-	if (catalog.GetCatalogType() != ClickhouseCatalog::CATALOG_TYPE) {
-		throw BinderException("Attached database \"%s\" is not a ClickHouse database", database_name);
-	}
-	if (database->IsReadOnly()) {
+	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, database_name, "clickhouse_execute");
+	if (catalog.GetAttached().IsReadOnly()) {
 		ClickhouseUtils::ThrowReadOnly(database_name);
 	}
-	return catalog.Cast<ClickhouseCatalog>();
+	return catalog;
 }
 
 static unique_ptr<FunctionData> ClickhouseExecuteBind(ClientContext &context, TableFunctionBindInput &input,
@@ -78,10 +69,12 @@ static void ClickhouseExecuteExecute(ClientContext &context, TableFunctionInput 
 	state.finished = true;
 	auto &bind_data = data.bind_data->Cast<ClickhouseExecuteBindData>();
 	auto &catalog = GetWritableCatalog(context, bind_data.database_name);
-	ClickhouseTransaction::Get(context, catalog).MarkWritten();
 	bool returned_no_rows;
 	try {
 		auto connection = catalog.GetConnectionPool().GetConnection();
+		// only once the connection is in hand: if GetConnection() itself throws (e.g. the pool is exhausted),
+		// nothing was sent to ClickHouse, so a later ROLLBACK should not warn about an uncommitted write
+		ClickhouseTransaction::Get(context, catalog).MarkWritten();
 		returned_no_rows = connection->Execute(bind_data.sql);
 	} catch (...) {
 		// a failed statement can still have changed something (e.g. a multi-part ALTER)

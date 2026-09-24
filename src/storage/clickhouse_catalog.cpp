@@ -4,10 +4,25 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 
 namespace duckdb {
+
+ClickhouseCatalog &ClickhouseCatalog::GetAttachedDatabase(ClientContext &context, const string &database_name,
+                                                           const string &function_name) {
+	auto database = DatabaseManager::Get(context).GetDatabase(context, database_name);
+	if (!database) {
+		throw BinderException("Failed to find attached database \"%s\" referenced in %s", database_name,
+		                      function_name);
+	}
+	auto &catalog = database->GetCatalog();
+	if (catalog.GetCatalogType() != CATALOG_TYPE) {
+		throw BinderException("Attached database \"%s\" is not a ClickHouse database", database_name);
+	}
+	return catalog.Cast<ClickhouseCatalog>();
+}
 
 ClickhouseCatalog::ClickhouseCatalog(AttachedDatabase &db, ClickhouseConnectionConfig config_p,
                                      ClickhouseAttachOptions options_p, ClientContext &context)
