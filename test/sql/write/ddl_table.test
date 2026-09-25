@@ -143,6 +143,18 @@ SELECT * FROM ch.w_ddl.defaults;
 ----
 1	dflt	42	2024-01-01	-1.5	true
 
+# a TIMESTAMP_NS DEFAULT keeps its nanoseconds
+statement ok
+CREATE TABLE ch.w_ddl.ns_default (id INTEGER PRIMARY KEY, t TIMESTAMP_NS DEFAULT TIMESTAMP_NS '2024-01-01 00:00:00.123456789');
+
+statement ok
+INSERT INTO ch.w_ddl.ns_default (id) VALUES (1);
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(t) FROM w_ddl.ns_default');
+----
+2024-01-01 00:00:00.123456789
+
 statement error
 CREATE TABLE ch.w_ddl.bad (id INTEGER, t TIMESTAMPTZ DEFAULT now());
 ----

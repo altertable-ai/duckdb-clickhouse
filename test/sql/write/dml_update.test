@@ -477,6 +477,11 @@ UPDATE ch.w_dml2.r SET dec = s::DECIMAL(10, 1);
 ----
 cast from VARCHAR to DECIMAL(10,1) has no exact ClickHouse translation
 
+statement error
+UPDATE ch.w_dml2.r SET i = dbl // 1;
+----
+// on DOUBLE has no exact ClickHouse translation
+
 query II
 SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(dec), groupArray(i) FROM (SELECT dec, i FROM w_dml2.r ORDER BY id)');
 ----

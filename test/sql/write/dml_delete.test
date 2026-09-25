@@ -433,10 +433,78 @@ SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM
 ----
 [1]
 
+# a TIMESTAMP_NS constant keeps its nanoseconds (truncated to microseconds, it would match 2024-01-01 00:00:00)
+query I
+SELECT count(*) FROM ch.w_dml.r WHERE d::TIMESTAMP_NS = TIMESTAMP_NS '2024-01-01 00:00:00.000000001';
+----
+0
+
+query I
+DELETE FROM ch.w_dml.r WHERE d::TIMESTAMP_NS = TIMESTAMP_NS '2024-01-01 00:00:00.000000001';
+----
+0
+
 query I
 SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.r');
 ----
 1
+
+# ---------------------------------------------------------------------------
+# // and % on FLOAT, DOUBLE and DECIMAL, and FLOAT arithmetic
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.fl (id Int32, d Float64, f Float32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.fl VALUES (1, 7.0, 0.1), (2, 1e20, 0.2);
+
+# DuckDB's // on a DOUBLE is a plain division (7.0 // 2 = 3.5), not ClickHouse's intDiv; % on it is fmod()
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE d // 2 = 3;
+----
+0
+
+statement error
+DELETE FROM ch.w_dml.fl WHERE d // 2 = 3;
+----
+// on DOUBLE has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.fl WHERE d % 3 = 1;
+----
+% on DOUBLE has no exact ClickHouse translation
+
+# FLOAT + FLOAT is computed in single precision by DuckDB: 0.1 + 0.1 < 0.3 but 0.2 + 0.1 = 0.3 (as FLOATs)
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE f + 0.1 < 0.3;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.fl WHERE f + 0.1 < 0.3;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.fl ORDER BY id)');
+----
+[2]
+
+# unary minus (negate(), so that a minus before a negative value never reads as a "--" comment), on a FLOAT
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE -f < -0.15;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.fl WHERE -f < -0.15;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.fl');
+----
+0
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml');

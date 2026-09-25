@@ -46,10 +46,18 @@ string ClickhouseExpression::Literal(const Value &value) {
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-		// naive timestamps are stored as UTC (see ClickhouseDdlTypes)
+		// naive timestamps are stored as UTC (see ClickhouseDdlTypes); seconds and milliseconds widen to
+		// microseconds exactly
 		return ClickhouseFilterPushdown::TransformConstant(
 		    Value::TIMESTAMPTZ(timestamp_tz_t(value.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>())));
+	case LogicalTypeId::TIMESTAMP_NS: {
+		// every nanosecond: a cast to TIMESTAMP would drop the sub-microsecond part
+		auto timestamp = TimestampNSValue::Get(value);
+		if (!Value::IsFinite(timestamp)) {
+			throw NotImplementedException("infinite timestamps have no ClickHouse literal");
+		}
+		return StringUtil::Format("fromUnixTimestamp64Nano(%d, 'UTC')", timestamp.value);
+	}
 	default:
 		return ClickhouseFilterPushdown::TransformConstant(value);
 	}
@@ -334,6 +342,36 @@ string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, 
 	}
 }
 
+//! DuckDB computes FLOAT arithmetic in single precision, ClickHouse promotes Float32 to Float64: rounding the
+//! Float64 result of + - * / (or of a negation) of two Float32 values to Float32 gives the single-precision result
+static string ArithmeticResult(const BoundFunctionExpression &function, const string &sql) {
+	return function.return_type.id() == LogicalTypeId::FLOAT ? "toFloat32(" + sql + ")" : sql;
+}
+
+//! Whether DuckDB's arithmetic function `function` computes what ClickHouse's operator does (overflow and division
+//! by zero aside): numbers only, or a DATE plus/minus a number of days
+static bool IsTranslatableArithmetic(const BoundFunctionExpression &function) {
+	auto &name = function.function.name;
+	auto &children = function.children;
+	auto all_numeric = function.return_type.IsNumeric();
+	for (auto &child : children) {
+		all_numeric = all_numeric && child->return_type.IsNumeric();
+	}
+	if (all_numeric) {
+		return true;
+	}
+	if (function.return_type.id() != LogicalTypeId::DATE || children.size() != 2) {
+		return false;
+	}
+	auto &left = children[0]->return_type;
+	auto &right = children[1]->return_type;
+	if (name == "+") {
+		return (left.id() == LogicalTypeId::DATE && right.IsIntegral()) ||
+		       (left.IsIntegral() && right.id() == LogicalTypeId::DATE);
+	}
+	return name == "-" && left.id() == LogicalTypeId::DATE && right.IsIntegral();
+}
+
 static string TranslateFunction(const BoundFunctionExpression &function, const std::function<string(idx_t)> &resolve) {
 	auto &name = function.function.name;
 	auto &children = function.children;
@@ -343,14 +381,35 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 	auto is_string = [&](idx_t i) {
 		return children[i]->return_type.id() == LogicalTypeId::VARCHAR;
 	};
-	if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
-		return "(" + arg(0) + " " + name + " " + arg(1) + ")";
+	auto is_arithmetic = name == "+" || name == "-" || name == "*" || name == "/" || name == "//" || name == "%";
+	if (is_arithmetic && !IsTranslatableArithmetic(function)) {
+		throw NotImplementedException("%s on %s has no exact ClickHouse translation: %s", name,
+		                              function.return_type.ToString(), function.ToString());
+	}
+	auto integral_result = function.return_type.IsIntegral();
+	if (children.size() == 2 && (name == "+" || name == "-" || name == "*")) {
+		return ArithmeticResult(function, "(" + arg(0) + " " + name + " " + arg(1) + ")");
 	}
 	if (children.size() == 1 && name == "-") {
-		return "(-" + arg(0) + ")";
+		// negate(), not a leading "-": "-" followed by a negative literal would start a "--" comment
+		return ArithmeticResult(function, "negate(" + arg(0) + ")");
 	}
-	if (children.size() == 2 && name == "//") {
+	if (children.size() == 2 && (name == "//" || name == "/") && integral_result) {
+		// integer division (DuckDB's "/" is one too with SET integer_division = true); truncates toward zero in
+		// both
 		return "intDiv(" + arg(0) + ", " + arg(1) + ")";
+	}
+	if (children.size() == 2 && name == "/" && function.return_type.IsFloating()) {
+		return ArithmeticResult(function, "(" + arg(0) + " / " + arg(1) + ")");
+	}
+	if (children.size() == 2 && name == "%" && integral_result) {
+		return "(" + arg(0) + " % " + arg(1) + ")";
+	}
+	if (is_arithmetic) {
+		// DuckDB's // on FLOAT/DOUBLE (and DECIMAL, which it casts to DOUBLE) is a plain division; % on them is
+		// fmod(), which ClickHouse does not compute the same way for large values (1e20 % 3); "/" on DECIMAL
+		throw NotImplementedException("%s on %s has no exact ClickHouse translation: %s", name,
+		                              function.return_type.ToString(), function.ToString());
 	}
 	if (children.size() == 2 && (name == "~~" || name == "!~~" || name == "~~*" || name == "!~~*")) {
 		auto negated = name[0] == '!';
