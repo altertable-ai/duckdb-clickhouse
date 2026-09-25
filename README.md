@@ -54,8 +54,10 @@ GROUP BY ALL;
 ```
 
 Filters, the selected columns and `LIMIT` / `ORDER BY … LIMIT` are sent to ClickHouse, so only the rows you need
-cross the network. Filters on floating-point, `UUID` and a few other columns are evaluated by DuckDB instead,
-because ClickHouse would compare them differently. `EXPLAIN ANALYZE` shows the query sent to ClickHouse.
+cross the network. Filters on floating-point and a few other columns are evaluated by DuckDB instead, because
+ClickHouse would compare them differently. ClickHouse also sorts `UUID` values differently from DuckDB, so
+`ORDER BY` on a `UUID` column runs in DuckDB and range filters on one compare its text form, which cannot use a
+ClickHouse index (`=` and `IN` can). `EXPLAIN ANALYZE` shows the query sent to ClickHouse.
 
 To run ClickHouse SQL directly, for example to use ClickHouse functions or aggregate on the server:
 

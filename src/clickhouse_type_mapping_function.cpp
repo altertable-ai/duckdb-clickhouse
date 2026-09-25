@@ -24,7 +24,7 @@ static unique_ptr<FunctionData> TypeMappingBind(ClientContext &context, TableFun
 	result->duckdb_type = mapped.type.ToString();
 	result->read_expression = ClickhouseTypes::ReadExpression(node, "c");
 	result->nullable = ClickhouseTypes::IsNullable(node);
-	result->pushdown = ClickhouseTypes::SupportsPushdown(node);
+	result->pushdown = ClickhouseTypes::SupportsFilterPushdown(node);
 	result->readable = mapped.readable;
 
 	names = {"duckdb_type", "read_expression", "nullable", "pushdown", "readable"};

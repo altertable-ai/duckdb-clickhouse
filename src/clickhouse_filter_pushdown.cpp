@@ -37,6 +37,18 @@ static string TransformComparison(ExpressionType type) {
 	}
 }
 
+static bool IsOrderedComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return true;
+	default:
+		return false;
+	}
+}
+
 //! toDate32(...) clamps rather than errors on an out-of-range argument (e.g. toDate32('1850-01-01') silently
 //! becomes 1900-01-01): pushing a comparison against a date outside this range would then match/exclude rows
 //! ClickHouse itself would not. [1900-01-01, 2299-12-31] is ClickHouse's own Date32 range -- the widest either
@@ -76,6 +88,8 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 		return ClickhouseUtils::QuoteLiteral(StringValue::Get(value));
 	case LogicalTypeId::ENUM:
 		return ClickhouseUtils::QuoteLiteral(value.ToString());
+	case LogicalTypeId::UUID:
+		return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
 	case LogicalTypeId::DATE: {
 		auto date = DateValue::Get(value);
 		if (!Date::IsFinite(date)) {
@@ -185,6 +199,13 @@ string ClickhouseFilterPushdown::TransformFilter(const string &column, const Tab
 		    TryFoldUnrepresentableComparison(column, constant_filter.comparison_type, constant_filter.constant);
 		if (!folded.empty()) {
 			return folded;
+		}
+		if (constant_filter.constant.type().id() == LogicalTypeId::UUID &&
+		    IsOrderedComparison(constant_filter.comparison_type)) {
+			// ClickHouse orders UUIDs by their second 64-bit half first; its canonical lowercase text orders
+			// exactly like DuckDB's UUID
+			return "toString(" + column + ") " + TransformComparison(constant_filter.comparison_type) + " " +
+			       ClickhouseUtils::QuoteLiteral(constant_filter.constant.ToString());
 		}
 		return column + " " + TransformComparison(constant_filter.comparison_type) + " " +
 		       TransformConstant(constant_filter.constant);

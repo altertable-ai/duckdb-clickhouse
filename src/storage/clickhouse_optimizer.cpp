@@ -40,7 +40,7 @@ static bool AllFiltersPushed(LogicalGet &get, const ClickhouseScanBindData &bind
 	for (auto &entry : get.table_filters.filters) {
 		auto column_id = entry.first;
 		if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size() || !bind_data.filter_pushdown ||
-		    !ClickhouseTypes::SupportsPushdown(bind_data.columns[column_id].type_node)) {
+		    !ClickhouseTypes::SupportsFilterPushdown(bind_data.columns[column_id].type_node)) {
 			return false;
 		}
 		try {

@@ -297,7 +297,7 @@ static bool ClickhouseSupportsPushdownType(const FunctionData &bind_data_p, idx_
 	if (!bind_data.filter_pushdown || column_index >= bind_data.columns.size()) {
 		return false;
 	}
-	return ClickhouseTypes::SupportsPushdown(bind_data.columns[column_index].type_node);
+	return ClickhouseTypes::SupportsFilterPushdown(bind_data.columns[column_index].type_node);
 }
 
 bool ClickhouseScanFunction::FilterPushdownEnabled(ClientContext &context) {
@@ -335,7 +335,7 @@ static optional_idx ResolvePushdownableColumn(const LogicalGet &get, const Click
 	if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size()) {
 		return optional_idx();
 	}
-	if (!ClickhouseTypes::SupportsPushdown(bind_data.columns[column_id].type_node)) {
+	if (!ClickhouseTypes::SupportsFilterPushdown(bind_data.columns[column_id].type_node)) {
 		return optional_idx();
 	}
 	return optional_idx(column_id);

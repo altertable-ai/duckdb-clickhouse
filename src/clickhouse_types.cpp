@@ -473,6 +473,10 @@ bool ClickhouseTypes::SupportsPushdown(const ClickhouseTypeNode &node) {
 	return PUSHDOWN_TYPES.find(type.name) != PUSHDOWN_TYPES.end();
 }
 
+bool ClickhouseTypes::SupportsFilterPushdown(const ClickhouseTypeNode &node) {
+	return SupportsPushdown(node) || Unwrap(node).name == "UUID";
+}
+
 bool ClickhouseTypes::IsComparedExactly(const ClickhouseTypeNode &node) {
 	if (node.name == "FixedString") {
 		return false;

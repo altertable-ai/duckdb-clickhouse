@@ -102,7 +102,7 @@ TIME_NS	c	false	false	true
 query TTTTT
 SELECT * FROM clickhouse_type_mapping('UUID');
 ----
-UUID	c	false	false	true
+UUID	c	false	true	true
 
 query TTTTT
 SELECT * FROM clickhouse_type_mapping('IPv6');

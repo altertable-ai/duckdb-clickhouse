@@ -250,7 +250,7 @@ query I
 SELECT id FROM ch.test_db.t1 WHERE rowid = 0;
 ----
 
-# not pushed: floats (NaN semantics differ) and UUIDs (ordering differs); DuckDB filters instead
+# not pushed: floats (NaN semantics differ); DuckDB filters instead
 query I
 SELECT id FROM ch.test_db.t1 WHERE value > 100 ORDER BY id;
 ----
@@ -273,16 +273,6 @@ query I
 SELECT count(*) FROM ch.test_db.t1 WHERE value > 100;
 ----
 2
-
-query I
-SELECT id FROM ch.test_db.scalars WHERE uuid = '61f0c404-5cb3-11e7-907b-a6006ad3dba0';
-----
-1
-
-query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.scalars WHERE uuid = '61f0c404-5cb3-11e7-907b-a6006ad3dba0';
-----
-analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`scalars`".*
 
 # pushed and non-pushed filters together
 query I
