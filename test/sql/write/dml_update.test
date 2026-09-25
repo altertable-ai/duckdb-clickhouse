@@ -77,9 +77,14 @@ SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w
 ----
 [1, 1, 3, 31, 41]
 
-# enums, server-converted types, CASE
-query I
+# enums, server-converted types (constants only, see below), CASE
+statement error
 UPDATE ch.w_dml2.u SET e = 'y', ip = '192.168.1.' || id::VARCHAR WHERE e = 'x' AND id < 2;
+----
+SET of column "ip" (IPv4) to a value that is not a constant: ClickHouse parses it from text
+
+query I
+UPDATE ch.w_dml2.u SET e = 'y', ip = '192.168.1.7' WHERE e = 'x' AND id < 2;
 ----
 2
 
@@ -91,8 +96,8 @@ UPDATE ch.w_dml2.u SET name = CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END;
 query IIII
 SELECT * FROM clickhouse_query('ch', 'SELECT id, name, toString(e), toString(ip) FROM w_dml2.u WHERE id <= 2 ORDER BY id');
 ----
-0	even	y	192.168.1.0
-1	odd	y	192.168.1.1
+0	even	y	192.168.1.7
+1	odd	y	192.168.1.7
 2	even	x	10.0.0.2
 
 # no row can match (DuckDB folds the plan to an empty result): nothing is updated, never every row
@@ -667,6 +672,82 @@ query I
 SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(i) FROM (SELECT i FROM w_dml2.vs ORDER BY id)');
 ----
 [5]
+
+# ---------------------------------------------------------------------------
+# columns DuckDB reads as text that ClickHouse stores as another type (IPv4/6, (U)Int256, Decimal256, geo types,
+# FixedString, ...): the mutation would parse the text, turning what does not parse into NULL or failing (and then
+# staying stuck). Only constants are written, converted on the server before the mutation is sent
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ip (id Int32, s String, ip Nullable(IPv4), ipn IPv4, fs FixedString(2), i Nullable(Int256), p Point) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.ip VALUES (1, 'abc', '1.2.3.4', '1.2.3.4', 'ab', '1', 'POINT (0 0)'), (2, '5.6.7.8', NULL, '0.0.0.0', 'cd', NULL, 'POINT (1 1)');
+
+foreach set ip=s ipn=s fs=s i=s p=s fs=upper(s) ip=coalesce(s,'1.1.1.1')
+
+statement error
+UPDATE ch.w_dml2.ip SET {set} WHERE id = 1;
+----
+<REGEX>:.*UPDATE on ClickHouse table "w_dml2"."ip" must filter only the modified table with translatable expressions \(SET of column "(ip|ipn|fs|i|p)" \(.*\) to a value that is not a constant: ClickHouse parses it from text\); use clickhouse_execute\(\) for anything else.*
+
+endloop
+
+foreach set ip='bogus' ipn='bogus' i='x' fs='abc' p='nope' ipn=NULL
+
+statement error
+UPDATE ch.w_dml2.ip SET {set} WHERE id = 2;
+----
+ClickHouse error
+
+endloop
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(ipn), fs, toString(i), wkt(p) FROM w_dml2.ip ORDER BY id');
+----
+1	1.2.3.4	1.2.3.4	ab	1	POINT(0 0)
+2	NULL	0.0.0.0	cd	NULL	POINT(1 1)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''ip''');
+----
+0
+
+query I
+UPDATE ch.w_dml2.ip SET ip = '9.9.9.9', ipn = '8.8.8.8', fs = 'z', i = '-7', p = 'POINT (3 4)' WHERE id = 1;
+----
+1
+
+query IIII
+SELECT ip, ipn, i, p FROM ch.w_dml2.ip WHERE id = 1;
+----
+9.9.9.9	8.8.8.8	-7	POINT(3 4)
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip), toString(ipn), hex(fs), toString(i), wkt(p) FROM w_dml2.ip WHERE id = 1');
+----
+9.9.9.9	8.8.8.8	7A00	-7	POINT(3 4)
+
+query I
+UPDATE ch.w_dml2.ip SET ip = NULL, i = NULL WHERE id = 1;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip), toString(i) FROM w_dml2.ip WHERE id = 1');
+----
+NULL	NULL
+
+# no mutation was left stuck: a later DELETE runs
+query I
+DELETE FROM ch.w_dml2.ip WHERE id = 2;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''ip'' AND NOT is_done');
+----
+0
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

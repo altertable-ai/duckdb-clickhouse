@@ -32,8 +32,11 @@ public:
 	//! (Nullable) Float32 for BFloat16, matching what the read path produces for it
 	static string ServerInputType(const ClickhouseTypeNode &node);
 	//! For a SERVER_CONVERSION column: the ClickHouse expression converting `expr` (of ServerInputType) to the
-	//! column's own type
+	//! column's own type. Text that does not convert fails the INSERT, in a Nullable column too
 	static string ServerConversion(const ClickhouseTypeNode &node, const string &expr);
+	//! The ClickHouse expression parsing `expr`, the text DuckDB reads a value of `type` (no Nullable/LowCardinality
+	//! wrapper) as, into `type`: readWKT*() for the geo types, a CAST otherwise. Fails on text that does not parse
+	static string ParseText(const ClickhouseTypeNode &type, const string &expr);
 };
 
 } // namespace duckdb

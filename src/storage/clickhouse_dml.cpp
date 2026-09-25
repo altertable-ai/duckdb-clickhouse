@@ -4,12 +4,14 @@
 #include "clickhouse_expression.hpp"
 #include "clickhouse_scanner.hpp"
 #include "clickhouse_utils.hpp"
+#include "clickhouse_writer.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
@@ -40,10 +42,28 @@ string ClickhouseDml::DisplayName(const TableCatalogEntry &table) {
 
 vector<std::pair<string, string>> ClickhouseDml::SemanticSettings() {
 	// transform_null_in = 1 would make a bare x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept).
-	// ClickhouseExpression::InList guards every IN / NOT IN against it, in the count and the statement alike. The pin
-	// reaches only the count, an ordinary query: DELETE and ALTER TABLE … UPDATE run with the server's default
-	// profile as loaded at startup, whatever the query's settings say
-	return {{"transform_null_in", "0"}};
+	// ClickhouseExpression::InList guards every IN / NOT IN against it, in the count and the statement alike. The pins
+	// reach only ordinary queries: DELETE and ALTER TABLE … UPDATE run with the server's default profile as loaded at
+	// startup, whatever the query's settings say.
+	// The rest make a count read every stored row, as a mutation does, and read all of its result: FINAL would hide
+	// replaced rows, the overflow modes set to 'break' would return a partial count, and the filters, limit and
+	// offset would drop rows or the result row itself. A cached result may be stale. CAST must not turn an IP that
+	// does not parse into 0.0.0.0, and if(isNull(x), NULL, CAST(…)) must not convert the NULLs
+	return {{"transform_null_in", "0"},
+	        {"final", "0"},
+	        {"read_overflow_mode", "throw"},
+	        {"read_overflow_mode_leaf", "throw"},
+	        {"timeout_overflow_mode", "throw"},
+	        {"timeout_overflow_mode_leaf", "throw"},
+	        {"set_overflow_mode", "throw"},
+	        {"group_by_overflow_mode", "throw"},
+	        {"additional_table_filters", "{}"},
+	        {"additional_result_filter", ""},
+	        {"limit", "0"},
+	        {"offset", "0"},
+	        {"use_query_cache", "0"},
+	        {"cast_ipv4_ipv6_default_on_conversion_error", "0"},
+	        {"short_circuit_function_evaluation", "enable"}};
 }
 
 //! Whether TRUNCATE TABLE really removes the rows of a table with this engine: the MergeTree family (Replicated,
@@ -479,6 +499,42 @@ static string FloorTimestamp(const string &sql, idx_t precision) {
 	return "fromUnixTimestamp64Micro(" + micros + " - positiveModulo(" + micros + ", " + micros_per_tick + "), 'UTC')";
 }
 
+//! Whether ClickHouse stores `node`, or a type nested in it, as something other than the text DuckDB reads it as:
+//! IPv4/6, (U)Int256, Decimal256, FixedString, the geo types, JSON, ... A CAST of text to such a type parses it
+static bool StoredFromText(const ClickhouseTypeNode &node) {
+	auto &base = ClickhouseTypeWrappers::Of(node).base;
+	if (base.name == "String") {
+		return false;
+	}
+	if (ClickhouseTypes::ToDuckDB(base).type.id() == LogicalTypeId::VARCHAR) {
+		return true;
+	}
+	for (auto &child : base.children) {
+		if (StoredFromText(child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The constant a SET value is, itself or as a projection's output below the LogicalUpdate (where DuckDB computes
+//! the SET values); null for anything else
+static optional_ptr<const BoundConstantExpression> ResolveConstant(const Expression &expr,
+                                                                   const LogicalOperator &child) {
+	auto resolved = &expr;
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		auto traced = TraceReference(child, expr.Cast<BoundReferenceExpression>().index);
+		if (traced.kind != ReferenceStep::Kind::PROJECTION_EXPRESSION) {
+			return nullptr;
+		}
+		resolved = traced.op->expressions[traced.index].get();
+	}
+	if (resolved->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return nullptr;
+	}
+	return &resolved->Cast<BoundConstantExpression>();
+}
+
 //! Whether a DateTime or DateTime64(p < 6) is nested in `node` (an Array, Tuple or Map element)
 static bool HoldsCoarseDateTime(const ClickhouseTypeNode &node) {
 	for (auto &child : node.children) {
@@ -526,6 +582,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	}
 	auto &child = *op.children[0];
 	vector<string> assignments;
+	vector<string> checked_values;
 	try {
 		for (idx_t i = 0; i < op.columns.size(); i++) {
 			auto column_id = op.columns[i].index;
@@ -541,12 +598,35 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			}
 			auto value =
 			    ClickhouseExpression::Translate(expr, [&](idx_t index) { return ResolveOutput(child, index); });
+			if (StoredFromText(column.type_node)) {
+				// the mutation would parse the text: into NULL for a Nullable column, or failing, which leaves it
+				// stuck. A constant is converted strictly, like an INSERT does, and checked first (check_sql)
+				auto &base = ClickhouseTypeWrappers::Of(column.type_node).base;
+				if (ClickhouseTypes::ToDuckDB(base).type.id() != LogicalTypeId::VARCHAR) {
+					throw NotImplementedException("SET of column \"%s\" (%s), whose elements ClickHouse parses from "
+					                              "text",
+					                              column.name, column.clickhouse_type);
+				}
+				auto constant = ResolveConstant(expr, child);
+				if (!constant) {
+					throw NotImplementedException("SET of column \"%s\" (%s) to a value that is not a constant: "
+					                              "ClickHouse parses it from text",
+					                              column.name, column.clickhouse_type);
+				}
+				if (!constant->value.IsNull()) {
+					value = ClickhouseWriter::ParseText(base, value);
+				}
+				auto assigned = "CAST(" + value + " AS " + column.clickhouse_type + ")";
+				checked_values.push_back(assigned);
+				assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = " + assigned);
+				continue;
+			}
 			// DuckDB's binder casts every SET value to the column's DuckDB type, and that cast is part of `expr`
 			// (translated, and rounded where DuckDB rounds, above). The CAST to the ClickHouse type below then
-			// converts the column's DuckDB type into its ClickHouse type: exact for most types, and what an INSERT's
-			// server-side conversion does for the others (BFloat16, IPv4/6, (U)Int256, Decimal256, JSON, ...), except
-			// for DateTime and DateTime64(p < 6), floored first like an INSERT. Should the value's type ever differ
-			// from the column's, that first cast is checked (and rounded) here
+			// converts the column's DuckDB type into its ClickHouse type: exact for the types left here, and what an
+			// INSERT's server-side conversion does for BFloat16, except for DateTime and DateTime64(p < 6), floored
+			// first like an INSERT. Should the value's type ever differ from the column's, that first cast is
+			// checked (and rounded) here
 			if (expr.return_type != column.type) {
 				value = ClickhouseExpression::Cast(value, expr.return_type, column.type,
 				                                   ClickhouseDdlTypes::ToClickhouse(column.type, true));
@@ -574,6 +654,10 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 		return result;
 	}
 	result.sql = result.description + " " + StringUtil::Join(assignments, ", ") + " WHERE " + where;
+	if (!checked_values.empty()) {
+		// ignore() still evaluates its arguments, and returns a type the client can read (Int256 and Point are not)
+		result.check_sql = "SELECT ignore(" + StringUtil::Join(checked_values, ", ") + ")";
+	}
 	result.settings = SemanticSettings();
 	result.settings.push_back(MutationsSyncSetting(context));
 	return result;
@@ -607,6 +691,10 @@ SourceResultType ClickhouseDmlOperator::GetDataInternal(ExecutionContext &contex
 		auto &catalog =
 		    ClickhouseCatalog::GetAttachedDatabase(context.client, statement.catalog_name, statement.description);
 		auto connection = catalog.StartWrite(context.client);
+		if (!statement.check_sql.empty()) {
+			// the same conversions as the statement's: one that fails throws ClickHouse's error here
+			connection->Query(statement.check_sql, ClickhouseDml::SemanticSettings());
+		}
 		// the count is an ordinary query, which an ATTACH's settings= would reach without SemanticSettings
 		for (auto &block : connection->Query(statement.count_sql, ClickhouseDml::SemanticSettings())) {
 			if (block.GetRowCount() == 0) {

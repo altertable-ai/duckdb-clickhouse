@@ -137,5 +137,76 @@ SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(dt64), toString(e), lc
 1	2024-01-02 03:04:05.678	b	it's	1.2.3.4
 2	1970-01-01 00:00:00.000	a	(empty)	255.255.255.255
 
+# a Nullable column too rejects text it cannot convert (its CAST alone would store NULL), even in a block with valid
+# rows: nothing is written. NULL stays NULL, valid text round-trips
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.nul (id UInt8, ip Nullable(IPv4), ip6 Nullable(IPv6), i Nullable(Int256), u Nullable(UInt256), d Nullable(Decimal(76, 2))) ENGINE = MergeTree ORDER BY id');
+
+foreach col ip ip6 i u d
+
+statement error
+INSERT INTO ch.w_conv.nul (id, {col}) VALUES (1, 'bogus');
+----
+ClickHouse error
+
+endloop
+
+statement error
+INSERT INTO ch.w_conv.nul (id, ip) VALUES (1, '1.1.1.1'), (2, NULL), (3, 'bogus');
+----
+ClickHouse error
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_conv.nul');
+----
+0
+
+query I
+INSERT INTO ch.w_conv.nul VALUES (1, '1.2.3.4', '::1', '-5', '5', '1.25'), (2, NULL, NULL, NULL, NULL, NULL);
+----
+2
+
+query IIIIII
+SELECT * FROM ch.w_conv.nul ORDER BY id;
+----
+1	1.2.3.4	::1	-5	5	1.25
+2	NULL	NULL	NULL	NULL	NULL
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(ip6), toString(i), toString(u), toString(d) FROM w_conv.nul ORDER BY id');
+----
+1	1.2.3.4	::1	-5	5	1.25
+2	NULL	NULL	NULL	NULL	NULL
+
+# whatever the ATTACH's settings= say: an IP that does not parse is not turned into 0.0.0.0, and NULLs still skip
+# the conversion
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=cast_ipv4_ipv6_default_on_conversion_error=1' AS ch_lax (TYPE clickhouse);
+
+statement error
+INSERT INTO ch_lax.w_conv.nul (id, ip) VALUES (3, 'bogus');
+----
+ClickHouse error
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=short_circuit_function_evaluation=disable' AS ch_nsc (TYPE clickhouse);
+
+query I
+INSERT INTO ch_nsc.w_conv.nul (id, ip, i) VALUES (4, NULL, NULL), (5, '5.5.5.5', '7');
+----
+2
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(i) FROM w_conv.nul WHERE id >= 3 ORDER BY id');
+----
+4	NULL	NULL
+5	5.5.5.5	7
+
+statement ok
+DETACH ch_lax;
+
+statement ok
+DETACH ch_nsc;
+
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_conv');

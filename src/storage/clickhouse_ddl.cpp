@@ -295,7 +295,7 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection,
 	           "is_in_sampling_key FROM system.columns WHERE database = " +
 	           ClickhouseUtils::QuoteLiteral(database) + " AND table = " + ClickhouseUtils::QuoteLiteral(table.name) +
 	           " AND name = " + ClickhouseUtils::QuoteLiteral(column);
-	for (auto &block : connection.Query(sql)) {
+	for (auto &block : connection.Query(sql, ClickhouseDml::SemanticSettings())) {
 		if (block.GetRowCount() == 0) {
 			continue;
 		}
@@ -310,8 +310,12 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection,
 	                       column, table.name);
 }
 
+//! Runs with ClickhouseDml::SemanticSettings() plus `extra_settings`: the count reads every stored row, whatever the
+//! ATTACH's settings= say
 static uint64_t QueryCount(ClickhouseConnection &connection, const string &sql,
-                           const vector<std::pair<string, string>> &settings = {}) {
+                           const vector<std::pair<string, string>> &extra_settings = {}) {
+	auto settings = ClickhouseDml::SemanticSettings();
+	settings.insert(settings.end(), extra_settings.begin(), extra_settings.end());
 	uint64_t count = 0;
 	for (auto &block : connection.Query(sql, settings)) {
 		if (block.GetRowCount() > 0) {
@@ -323,11 +327,9 @@ static uint64_t QueryCount(ClickhouseConnection &connection, const string &sql,
 
 //! How many rows of `qualified` satisfy `condition`, counting the rows a lightweight DELETE only masked: a mutation
 //! still rewrites (and converts) them. countIf, not WHERE: ClickHouse 25.8 answers WHERE n IS NULL with 0 for masked
-//! rows even with apply_deleted_mask = 0. Pinned like the UPDATE/DELETE count (ClickhouseDml::SemanticSettings)
+//! rows even with apply_deleted_mask = 0
 static uint64_t CountStoredRows(ClickhouseConnection &connection, const string &qualified, const string &condition) {
-	auto settings = ClickhouseDml::SemanticSettings();
-	settings.emplace_back("apply_deleted_mask", "0");
-	return QueryCount(connection, "SELECT countIf(" + condition + ") FROM " + qualified, settings);
+	return QueryCount(connection, "SELECT countIf(" + condition + ") FROM " + qualified, {{"apply_deleted_mask", "0"}});
 }
 
 //! Active parts of a MergeTree-family table that do not store `column` (written before it was added, and not merged
@@ -391,14 +393,17 @@ static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog,
                              uint64_t missing_parts) {
 	auto &name = column.info.name;
 	auto sync = ClickhouseDml::MutationsSyncSetting(context);
-	if (sync.second == "0") {
-		// the default would change while the mutation still waits to run
+	// the default would change while the mutation still waits to run: anywhere with 0, and on the other replicas of a
+	// Replicated table with 1, which waits for this replica only (the default change is not ordered after the
+	// mutation there)
+	auto replicated = StringUtil::StartsWith(table.GetEngine(), "Replicated");
+	if (sync.second == "0" || (replicated && sync.second != "2")) {
 		throw NotImplementedException(
 		    "Cannot change the default of column \"%s\" of ClickHouse table \"%s\": %d part(s) do not store the column "
 		    "yet, and ClickHouse computes it there from the current default, so it has to be materialized first, which "
-		    "ch_mutations_sync = 0 would leave running in the background; SET ch_mutations_sync = 2, or use "
+		    "ch_mutations_sync = %s would leave running in the background%s; SET ch_mutations_sync = 2, or use "
 		    "clickhouse_execute() instead",
-		    name, table.name, missing_parts);
+		    name, table.name, missing_parts, sync.second, sync.second == "0" ? "" : " on the other replicas");
 	}
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
 	auto quoted = ClickhouseUtils::QuoteIdentifier(name);
@@ -687,9 +692,24 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 		}
 		// scalar columns are added Nullable (Array/Tuple/Map/JSON never are): DuckDB's ADD COLUMN carries no NOT
 		// NULL constraint
+		auto column_sql = ColumnSql(context, add.new_column, true);
+		auto &engine = table.GetEngine();
+		if (add.new_column.HasDefaultValue() && !StringUtil::EndsWith(engine, "MergeTree")) {
+			// only the MergeTree family computes the default for the rows a table already holds: Memory (and the
+			// Buffer and Merge proxies) gives them NULL or the type's zero, and cannot store the column afterwards
+			// (a mutation finds it in no block)
+			auto connection = catalog.GetConnectionPool().GetConnection();
+			if (QueryCount(connection.GetConnection(), "SELECT count() FROM " + qualified) > 0) {
+				throw NotImplementedException(
+				    "Cannot add column \"%s\" with a DEFAULT to ClickHouse table \"%s\" (engine %s): it holds rows, "
+				    "which ClickHouse would give NULL rather than the default (only MergeTree-family tables compute it "
+				    "for existing rows); add the column without a DEFAULT, or use clickhouse_execute() instead",
+				    new_name, table.name, engine);
+			}
+		}
 		// IF NOT EXISTS still sent: the cached column list may be stale
 		return {"ALTER TABLE " + qualified + " ADD COLUMN " + (add.if_column_not_exists ? "IF NOT EXISTS " : "") +
-		        ColumnSql(context, add.new_column, true)};
+		        column_sql};
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &remove = info.Cast<RemoveColumnInfo>();

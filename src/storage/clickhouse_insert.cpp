@@ -10,6 +10,7 @@
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_ddl.hpp"
+#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -234,8 +235,11 @@ void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGloba
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, catalog_name, "INSERT");
 	gstate.connection = catalog.StartWrite(context);
 	// Time/Time64 columns need this setting (ClickHouse 25.x); servers that do not know it ignore it. Tables
-	// DuckDB creates map TIME to Time64 (see ClickhouseDdlTypes), so every INSERT needs it, not just DDL
-	gstate.header = gstate.connection->BeginInsert(gstate.insert_sql, {{"enable_time_time64_type", "1"}});
+	// DuckDB creates map TIME to Time64 (see ClickhouseDdlTypes), so every INSERT needs it, not just DDL. The
+	// server-side conversions must neither turn text into a default nor lose rows to a limit
+	auto settings = ClickhouseDml::SemanticSettings();
+	settings.emplace_back("enable_time_time64_type", "1");
+	gstate.header = gstate.connection->BeginInsert(gstate.insert_sql, settings);
 	if (gstate.header.GetColumnCount() != gstate.columns.size()) {
 		// not InternalException: this means the cached column list is stale (another connection changed the
 		// table since it was cached), and InternalException would invalidate the whole DuckDB instance for

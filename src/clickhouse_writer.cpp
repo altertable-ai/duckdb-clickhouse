@@ -74,18 +74,32 @@ string ClickhouseWriter::ServerInputType(const ClickhouseTypeNode &node) {
 	return ClickhouseTypes::IsNullable(node) ? "Nullable(" + string(base) + ")" : string(base);
 }
 
-string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const string &expr) {
+string ClickhouseWriter::ParseText(const ClickhouseTypeNode &type, const string &expr) {
 	// geo types are read as WKT (wkt()); CAST cannot parse WKT, the readWKT* functions can
 	static const unordered_map<string, string> WKT_READERS = {
 	    {"Point", "readWKTPoint"},           {"Ring", "readWKTRing"},       {"LineString", "readWKTLineString"},
 	    {"MultiLineString", "readWKTMultiLineString"}, {"Polygon", "readWKTPolygon"},
 	    {"MultiPolygon", "readWKTMultiPolygon"}};
-	auto reader = WKT_READERS.find(ClickhouseTypeWrappers::Of(node).base.name);
+	auto reader = WKT_READERS.find(type.name);
 	if (reader != WKT_READERS.end()) {
 		return reader->second + "(" + expr + ")";
 	}
-	// the column's full type, wrappers included: CAST(Nullable(String) AS Nullable(IPv4)) keeps NULLs
-	return "CAST(" + expr + " AS " + node.text + ")";
+	return "CAST(" + expr + " AS " + type.text + ")";
+}
+
+string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const string &expr) {
+	auto wrappers = ClickhouseTypeWrappers::Of(node);
+	if (wrappers.base.name == "BFloat16") {
+		// from Float32: nothing to parse
+		return "CAST(" + expr + " AS " + node.text + ")";
+	}
+	if (!wrappers.nullable) {
+		return ParseText(wrappers.base, expr);
+	}
+	// CAST(Nullable(String) AS Nullable(IPv4)) turns text that does not parse into NULL: only the NULLs skip the
+	// conversion (short_circuit_function_evaluation, see ClickhouseDml::SemanticSettings, keeps it from running on
+	// the empty string under a NULL)
+	return "if(isNull(" + expr + "), NULL, " + ParseText(wrappers.base, "assumeNotNull(" + expr + ")") + ")";
 }
 
 //===--------------------------------------------------------------------===//

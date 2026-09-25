@@ -361,6 +361,73 @@ SELECT id, n, s FROM ch.w_alter.t ORDER BY id;
 statement ok
 ALTER TABLE ch.w_alter.t ALTER COLUMN id SET NOT NULL;
 
+# the NULL count reads every stored row whatever the ATTACH's settings= say: final = 1 would hide the NULL row
+# behind the newer version of id 1, which the mutation still converts. FINAL deduplicates across partitions, merges
+# never do: both rows stay stored
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.rmt (id Int32, v Nullable(Int32), part Int32) ENGINE = ReplacingMergeTree PARTITION BY part ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_alter.rmt VALUES (1, NULL, 1)');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_alter.rmt VALUES (1, 5, 2)');
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=final=1' AS ch_final (TYPE clickhouse);
+
+query III
+SELECT * FROM ch_final.w_alter.rmt;
+----
+1	5	2
+
+statement error
+ALTER TABLE ch_final.w_alter.rmt ALTER COLUMN v SET NOT NULL;
+----
+NOT NULL constraint failed: rmt.v (1 stored row(s)
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT type, (SELECT count() FROM system.mutations WHERE database = ''w_alter'' AND table = ''rmt'') AS mutations FROM system.columns WHERE database = ''w_alter'' AND table = ''rmt'' AND name = ''v''');
+----
+Nullable(Int32)	0
+
+query III
+SELECT * FROM ch.w_alter.rmt ORDER BY part;
+----
+1	NULL	1
+1	5	2
+
+# the same for a table filter, which hides the NULL row
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=additional_table_filters={''w_alter.rmt'':''v>0''}' AS ch_filtered (TYPE clickhouse);
+
+query III
+SELECT * FROM ch_filtered.w_alter.rmt;
+----
+1	5	2
+
+statement error
+ALTER TABLE ch_filtered.w_alter.rmt ALTER COLUMN v SET NOT NULL;
+----
+NOT NULL constraint failed: rmt.v (1 stored row(s)
+
+statement ok
+DETACH ch_filtered;
+
+# the UPDATE/DELETE count is pinned the same way: it counts the stored rows the mutation rewrites
+query I
+UPDATE ch_final.w_alter.rmt SET v = 7 WHERE id = 1;
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(v) FROM w_alter.rmt');
+----
+[7, 7]
+
+statement ok
+DETACH ch_final;
+
 # ---------------------------------------------------------------------------
 # TYPE: a closed list of conversions that keep every value, keeping the Nullable-ness; nothing else is sent
 # ---------------------------------------------------------------------------
@@ -767,6 +834,40 @@ SELECT * FROM clickhouse_query('ch', 'SELECT id, e FROM w_alter.mem ORDER BY id'
 1	NULL
 2	NULL
 3	9
+
+# ADD COLUMN … DEFAULT: Memory gives the rows it holds NULL, not the default (only the MergeTree family computes
+# it for them), so a DEFAULT is refused once the table holds rows; nothing is added
+statement error
+ALTER TABLE ch.w_alter.mem ADD COLUMN f INTEGER DEFAULT 5;
+----
+Cannot add column "f" with a DEFAULT to ClickHouse table "mem" (engine Memory): it holds rows
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.columns WHERE database = ''w_alter'' AND table = ''mem'' AND name = ''f''');
+----
+0
+
+statement ok
+ALTER TABLE ch.w_alter.mem ADD COLUMN f INTEGER;
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.mem0 (id Int32) ENGINE = Memory');
+
+statement ok
+ALTER TABLE ch.w_alter.mem0 ADD COLUMN f INTEGER DEFAULT 5;
+
+statement ok
+INSERT INTO ch.w_alter.mem0 (id) VALUES (1);
+
+query II
+SELECT * FROM ch.w_alter.mem0;
+----
+1	5
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, f FROM w_alter.mem0');
+----
+1	5
 
 statement ok
 CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.log (id Int32) ENGINE = Log');

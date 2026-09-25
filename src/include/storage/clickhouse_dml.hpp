@@ -19,6 +19,9 @@ struct ClickhouseDmlStatement {
 	string count_sql;
 	//! Empty when there is nothing to run
 	string sql;
+	//! SELECT ignore(<value>, …): the SET values ClickHouse parses from text, run before the count so that one that
+	//! does not convert fails the statement before the mutation is sent. Empty when there are none
+	string check_sql;
 	//! Query-level settings sent with `sql`: ClickhouseDml::SemanticSettings(), plus lightweight_deletes_sync or
 	//! mutations_sync
 	vector<std::pair<string, string>> settings;
@@ -71,8 +74,10 @@ public:
 	                                               const string &reason);
 	//! "db"."t", for errors
 	static string DisplayName(const TableCatalogEntry &table);
-	//! Query settings the count and the statement both run with, whatever the ATTACH's settings= holds
-	//! (transform_null_in = 0). Only the count depends on them: the translated predicate does not (see InList)
+	//! Query settings every query the extension issues itself runs with (the counts and checks before a statement,
+	//! the statement, an INSERT's conversions), whatever the ATTACH's settings= holds: transform_null_in = 0, no
+	//! FINAL, no filter, limit or partial result, strict IP parsing. The translated predicate does not depend on them
+	//! (see InList)
 	static vector<std::pair<string, string>> SemanticSettings();
 	//! {"mutations_sync", <ch_mutations_sync>}: sent with every mutation (UPDATE, ALTER TABLE … ALTER COLUMN)
 	static std::pair<string, string> MutationsSyncSetting(ClientContext &context);

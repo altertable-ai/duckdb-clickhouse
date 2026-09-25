@@ -92,14 +92,15 @@ Things to know:
   that fails part-way may leave the rows sent so far. A DuckDB transaction can only write to one attached database,
   so write to local tables and to ClickHouse in separate transactions.
 - **Inserts** fill the columns you leave out with their ClickHouse `DEFAULT`. Values a column cannot hold (a date out
-  of range, `NULL` in a non-`Nullable` column) are rejected, never clamped.
+  of range, `NULL` in a non-`Nullable` column, text that is not an IP address) are rejected, never clamped.
 - **New tables** use the `MergeTree` engine by default (see `ch_default_table_engine`), ordered by the `PRIMARY KEY`.
   `CREATE TABLE` runs on the node you are connected to only; for a cluster, use `clickhouse_execute` with
   `ON CLUSTER`.
 - **`UPDATE` and `DELETE`** become one ClickHouse statement each: an `ALTER TABLE … UPDATE` mutation, or a
   lightweight `DELETE` (MergeTree tables). The `WHERE` and `SET` clauses can use the table's own columns,
   constants, comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, arithmetic, `LIKE`, `CASE`, `coalesce`, casts and common
-  string functions. Joins, subqueries, `UPDATE … FROM` and other functions are rejected before anything runs. The
+  string functions; columns read as text but stored as another type (`IPv4`, `FixedString`, …) can only be set to
+  constants. Joins, subqueries, `UPDATE … FROM` and other functions are rejected before anything runs. The
   result is the one DuckDB would compute, with a few exceptions where ClickHouse's own rules apply: `NaN`
   comparisons, integer overflow (it wraps instead of raising an error), division by zero (an error in ClickHouse)
   and byte-wise `LIKE`.

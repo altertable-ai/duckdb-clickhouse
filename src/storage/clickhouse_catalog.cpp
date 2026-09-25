@@ -158,7 +158,8 @@ void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 		{
 			auto connection = connection_pool->GetConnection();
 			for (auto &block : connection->Query("SELECT count() FROM system.tables WHERE database = " +
-			                                     ClickhouseUtils::QuoteLiteral(database))) {
+			                                         ClickhouseUtils::QuoteLiteral(database),
+			                                     ClickhouseDml::SemanticSettings())) {
 				if (block.GetRowCount() > 0) {
 					table_count = block[0]->As<clickhouse::ColumnUInt64>()->At(0);
 				}
