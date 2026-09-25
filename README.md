@@ -201,10 +201,17 @@ lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`
   - conditions and `SET` values reading `DateTime64` columns with a precision above 6 (DuckDB reads them truncated
     to microseconds) or `FixedString` columns (DuckDB sees their padding); such columns can still be assigned;
   - casts between `TIMESTAMP WITH TIME ZONE` and `DATE`, `TIMESTAMP`, `VARCHAR` or `TIME`, which DuckDB converts in
-    its `TimeZone` setting and ClickHouse in the column's or server's time zone.
+    its `TimeZone` setting and ClickHouse in the column's or server's time zone;
+  - casts to `VARCHAR`, written or implicit (`||`, `LIKE`, … on a non-string), except from integers, `DATE` and
+    `ENUM`: ClickHouse formats floating-point, `DECIMAL`, timestamp and other values differently.
 - A condition DuckDB proves always false (e.g. `WHERE 1 = 0`) updates or deletes nothing and sends nothing.
 - The translated statement follows ClickHouse semantics where they differ from DuckDB's (e.g. `NaN` comparisons,
-  `UUID` ordering, integer division and division by zero, and explicit `CAST`s).
+  `UUID` ordering, integer division and division by zero, and explicit `CAST`s). In `UPDATE`, arithmetic overflow and
+  out-of-range values wrap in ClickHouse instead of raising an error (e.g. `SET u = u - 1` on a `UInt32` holding 0
+  writes 4294967295).
+- `UPDATE` runs as an `ALTER TABLE … UPDATE` mutation. If it fails while running (e.g. a value that does not convert
+  to the column's type, or `NULL` into a non-`Nullable` column), it can stay in `system.mutations` and block later
+  mutations on the table until you run `KILL MUTATION WHERE …` via `clickhouse_execute`.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

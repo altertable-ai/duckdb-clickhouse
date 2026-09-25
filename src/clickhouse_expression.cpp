@@ -96,6 +96,30 @@ static string LikePattern(const Expression &pattern) {
 	return ClickhouseUtils::QuoteLiteral(StringUtil::Replace(StringValue::Get(value), "\\", "\\\\"));
 }
 
+//! Types whose VARCHAR form is the same text in DuckDB and ClickHouse (CAST(x AS String)). Any other cast to VARCHAR
+//! is rejected, whether written or implicit (e.g. the operands of ||, LIKE, contains): a DOUBLE, DECIMAL, TIMESTAMP,
+//! ... would be formatted differently (e.g. DuckDB's 1.0 is ClickHouse's 1)
+static bool HasSameTextForm(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::ENUM:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::DATE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static string TranslateFunction(const BoundFunctionExpression &function, const std::function<string(idx_t)> &resolve) {
 	auto &name = function.function.name;
 	auto &children = function.children;
@@ -120,7 +144,9 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 		return "(" + arg(0) + (negated ? " NOT " : " ") + keyword + " " + LikePattern(*children[1]) + ")";
 	}
 	if (children.size() == 2 && name == "||" && is_string(0) && is_string(1)) {
-		// NULL if either side is NULL, in both (unlike DuckDB's concat(), which skips NULLs)
+		// NULL if either side is NULL, in both (unlike DuckDB's concat(), which skips NULLs). DuckDB's binder casts a
+		// non-VARCHAR operand to VARCHAR implicitly (BindConcatOperator): that cast is checked like any other, see
+		// HasSameTextForm
 		return "concat(" + arg(0) + ", " + arg(1) + ")";
 	}
 	if (children.size() == 2 && (name == "starts_with" || name == "prefix")) {
@@ -266,6 +292,10 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 			// time zone
 			throw NotImplementedException("cast from %s to %s depends on the time zone: %s", source_type.ToString(),
 			                              cast.return_type.ToString(), expr.ToString());
+		}
+		if (cast.return_type.id() == LogicalTypeId::VARCHAR && !HasSameTextForm(source_type)) {
+			throw NotImplementedException("cast from %s to VARCHAR, which ClickHouse formats differently: %s",
+			                              source_type.ToString(), expr.ToString());
 		}
 		string type;
 		try {

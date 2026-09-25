@@ -94,45 +94,129 @@ static idx_t MarkJoinLeftCount(const LogicalComparisonJoin &join) {
 	return join.left_projection_map.empty() ? join.children[0]->types.size() : join.left_projection_map.size();
 }
 
-//! The IN-list MARK join whose mark column output column `index` of `op` is, passed through filters and projections
-//! as a plain reference; null if it is anything else
-static optional_ptr<const LogicalComparisonJoin> FindMarkJoin(const LogicalOperator &op, idx_t index) {
+//! Where output column `index` of a plan operator comes from, one operator down (StepReference) or followed through
+//! every plain reference (TraceReference). The one walk ResolveOutput, FindMarkJoin and UnchangedScanColumn share
+struct ReferenceStep {
+	enum class Kind : uint8_t {
+		//! The same value as output `index` of `*next`: a filter, a projection of a plain reference, or the left input
+		//! of an IN-list MARK join
+		PASS_THROUGH,
+		//! Table column `column_id` (possibly a virtual column) of the LogicalGet `*op`
+		SCAN_COLUMN,
+		//! Computed by `op->expressions[index]` of the LogicalProjection `*op`, which is not a plain reference
+		PROJECTION_EXPRESSION,
+		//! The mark column of the IN-list MARK join `*op` (validated)
+		MARK_COLUMN,
+		//! Anything else, e.g. another operator or an index outside an operator's output; `reason` says why
+		UNRESOLVED
+	};
+	Kind kind;
+	//! The operator the step (or trace) stopped at
+	const LogicalOperator *op;
+	idx_t index;
+	//! PASS_THROUGH only
+	const LogicalOperator *next = nullptr;
+	//! SCAN_COLUMN only
+	column_t column_id = 0;
+	//! UNRESOLVED only
+	string reason;
+};
+
+static ReferenceStep Unresolved(const LogicalOperator &op, idx_t index, string reason) {
+	ReferenceStep step {ReferenceStep::Kind::UNRESOLVED, &op, index};
+	step.reason = std::move(reason);
+	return step;
+}
+
+static ReferenceStep PassThrough(const LogicalOperator &op, idx_t index, idx_t child_index) {
+	ReferenceStep step {ReferenceStep::Kind::PASS_THROUGH, &op, child_index};
+	step.next = op.children[0].get();
+	return step;
+}
+
+//! One step down from output column `index` of `op`. Throws "IN list rewritten into a join" for a MARK join over
+//! constants that is not exactly an IN list (see ValidateInListJoin)
+static ReferenceStep StepReference(const LogicalOperator &op, idx_t index) {
 	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		auto &column_ids = get.GetColumnIds();
+		idx_t position = index;
+		if (!get.projection_ids.empty()) {
+			if (index >= get.projection_ids.size()) {
+				return Unresolved(op, index, "reference outside the scan's output");
+			}
+			position = get.projection_ids[index];
+		}
+		if (position >= column_ids.size()) {
+			return Unresolved(op, index, "reference outside the scan's output");
+		}
+		auto &column_index = column_ids[position];
+		if (column_index.HasChildren()) {
+			return Unresolved(op, index, "reference to a nested field pushed into the scan");
+		}
+		ReferenceStep step {ReferenceStep::Kind::SCAN_COLUMN, &op, index};
+		step.column_id = column_index.GetPrimaryIndex();
+		return step;
+	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		auto &filter = op.Cast<LogicalFilter>();
+		idx_t child_index = index;
 		if (!filter.projection_map.empty()) {
 			if (index >= filter.projection_map.size()) {
-				return nullptr;
+				return Unresolved(op, index, "reference outside the filter's output");
 			}
-			index = filter.projection_map[index];
+			child_index = filter.projection_map[index];
 		}
-		return FindMarkJoin(*op.children[0], index);
+		return PassThrough(op, index, child_index);
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		if (index >= op.expressions.size() ||
-		    op.expressions[index]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
-			return nullptr;
+		if (index >= op.expressions.size()) {
+			return Unresolved(op, index, "reference outside the projection's output");
 		}
-		return FindMarkJoin(*op.children[0], op.expressions[index]->Cast<BoundReferenceExpression>().index);
+		auto &expr = *op.expressions[index];
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			return PassThrough(op, index, expr.Cast<BoundReferenceExpression>().index);
+		}
+		return ReferenceStep {ReferenceStep::Kind::PROJECTION_EXPRESSION, &op, index};
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
 		if (!IsInListJoinCandidate(op)) {
-			return nullptr;
+			break;
 		}
 		auto &join = ValidateInListJoin(op);
 		auto left_count = MarkJoinLeftCount(join);
 		if (index == left_count) {
-			return &join;
+			return ReferenceStep {ReferenceStep::Kind::MARK_COLUMN, &op, index};
 		}
 		if (index > left_count) {
-			return nullptr;
+			return Unresolved(op, index, IN_LIST_JOIN);
 		}
-		auto left_index = join.left_projection_map.empty() ? index : join.left_projection_map[index];
-		return FindMarkJoin(*op.children[0], left_index);
+		return PassThrough(op, index, join.left_projection_map.empty() ? index : join.left_projection_map[index]);
 	}
 	default:
+		break;
+	}
+	return Unresolved(op, index, StringUtil::Format("operator %s", LogicalOperatorToString(op.type)));
+}
+
+//! StepReference repeated through every PASS_THROUGH: where output column `index` of `op` really comes from
+static ReferenceStep TraceReference(const LogicalOperator &op, idx_t index) {
+	auto step = StepReference(op, index);
+	while (step.kind == ReferenceStep::Kind::PASS_THROUGH) {
+		step = StepReference(*step.next, step.index);
+	}
+	return step;
+}
+
+//! The IN-list MARK join whose mark column output column `index` of `op` is, passed through filters and projections
+//! as a plain reference; null if it is anything else
+static optional_ptr<const LogicalComparisonJoin> FindMarkJoin(const LogicalOperator &op, idx_t index) {
+	auto traced = TraceReference(op, index);
+	if (traced.kind != ReferenceStep::Kind::MARK_COLUMN) {
 		return nullptr;
 	}
+	return &traced.op->Cast<LogicalComparisonJoin>();
 }
 
 //! A LogicalFilter expression over `input` that is exactly an IN-list mark column (IN) or NOT of one (NOT IN), as
@@ -193,62 +277,26 @@ static bool HasParameters(LogicalOperator &op) {
 }
 
 string ClickhouseDml::ResolveOutput(const LogicalOperator &op, idx_t index) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET: {
-		auto &get = op.Cast<LogicalGet>();
-		auto &column_ids = get.GetColumnIds();
-		idx_t position = index;
-		if (!get.projection_ids.empty()) {
-			if (index >= get.projection_ids.size()) {
-				throw NotImplementedException("reference outside the scan's output");
-			}
-			position = get.projection_ids[index];
-		}
-		if (position >= column_ids.size()) {
-			throw NotImplementedException("reference outside the scan's output");
-		}
-		auto &column_index = column_ids[position];
-		if (column_index.HasChildren()) {
-			throw NotImplementedException("reference to a nested field pushed into the scan");
-		}
-		return ColumnSql(ScanBindData(get), column_index.GetPrimaryIndex());
-	}
-	case LogicalOperatorType::LOGICAL_FILTER: {
-		auto &filter = op.Cast<LogicalFilter>();
-		idx_t child_index = index;
-		if (!filter.projection_map.empty()) {
-			if (index >= filter.projection_map.size()) {
-				throw NotImplementedException("reference outside the filter's output");
-			}
-			child_index = filter.projection_map[index];
-		}
-		return ResolveOutput(*op.children[0], child_index);
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		if (index >= op.expressions.size()) {
-			throw NotImplementedException("reference outside the projection's output");
-		}
+	auto step = StepReference(op, index);
+	if (step.kind == ReferenceStep::Kind::PROJECTION_EXPRESSION ||
+	    (step.kind == ReferenceStep::Kind::PASS_THROUGH && op.type == LogicalOperatorType::LOGICAL_PROJECTION)) {
+		// a projection's output is translated (and parenthesized) as an expression, plain reference or not
 		auto &child = *op.children[0];
 		return "(" +
 		       ClickhouseExpression::Translate(*op.expressions[index],
 		                                       [&](idx_t i) { return ResolveOutput(child, i); }) +
 		       ")";
 	}
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
-		if (!IsInListJoinCandidate(op)) {
-			throw NotImplementedException("operator %s", LogicalOperatorToString(op.type));
-		}
-		auto &join = ValidateInListJoin(op);
-		auto left_count = MarkJoinLeftCount(join);
-		if (index >= left_count) {
-			// the mark column anywhere but as a whole filter expression (or under a NOT), e.g. x IN (...) OR y
-			throw NotImplementedException(IN_LIST_JOIN);
-		}
-		auto left_index = join.left_projection_map.empty() ? index : join.left_projection_map[index];
-		return ResolveOutput(*op.children[0], left_index);
-	}
+	switch (step.kind) {
+	case ReferenceStep::Kind::PASS_THROUGH:
+		return ResolveOutput(*step.next, step.index);
+	case ReferenceStep::Kind::SCAN_COLUMN:
+		return ColumnSql(ScanBindData(op.Cast<LogicalGet>()), step.column_id);
+	case ReferenceStep::Kind::MARK_COLUMN:
+		// the mark column anywhere but as a whole filter expression (or under a NOT), e.g. x IN (...) OR y
+		throw NotImplementedException(IN_LIST_JOIN);
 	default:
-		throw NotImplementedException("operator %s", LogicalOperatorToString(op.type));
+		throw NotImplementedException(step.reason);
 	}
 }
 
@@ -376,55 +424,11 @@ ClickhouseDmlStatement ClickhouseDml::PlanDelete(LogicalDelete &op) {
 //! Structural, so it does not depend on the SQL ResolveOutput would produce for the column (a read expression, or
 //! a rejection for a column that is not compared exactly)
 static optional_idx UnchangedScanColumn(const LogicalOperator &op, idx_t index) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET: {
-		auto &get = op.Cast<LogicalGet>();
-		auto &column_ids = get.GetColumnIds();
-		idx_t position = index;
-		if (!get.projection_ids.empty()) {
-			if (index >= get.projection_ids.size()) {
-				return optional_idx();
-			}
-			position = get.projection_ids[index];
-		}
-		if (position >= column_ids.size() || column_ids[position].HasChildren() ||
-		    IsVirtualColumn(column_ids[position].GetPrimaryIndex())) {
-			return optional_idx();
-		}
-		return column_ids[position].GetPrimaryIndex();
-	}
-	case LogicalOperatorType::LOGICAL_FILTER: {
-		auto &filter = op.Cast<LogicalFilter>();
-		if (!filter.projection_map.empty()) {
-			if (index >= filter.projection_map.size()) {
-				return optional_idx();
-			}
-			index = filter.projection_map[index];
-		}
-		return UnchangedScanColumn(*op.children[0], index);
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		if (index >= op.expressions.size() ||
-		    op.expressions[index]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
-			return optional_idx();
-		}
-		return UnchangedScanColumn(*op.children[0], op.expressions[index]->Cast<BoundReferenceExpression>().index);
-	}
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
-		if (!IsInListJoinCandidate(op)) {
-			return optional_idx();
-		}
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		auto left_count = MarkJoinLeftCount(join);
-		if (index >= left_count) {
-			return optional_idx();
-		}
-		auto left_index = join.left_projection_map.empty() ? index : join.left_projection_map[index];
-		return UnchangedScanColumn(*op.children[0], left_index);
-	}
-	default:
+	auto traced = TraceReference(op, index);
+	if (traced.kind != ReferenceStep::Kind::SCAN_COLUMN || IsVirtualColumn(traced.column_id)) {
 		return optional_idx();
 	}
+	return traced.column_id;
 }
 
 ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, LogicalUpdate &op) {
@@ -444,7 +448,8 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			ThrowUnsupportedShape("UPDATE", "SET of an unknown column");
 		}
 		if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
-			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE; checked before the WHERE is even looked at
+			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE; checked before the matches_nothing and
+			// unbound_parameters early returns, so such a statement is refused even when no row matches
 			ThrowUnsupportedShape("UPDATE", "SET " + columns[op.columns[i].index].name + " = DEFAULT");
 		}
 	}
