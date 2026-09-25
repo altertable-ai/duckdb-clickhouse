@@ -189,7 +189,9 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
 (a mutation; `ch_mutations_sync`, default `2`, decides whether it waits), `DELETE FROM … WHERE …` (a synchronous
 lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
 `SELECT count()` run just before the statement, so it can be off if other clients write at the same time. Both run
-with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `NOT IN` never matches `NULL`s.
+with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `NOT IN` never matches `NULL`s. (The
+setting matters for the count: on ClickHouse 25.8 the `DELETE` and the mutation ignore `transform_null_in`, whether it
+comes from the query or from the server's default profile.)
 
 - The `WHERE` clause must only use the modified table's columns, constants, prepared-statement parameters (`?`,
   `$1`), comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN` lists of constants without `NULL`, `BETWEEN`,
@@ -197,8 +199,11 @@ with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `N
   `coalesce`, `CASE` and `CAST`. Anything else — other functions, subqueries, `USING`, `UPDATE … FROM`, `RETURNING`,
   `SET … = DEFAULT` — is rejected before anything runs; use `clickhouse_execute`. An `IN` list of 5 or more values
   must be a condition of its own (e.g. not inside an `OR`). `SET` values follow the same rules as `WHERE`, and are
-  converted to the column's ClickHouse type with `CAST` (the same conversion an `INSERT` makes). ClickHouse does not
-  update sorting-key columns.
+  converted to the column's ClickHouse type with `CAST`. That conversion is exact, or, for the types an `INSERT`
+  converts on the server (`BFloat16`, `IPv4`/`IPv6`, `(U)Int256`, `Decimal256`, `JSON`, …), the one it makes. A value
+  for a `DateTime` or `DateTime64` column with a precision below 6 is first floored to that precision, as an `INSERT`
+  does (ClickHouse's `CAST` alone truncates toward zero, which differs before 1970). Such timestamps inside an
+  `Array`, `Tuple` or `Map` column are rejected. ClickHouse does not update sorting-key columns.
 - Casts, written or implicit (DuckDB casts every `SET` value to its column's type), give DuckDB's result:
   `FLOAT`/`DOUBLE` to an integer rounds half to even (`roundBankers`), `DECIMAL` to an integer or to a smaller scale
   rounds half away from zero (`round`), e.g. `SET qty = qty / 2` writes 4 for 7 and `SET price = price * 1.1` writes
@@ -213,7 +218,9 @@ with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `N
     its `TimeZone` setting and ClickHouse in the column's or server's time zone;
   - casts to `VARCHAR`, written or implicit (`||`, `LIKE`, … on a non-string), except from integers, `DATE` and
     `ENUM`: ClickHouse formats floating-point, `DECIMAL`, timestamp and other values differently;
-  - casts that round differently in ClickHouse: `FLOAT`/`DOUBLE` or `VARCHAR` to `DECIMAL`, timestamps to a coarser
+  - casts that round differently in ClickHouse: `FLOAT`/`DOUBLE` or `VARCHAR` to `DECIMAL`, `VARCHAR` to `FLOAT` or
+    `DOUBLE` (ClickHouse's parse is not correctly rounded: `'1.7091'` reads as `1.7090999999999998`; a constant such
+    as `'1.5'::DOUBLE` is folded by DuckDB and translates), timestamps to a coarser
     timestamp (`TIMESTAMP` to `TIMESTAMP_S`, `TIMESTAMP_NS` to `TIMESTAMP`, …), `VARCHAR` to `TIMESTAMP_MS` or
     `TIMESTAMP_NS`, `DECIMAL` wider than 15 digits (7 for `FLOAT`) or `HUGEINT` to `FLOAT`/`DOUBLE` (this includes
     `/` on such a `DECIMAL`, which DuckDB computes in `DOUBLE`), and any other cast not known to be exact (e.g.
@@ -228,14 +235,18 @@ with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `N
   - `UUID` ordering;
   - integer division and division by zero (e.g. `x // 0` and `x % 0` fail in ClickHouse where DuckDB returns
     `NULL`);
-  - arithmetic overflow and out-of-range casts, which wrap or saturate in ClickHouse instead of raising an error, in
-    `WHERE` as well as in `SET` (e.g. `SET u = u - 1` on a `UInt32` holding 0 writes 4294967295, and
-    `WHERE b + 1 < 0` matches a `BIGINT` holding its maximum, where DuckDB raises an overflow error);
+  - arithmetic overflow and out-of-range casts, which wrap or saturate in ClickHouse, or exceed a `DECIMAL`
+    column's declared precision, instead of raising an error, in `WHERE` as well as in `SET` (e.g. `SET u = u - 1`
+    on a `UInt32` holding 0 writes 4294967295, `SET d = e` from a `Decimal(3, 2)` holding 9.95 into a `Decimal(2, 1)` stores 10,
+    and `WHERE b + 1 < 0` matches a `BIGINT` holding its maximum, where DuckDB raises an error);
   - `LIKE`/`ILIKE` collation (bytes in ClickHouse);
   - `lower`/`upper`, run as `lowerUTF8`/`upperUTF8`, which differ from DuckDB for a few characters (e.g.
     `upper('ß')` is `ẞ` in DuckDB and `SS` in ClickHouse);
-  - explicit casts that do not round (e.g. `VARCHAR` to an integer or a date) follow ClickHouse's parse rules: a
-    string ClickHouse does not parse fails the statement (e.g. `'2.5'` to `INTEGER`, which DuckDB rounds to 3).
+  - casts from `VARCHAR` that do not round (e.g. to an integer, a date or a `BOOLEAN`), written or implicit (e.g.
+    `SET int_col = varchar_col`), follow ClickHouse's parse rules in both directions: a string ClickHouse does not
+    parse fails the statement (e.g. `'2.5'` to `INTEGER`, which DuckDB rounds to 3), and a string DuckDB rejects can
+    be accepted, so the statement deletes or writes where DuckDB would raise an error (e.g. `'20240101'` as a
+    timestamp is read as Unix seconds, `'on'` as a `BOOLEAN` is true).
 - `UPDATE` runs as an `ALTER TABLE … UPDATE` mutation. If it fails while running (e.g. a value that does not convert
   to the column's type, or `NULL` into a non-`Nullable` column), it can stay in `system.mutations` and block later
   mutations on the table until you run `KILL MUTATION WHERE …` via `clickhouse_execute`.
