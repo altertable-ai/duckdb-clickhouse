@@ -1,0 +1,528 @@
+# name: test/sql/write/ddl_alter_column.test
+# description: ALTER TABLE … ALTER COLUMN (SET/DROP DEFAULT, SET/DROP NOT NULL, TYPE) on attached ClickHouse tables
+# group: [write]
+
+require clickhouse_scanner
+
+require icu
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_alter');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_alter');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.t (id Int32, p Int32, a Nullable(Int32), b Int64, s LowCardinality(String), n Nullable(Int32), d Date32, dec Decimal(10, 2), f Float64, arr Array(Int32), txt Nullable(String), m Int32 MATERIALIZED id * 2) ENGINE = MergeTree PARTITION BY p ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_alter.t (id, p, a, b, s, n, d, dec, f, arr, txt) VALUES (1, 0, 10, 3000000000, ''x'', NULL, ''2024-01-02'', 1.25, 2.5, [1], ''12''), (2, 0, NULL, -1, ''y'', 5, ''1900-01-01'', -3.5, 1.5, [], ''abc'')');
+
+# ---------------------------------------------------------------------------
+# SET DEFAULT / DROP DEFAULT: metadata only, the type is kept
+# ---------------------------------------------------------------------------
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a SET DEFAULT 42;
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT type, default_kind, default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(Int32)	DEFAULT	42
+
+statement ok
+INSERT INTO ch.w_alter.t (id, p, b, s, d, dec, f, arr) VALUES (3, 1, 7, 'z', DATE '2000-01-01', 0, 0, []);
+
+query I
+SELECT a FROM ch.w_alter.t WHERE id = 3;
+----
+42
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT a FROM w_alter.t WHERE id = 3');
+----
+42
+
+statement ok
+DELETE FROM ch.w_alter.t WHERE id = 3;
+
+# the constant is cast to the column's type, like a CREATE TABLE DEFAULT
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a SET DEFAULT '7';
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT type, default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(Int32)	7
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN s SET DEFAULT 'it''s';
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT type, default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''s''');
+----
+LowCardinality(String)	'it\'s'
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN d SET DEFAULT current_date;
+----
+DEFAULT value of column "d" must be a constant for ClickHouse tables
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN a SET DEFAULT random();
+----
+DEFAULT value of column "a" must be a constant for ClickHouse tables
+
+# a MATERIALIZED (or ALIAS) column would silently become a DEFAULT one
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN m SET DEFAULT 1;
+----
+Column "m" of ClickHouse table "t" is MATERIALIZED
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN m DROP DEFAULT;
+----
+Column "m" of ClickHouse table "t" is MATERIALIZED
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN nope SET DEFAULT 1;
+----
+Column with name "nope" does not exist in ClickHouse table "t"
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a DROP DEFAULT;
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT type, default_kind, default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(Int32)	(empty)	(empty)
+
+# nothing to drop: nothing is sent (ClickHouse itself would refuse REMOVE DEFAULT)
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a DROP DEFAULT;
+
+# ---------------------------------------------------------------------------
+# DROP NOT NULL: Nullable(T), inside LowCardinality
+# ---------------------------------------------------------------------------
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN b DROP NOT NULL;
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN s DROP NOT NULL;
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name IN (''b'', ''s'') ORDER BY name');
+----
+b	Nullable(Int64)
+s	LowCardinality(Nullable(String))
+
+query II
+SELECT column_name, "null" FROM (DESCRIBE ch.w_alter.t) WHERE column_name IN ('b', 's') ORDER BY column_name;
+----
+b	YES
+s	YES
+
+# the default survives
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''s''');
+----
+'it\'s'
+
+query II
+SELECT b, s FROM ch.w_alter.t ORDER BY id;
+----
+3000000000	x
+-1	y
+
+# already Nullable: nothing to do
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a DROP NOT NULL;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(Int32)
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN arr DROP NOT NULL;
+----
+Column "arr" (Array(Int32)) cannot be Nullable in ClickHouse
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN id DROP NOT NULL;
+----
+Column "id" is part of the sorting, primary, partition or sampling key of ClickHouse table "t"
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN p DROP NOT NULL;
+----
+Column "p" is part of the sorting, primary, partition or sampling key of ClickHouse table "t"
+
+# ---------------------------------------------------------------------------
+# SET NOT NULL: refused while NULLs are present, and then nothing is sent
+# ---------------------------------------------------------------------------
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN n SET NOT NULL;
+----
+NOT NULL constraint failed: t.n (2 stored row(s) of the ClickHouse table hold NULL, counting deleted rows not purged yet
+
+query II
+SELECT id, n FROM ch.w_alter.t ORDER BY id;
+----
+1	NULL
+2	5
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''n''');
+----
+Nullable(Int32)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_alter'' AND command LIKE ''%MODIFY COLUMN `n`%''');
+----
+0
+
+statement ok
+UPDATE ch.w_alter.t SET n = 0 WHERE n IS NULL;
+
+# row 3, deleted above, is only masked: the mutation would still convert its NULL and fail, leaving the table
+# unreadable behind a stuck mutation
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN n SET NOT NULL;
+----
+NOT NULL constraint failed: t.n (1 stored row(s)
+
+statement ok
+CALL clickhouse_execute('ch', 'ALTER TABLE w_alter.t APPLY DELETED MASK SETTINGS mutations_sync = 2');
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN n SET NOT NULL;
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN s SET NOT NULL;
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name IN (''n'', ''s'') ORDER BY name');
+----
+n	Int32
+s	LowCardinality(String)
+
+query II
+SELECT column_name, "null" FROM (DESCRIBE ch.w_alter.t) WHERE column_name IN ('n', 's') ORDER BY column_name;
+----
+n	NO
+s	NO
+
+query III
+SELECT id, n, s FROM ch.w_alter.t ORDER BY id;
+----
+1	0	x
+2	5	y
+
+# already non-Nullable: nothing to do (the key column included)
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN id SET NOT NULL;
+
+# ---------------------------------------------------------------------------
+# TYPE: only casts every value of which converts exactly (the rules UPDATE casts follow), keeping the Nullable-ness
+# ---------------------------------------------------------------------------
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a TYPE BIGINT;
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT type, default_kind FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(Int64)	(empty)
+
+query II
+SELECT column_type, "null" FROM (DESCRIBE ch.w_alter.t) WHERE column_name = 'a';
+----
+BIGINT	YES
+
+query I
+SELECT a FROM ch.w_alter.t ORDER BY id;
+----
+10
+NULL
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN a TYPE VARCHAR;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''a''');
+----
+Nullable(String)
+
+query I
+SELECT a FROM ch.w_alter.t WHERE a = '10';
+----
+10
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN d TYPE TIMESTAMP;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''d''');
+----
+DateTime64(6, 'UTC')
+
+query I
+SELECT d FROM ch.w_alter.t ORDER BY id;
+----
+2024-01-02 00:00:00+00
+1900-01-01 00:00:00+00
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN dec TYPE DECIMAL(12, 4);
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''dec''');
+----
+Decimal(12, 4)
+
+query I
+SELECT dec FROM ch.w_alter.t ORDER BY id;
+----
+1.2500
+-3.5000
+
+# narrowing wraps out-of-range values, like UPDATE (see "integer overflow" in the README)
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN b TYPE INTEGER;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''b''');
+----
+Nullable(Int32)
+
+query I
+SELECT b FROM ch.w_alter.t ORDER BY id;
+----
+-1294967296
+-1
+
+# the same type: nothing to do (LowCardinality kept)
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN s TYPE VARCHAR;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''s''');
+----
+LowCardinality(String)
+
+# DuckDB rounds these, ClickHouse's CAST truncates
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN f TYPE INTEGER;
+----
+Cannot change the type of column "f" of ClickHouse table "t" from DOUBLE to INTEGER: DuckDB rounds this cast, ClickHouse's CAST truncates
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN dec TYPE DECIMAL(10, 1);
+----
+DuckDB rounds this cast, ClickHouse's CAST truncates
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN dec TYPE FLOAT;
+----
+has no exact ClickHouse translation
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN f TYPE VARCHAR;
+----
+which ClickHouse formats differently
+
+# DateTime64 columns read as TIMESTAMP WITH TIME ZONE
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN d TYPE DATE;
+----
+depends on the time zone
+
+# a value that does not convert: refused before anything is sent
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN txt TYPE INTEGER;
+----
+Cannot change the type of column "txt" of ClickHouse table "t" to INTEGER: 1 stored value(s) do not convert
+
+query II
+SELECT id, txt FROM ch.w_alter.t ORDER BY id;
+----
+1	12
+2	abc
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''txt''');
+----
+Nullable(String)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_alter'' AND NOT is_done');
+----
+0
+
+statement ok
+UPDATE ch.w_alter.t SET txt = '34' WHERE id = 2;
+
+# a deleted, not yet purged row still counts
+statement ok
+INSERT INTO ch.w_alter.t (id, p, b, s, n, d, dec, f, arr, txt) VALUES (4, 1, 0, 'w', 0, TIMESTAMP '2000-01-01', 0, 0, [], 'zz');
+
+statement ok
+DELETE FROM ch.w_alter.t WHERE id = 4;
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN txt TYPE INTEGER;
+----
+1 stored value(s) do not convert
+
+statement ok
+CALL clickhouse_execute('ch', 'ALTER TABLE w_alter.t APPLY DELETED MASK SETTINGS mutations_sync = 2');
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN txt TYPE INTEGER;
+
+query II
+SELECT id, txt FROM ch.w_alter.t ORDER BY id;
+----
+1	12
+2	34
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''txt''');
+----
+Nullable(Int32)
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN n TYPE BIGINT USING n + 1;
+----
+ALTER COLUMN … TYPE … USING is not supported for ClickHouse tables
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN id TYPE BIGINT;
+----
+Column "id" is part of the sorting, primary, partition or sampling key of ClickHouse table "t"
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN arr TYPE BIGINT[];
+----
+Cannot change the type of column "arr" of ClickHouse table "t": only scalar columns
+
+statement error
+ALTER TABLE ch.w_alter.t ALTER COLUMN n TYPE INTEGER[];
+----
+Cannot change the type of column "n" of ClickHouse table "t": only scalar columns
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT type FROM system.columns WHERE database = ''w_alter'' AND table = ''t'' AND name = ''id''');
+----
+Int32
+
+# ---------------------------------------------------------------------------
+# type and NOT NULL changes are mutations: sent with mutations_sync = ch_mutations_sync
+# ---------------------------------------------------------------------------
+statement ok
+SET ch_mutations_sync = 1;
+
+statement ok
+ALTER TABLE ch.w_alter.t ALTER COLUMN n TYPE BIGINT;
+
+statement ok
+RESET ch_mutations_sync;
+
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT query, Settings[''mutations_sync''] FROM system.query_log WHERE type = ''QueryFinish'' AND query LIKE ''ALTER TABLE `w_alter`.`t` MODIFY COLUMN%'' AND (query LIKE ''%`a` Nullable(Int64)%'' OR query LIKE ''%`n` Int64%'') ORDER BY event_time_microseconds');
+----
+ALTER TABLE `w_alter`.`t` MODIFY COLUMN `a` Nullable(Int64)	2
+ALTER TABLE `w_alter`.`t` MODIFY COLUMN `n` Int64	1
+
+# ---------------------------------------------------------------------------
+# other engines: Memory supports them; ClickHouse's own error elsewhere; views are refused
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.mem (id Int32, v Nullable(Int32)) ENGINE = Memory');
+
+statement ok
+INSERT INTO ch.w_alter.mem VALUES (1, NULL), (2, 3);
+
+statement error
+ALTER TABLE ch.w_alter.mem ALTER COLUMN v SET NOT NULL;
+----
+NOT NULL constraint failed: mem.v
+
+statement ok
+ALTER TABLE ch.w_alter.mem ALTER COLUMN v TYPE BIGINT;
+
+statement ok
+ALTER TABLE ch.w_alter.mem ALTER COLUMN id DROP NOT NULL;
+
+statement ok
+ALTER TABLE ch.w_alter.mem ALTER COLUMN v SET DEFAULT 9;
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type, default_expression FROM system.columns WHERE database = ''w_alter'' AND table = ''mem'' ORDER BY position');
+----
+id	Nullable(Int32)	(empty)
+v	Nullable(Int64)	9
+
+query II
+SELECT * FROM ch.w_alter.mem ORDER BY id;
+----
+1	NULL
+2	3
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_alter.log (id Int32) ENGINE = Log');
+
+statement error
+ALTER TABLE ch.w_alter.log ALTER COLUMN id TYPE BIGINT;
+----
+<REGEX>:.*ClickHouse error 48 \(NOT_IMPLEMENTED\).*
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_alter.v AS SELECT 1 AS one');
+
+statement error
+ALTER TABLE ch.w_alter.v ALTER COLUMN one SET DEFAULT 2;
+----
+is a ClickHouse view (engine View), which ALTER TABLE cannot modify
+
+statement error
+ALTER TABLE ch.w_alter.v ALTER COLUMN one TYPE BIGINT;
+----
+is a ClickHouse view (engine View), which ALTER TABLE cannot modify
+
+statement error
+ALTER TABLE ch.w_alter.v ALTER COLUMN one DROP NOT NULL;
+----
+is a ClickHouse view (engine View), which ALTER TABLE cannot modify
+
+# ---------------------------------------------------------------------------
+# everything else still points to clickhouse_execute()
+# ---------------------------------------------------------------------------
+statement error
+ALTER TABLE ch.w_alter.t SET PARTITIONED BY (id);
+----
+run it with clickhouse_execute() instead
+
+statement error
+ALTER TABLE ch.w_alter.t SET SORTED BY (id);
+----
+run it with clickhouse_execute() instead
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_alter');

@@ -12,6 +12,14 @@ class ColumnDefinition;
 struct AlterTableInfo;
 struct CreateTableInfo;
 
+//! The ClickHouse statement an ALTER TABLE becomes
+struct ClickhouseAlterStatement {
+	//! Empty when there is nothing to send
+	string sql;
+	//! A mutation (a type or Nullable change): sent with mutations_sync = ch_mutations_sync
+	bool mutation = false;
+};
+
 //! Builds and runs the ClickHouse DDL for DuckDB DDL statements
 class ClickhouseDdl {
 public:
@@ -33,7 +41,8 @@ public:
 	//! entries are retired and stay valid until the current transaction ends (see ClickhouseTransactionManager);
 	//! methods of a cached schema entry also hold catalog.GetSchemaEntryOwner(<their name>) across the call
 	//! (belt-and-braces)
-	static void Execute(ClientContext &context, ClickhouseCatalog &catalog, const string &sql);
+	static void Execute(ClientContext &context, ClickhouseCatalog &catalog, const string &sql,
+	                    const vector<std::pair<string, string>> &settings = {});
 	//! The (freshly loaded) table entry, or null
 	static optional_ptr<ClickhouseTableEntry> LookupTable(ClientContext &context, ClickhouseCatalog &catalog,
 	                                                      const string &database, const string &table);
@@ -41,13 +50,18 @@ public:
 	//! an existing table, returns the existing table's entry
 	static ClickhouseTableEntry &CreateTable(ClientContext &context, ClickhouseCatalog &catalog,
 	                                         const string &database, CreateTableInfo &info);
-	//! ALTER TABLE ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] / RENAME COLUMN, or RENAME TABLE; anything
-	//! else throws NotImplementedException. Column names are resolved against the table's ClickHouse columns the
-	//! way DuckDB resolves identifiers, case-insensitively (see ResolveColumn()), and the statement uses the real
-	//! ClickHouse name. Returns an empty string when there is nothing to send: ADD COLUMN IF NOT EXISTS of a column
-	//! that exists, DROP COLUMN IF EXISTS of one that does not
-	static string AlterTableSql(ClientContext &context, const string &database, const ClickhouseTableEntry &table,
-	                            AlterTableInfo &info);
+	//! ALTER TABLE ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] / RENAME COLUMN, RENAME TABLE, or ALTER
+	//! COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL and TYPE (MODIFY COLUMN); anything else throws
+	//! NotImplementedException. Column names are resolved against the table's ClickHouse columns the way DuckDB
+	//! resolves identifiers, case-insensitively (see ResolveColumn()), and the statement uses the real ClickHouse
+	//! name. The ALTER COLUMN forms read the column's current type, default and key membership from the server and,
+	//! for SET NOT NULL and TYPE, check every existing value first, so a mutation that would fail -- and leave the
+	//! table unreadable behind a stuck mutation -- is never sent. The statement is empty when there is nothing to
+	//! send: ADD COLUMN IF NOT EXISTS of a column that exists, DROP COLUMN IF EXISTS of one that does not, DROP
+	//! DEFAULT without a default, a NOT NULL change or TYPE that the column already matches
+	static ClickhouseAlterStatement AlterTable(ClientContext &context, ClickhouseCatalog &catalog,
+	                                           const string &database, const ClickhouseTableEntry &table,
+	                                           AlterTableInfo &info);
 	//! The ClickHouse column of `table` that the DuckDB identifier `name` refers to: the exact (case-sensitive) match,
 	//! else the only case-insensitive one. Null if there is none; CatalogException if several columns match only
 	//! case-insensitively

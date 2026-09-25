@@ -575,13 +575,17 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	}
 	result.sql = result.description + " " + StringUtil::Join(assignments, ", ") + " WHERE " + where;
 	result.settings = SemanticSettings();
+	result.settings.push_back(MutationsSyncSetting(context));
+	return result;
+}
+
+std::pair<string, string> ClickhouseDml::MutationsSyncSetting(ClientContext &context) {
 	Value mutations_sync;
 	string sync = "2";
 	if (context.TryGetCurrentSetting("ch_mutations_sync", mutations_sync) && !mutations_sync.IsNull()) {
 		sync = mutations_sync.ToString();
 	}
-	result.settings.emplace_back("mutations_sync", sync);
-	return result;
+	return {"mutations_sync", sync};
 }
 
 ClickhouseDmlOperator::ClickhouseDmlOperator(PhysicalPlan &physical_plan, LogicalOperator &op,

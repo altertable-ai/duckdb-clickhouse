@@ -110,12 +110,7 @@ SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.tables WHERE datab
 u
 
 statement error
-ALTER TABLE ch.w_ddl2.u ALTER COLUMN b TYPE INTEGER;
-----
-is not supported for ClickHouse tables
-
-statement error
-ALTER TABLE ch.w_ddl2.u ALTER COLUMN b SET DEFAULT 'z';
+ALTER TABLE ch.w_ddl2.u SET PARTITIONED BY (id);
 ----
 is not supported for ClickHouse tables
 

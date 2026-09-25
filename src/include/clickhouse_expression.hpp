@@ -28,6 +28,9 @@ public:
 	//! translation (e.g. DOUBLE or VARCHAR to DECIMAL, time-zone-dependent casts, most casts to VARCHAR)
 	static string Cast(const string &sql, const LogicalType &source, const LogicalType &target,
 	                   const string &clickhouse_type);
+	//! Throws NotImplementedException, with the reason, unless a plain ClickHouse CAST from `source` to `target`
+	//! gives DuckDB's result: casts Cast() rounds first (e.g. DOUBLE to INTEGER) are refused too
+	static void CheckPlainCast(const LogicalType &source, const LogicalType &target);
 	//! A filter DuckDB pushed into a scan (LogicalGet::table_filters) on `column` (ClickHouse SQL for a column of
 	//! DuckDB type `column_type`), translated exactly through Translate(). Never narrows a predicate by dropping a
 	//! part: returns "" only for an OPTIONAL_FILTER (a hint: DuckDB keeps its exact predicate in a LogicalFilter

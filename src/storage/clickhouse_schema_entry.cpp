@@ -10,6 +10,7 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_ddl.hpp"
+#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -98,15 +99,22 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		    "clickhouse_execute() instead",
 		    table.name, table.ViewLikeKind(), table.GetEngine());
 	}
+	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
+	// the ALTER COLUMN checks read the server before anything is written: refuse a READ_ONLY attach first
+	ch_catalog.ThrowIfReadOnly();
 	// built before Execute() clears the cache and retires `entry`
-	auto sql = ClickhouseDdl::AlterTableSql(context, name, table, alter);
-	if (sql.empty()) {
-		// ADD COLUMN IF NOT EXISTS of an existing column, DROP COLUMN IF EXISTS of a missing one
+	auto statement = ClickhouseDdl::AlterTable(context, ch_catalog, name, table, alter);
+	if (statement.sql.empty()) {
+		// nothing to change (see ClickhouseDdl::AlterTable)
 		return;
 	}
-	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
+	vector<std::pair<string, string>> settings;
+	if (statement.mutation) {
+		settings.push_back(ClickhouseDml::MutationsSyncSetting(context));
+	}
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
-	ClickhouseDdl::Execute(context, ch_catalog, sql);
+	// the cleared cache makes the new type or nullability visible at once
+	ClickhouseDdl::Execute(context, ch_catalog, statement.sql, settings);
 }
 
 void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {

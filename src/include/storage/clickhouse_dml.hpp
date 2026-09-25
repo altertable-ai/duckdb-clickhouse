@@ -74,6 +74,8 @@ public:
 	//! Query settings the count and the statement both run with, whatever the ATTACH's settings= holds
 	//! (transform_null_in = 0). Only the count depends on them: the translated predicate does not (see InList)
 	static vector<std::pair<string, string>> SemanticSettings();
+	//! {"mutations_sync", <ch_mutations_sync>}: sent with every mutation (UPDATE, ALTER TABLE … ALTER COLUMN)
+	static std::pair<string, string> MutationsSyncSetting(ClientContext &context);
 };
 
 //! Runs a ClickhouseDmlStatement once: the count, then the statement, on one write connection. Emits the count

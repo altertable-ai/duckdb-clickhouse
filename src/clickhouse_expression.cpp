@@ -355,6 +355,12 @@ string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, 
 	return CastSql(ClassifyCast(source, target), sql, target, clickhouse_type);
 }
 
+void ClickhouseExpression::CheckPlainCast(const LogicalType &source, const LogicalType &target) {
+	if (ClassifyCast(source, target) != CastRounding::NONE) {
+		throw NotImplementedException("DuckDB rounds this cast, ClickHouse's CAST truncates");
+	}
+}
+
 //! DuckDB computes FLOAT arithmetic in single precision, ClickHouse promotes Float32 to Float64: rounding the
 //! Float64 result of + - * / (or of a negation) of two Float32 values to Float32 gives the single-precision result
 static string ArithmeticResult(const BoundFunctionExpression &function, const string &sql) {

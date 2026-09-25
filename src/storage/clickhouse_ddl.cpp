@@ -2,13 +2,17 @@
 
 #include "clickhouse_ddl_types.hpp"
 #include "clickhouse_expression.hpp"
+#include "clickhouse_types.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/list.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -37,7 +41,7 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 	// requires every function in the tree to be FunctionStability::CONSISTENT, which excludes those.
 	if (!bound->IsFoldable() || !bound->IsConsistent()) {
 		throw NotImplementedException("DEFAULT value of column \"%s\" must be a constant for ClickHouse tables (got "
-		                              "%s); create the table with clickhouse_execute() instead",
+		                              "%s); use clickhouse_execute() instead",
 		                              column.Name(), column.DefaultValue().ToString());
 	}
 	auto value = ExpressionExecutor::EvaluateScalar(context, *bound);
@@ -47,7 +51,7 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 		return " DEFAULT " + ClickhouseExpression::Literal(value);
 	} catch (NotImplementedException &) {
 		throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
-		                              "ClickHouse literal; create the table with clickhouse_execute() instead",
+		                              "ClickHouse literal; use clickhouse_execute() instead",
 		                              value.ToString(), column.Name(), value.type().ToString());
 	}
 }
@@ -198,11 +202,14 @@ string ClickhouseDdl::CreateTableSql(ClientContext &context, const string &datab
 	return sql;
 }
 
-void ClickhouseDdl::Execute(ClientContext &context, ClickhouseCatalog &catalog, const string &sql) {
+void ClickhouseDdl::Execute(ClientContext &context, ClickhouseCatalog &catalog, const string &sql,
+                            const vector<std::pair<string, string>> &settings) {
 	try {
 		auto connection = catalog.StartWrite(context);
 		// Time/Time64 columns need this setting (ClickHouse 25.x); servers that do not know it ignore it
-		connection->Execute(sql, {{"enable_time_time64_type", "1"}});
+		vector<std::pair<string, string>> query_settings {{"enable_time_time64_type", "1"}};
+		query_settings.insert(query_settings.end(), settings.begin(), settings.end());
+		connection->Execute(sql, query_settings);
 	} catch (...) {
 		// a failed statement can still have changed something
 		catalog.ClearCache();
@@ -264,8 +271,265 @@ static string SpelledAs(const ClickhouseColumnInfo &column, const string &name) 
 	return column.name == name ? string() : " (ClickHouse column \"" + column.name + "\")";
 }
 
-string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &database, const ClickhouseTableEntry &table,
-                                    AlterTableInfo &info) {
+static const ClickhouseColumnInfo &RequireColumn(const ClickhouseTableEntry &table, const string &name) {
+	auto column = ClickhouseDdl::ResolveColumn(table, name);
+	if (!column) {
+		throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"", name, table.name);
+	}
+	return *column;
+}
+
+//! A column as the server has it now: the cached entry may be stale, and a MODIFY COLUMN built from a stale type
+//! would change more than asked
+struct ClickhouseServerColumn {
+	ClickhouseColumnInfo info;
+	//! system.columns.default_kind: "", DEFAULT, MATERIALIZED, ALIAS or EPHEMERAL
+	string default_kind;
+	//! Part of the sorting, primary, partition or sampling key
+	bool in_key = false;
+};
+
+static ClickhouseServerColumn LoadServerColumn(ClickhouseCatalog &catalog, const string &database,
+                                               const ClickhouseTableEntry &table, const string &column) {
+	auto connection = catalog.GetConnectionPool().GetConnection();
+	auto sql = "SELECT type, default_kind, is_in_sorting_key OR is_in_primary_key OR is_in_partition_key OR "
+	           "is_in_sampling_key FROM system.columns WHERE database = " +
+	           ClickhouseUtils::QuoteLiteral(database) + " AND table = " + ClickhouseUtils::QuoteLiteral(table.name) +
+	           " AND name = " + ClickhouseUtils::QuoteLiteral(column);
+	for (auto &block : connection->Query(sql)) {
+		if (block.GetRowCount() == 0) {
+			continue;
+		}
+		ClickhouseServerColumn result;
+		result.info = ClickhouseColumnInfo::Create(column, string(block[0]->As<clickhouse::ColumnString>()->At(0)));
+		result.default_kind = string(block[1]->As<clickhouse::ColumnString>()->At(0));
+		result.in_key = block[2]->As<clickhouse::ColumnUInt8>()->At(0) != 0;
+		return result;
+	}
+	throw CatalogException("Column \"%s\" of ClickHouse table \"%s\" no longer exists; run CALL "
+	                       "clickhouse_clear_cache() and retry",
+	                       column, table.name);
+}
+
+//! How many rows of `qualified` satisfy `condition`, counting the rows a lightweight DELETE only masked: a mutation
+//! still rewrites (and converts) them. countIf, not WHERE: ClickHouse 25.8 answers WHERE n IS NULL with 0 for masked
+//! rows even with apply_deleted_mask = 0
+static uint64_t CountStoredRows(ClickhouseCatalog &catalog, const string &qualified, const string &condition) {
+	auto connection = catalog.GetConnectionPool().GetConnection();
+	uint64_t count = 0;
+	for (auto &block :
+	     connection->Query("SELECT countIf(" + condition + ") FROM " + qualified, {{"apply_deleted_mask", "0"}})) {
+		if (block.GetRowCount() > 0) {
+			count = block[0]->As<clickhouse::ColumnUInt64>()->At(0);
+		}
+	}
+	return count;
+}
+
+//! Type and NOT NULL changes rewrite the column: ClickHouse refuses them on key columns (ALTER_OF_COLUMN_IS_FORBIDDEN),
+//! and an ALIAS column holds no data to convert
+static void ThrowIfNotRewritable(const ClickhouseServerColumn &column, const ClickhouseTableEntry &table) {
+	if (column.in_key) {
+		throw NotImplementedException("Column \"%s\" is part of the sorting, primary, partition or sampling key of "
+		                              "ClickHouse table \"%s\", whose type ClickHouse cannot change",
+		                              column.info.name, table.name);
+	}
+	if (column.default_kind == "ALIAS") {
+		throw NotImplementedException("Column \"%s\" of ClickHouse table \"%s\" is an ALIAS; change it with "
+		                              "clickhouse_execute() instead",
+		                              column.info.name, table.name);
+	}
+}
+
+//! Types ClickHouse cannot wrap in Nullable
+static bool CanBeNullable(const ClickhouseTypeNode &node) {
+	static const unordered_set<string> NOT_NULLABLE = {"Array",
+	                                                   "Tuple",
+	                                                   "Map",
+	                                                   "Nested",
+	                                                   "JSON",
+	                                                   "Object",
+	                                                   "Variant",
+	                                                   "Dynamic",
+	                                                   "Point",
+	                                                   "Ring",
+	                                                   "LineString",
+	                                                   "MultiLineString",
+	                                                   "Polygon",
+	                                                   "MultiPolygon",
+	                                                   "Geometry",
+	                                                   "AggregateFunction",
+	                                                   "SimpleAggregateFunction",
+	                                                   "Nothing"};
+	return NOT_NULLABLE.find(node.name) == NOT_NULLABLE.end();
+}
+
+static string ModifyColumn(const string &qualified, const ClickhouseColumnInfo &column, const string &rest) {
+	return "ALTER TABLE " + qualified + " MODIFY COLUMN " + ClickhouseUtils::QuoteIdentifier(column.name) + " " + rest;
+}
+
+static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCatalog &catalog, const string &database,
+                                           const ClickhouseTableEntry &table, SetDefaultInfo &info) {
+	auto &cached = RequireColumn(table, info.column_name);
+	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	if (column.default_kind == "MATERIALIZED" || column.default_kind == "ALIAS") {
+		// MODIFY COLUMN … DEFAULT would silently turn it into a DEFAULT column
+		throw NotImplementedException("Column \"%s\" of ClickHouse table \"%s\" is %s, not a column with a DEFAULT; "
+		                              "change it with clickhouse_execute() instead",
+		                              column.info.name, table.name, column.default_kind);
+	}
+	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
+	if (!info.expression) {
+		// DROP DEFAULT: ClickHouse refuses REMOVE DEFAULT for a column without one
+		if (column.default_kind.empty()) {
+			return {};
+		}
+		return {ModifyColumn(qualified, column.info, "REMOVE DEFAULT")};
+	}
+	// ClickHouse keeps the column's type: only the default is replaced
+	ColumnDefinition definition(column.info.name, column.info.type);
+	definition.SetDefaultValue(info.expression->Copy());
+	return {ModifyColumn(qualified, column.info, ClickhouseDdl::DefaultValueSql(context, definition).substr(1))};
+}
+
+static ClickhouseAlterStatement ChangeNullability(ClickhouseCatalog &catalog, const string &database,
+                                                  const ClickhouseTableEntry &table, const string &name,
+                                                  bool nullable) {
+	auto &cached = RequireColumn(table, name);
+	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	auto &node = column.info.type_node;
+	if (ClickhouseTypes::IsNullable(node) == nullable) {
+		return {};
+	}
+	ThrowIfNotRewritable(column, table);
+	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
+	auto low_cardinality = node.name == "LowCardinality" && node.children.size() == 1;
+	auto &inner = low_cardinality ? node.children[0] : node;
+	string type;
+	if (nullable) {
+		if (!CanBeNullable(inner)) {
+			throw NotImplementedException("Column \"%s\" (%s) cannot be Nullable in ClickHouse", column.info.name,
+			                              column.info.clickhouse_type);
+		}
+		type = "Nullable(" + inner.text + ")";
+	} else {
+		if (inner.name != "Nullable" || inner.children.size() != 1) {
+			throw NotImplementedException("Column \"%s\" (%s) cannot be made NOT NULL through ALTER TABLE; change it "
+			                              "with clickhouse_execute() instead",
+			                              column.info.name, column.info.clickhouse_type);
+		}
+		// converting a NULL to a non-Nullable type fails the mutation, which then blocks the table
+		auto nulls =
+		    CountStoredRows(catalog, qualified, ClickhouseUtils::QuoteIdentifier(column.info.name) + " IS NULL");
+		if (nulls > 0) {
+			throw ConstraintException(
+			    "NOT NULL constraint failed: %s.%s (%d stored row(s) of the ClickHouse table hold "
+			    "NULL, counting deleted rows not purged yet: ALTER TABLE … APPLY DELETED MASK "
+			    "purges those); nothing was changed",
+			    table.name, column.info.name, nulls);
+		}
+		type = inner.children[0].text;
+	}
+	if (low_cardinality) {
+		type = "LowCardinality(" + type + ")";
+	}
+	return {ModifyColumn(qualified, column.info, type), true};
+}
+
+//! The USING-less form: DuckDB's parser makes it CAST(<column> AS <target type>)
+static bool IsPlainTypeChange(const ChangeColumnTypeInfo &info) {
+	if (!info.expression || info.expression->GetExpressionType() != ExpressionType::OPERATOR_CAST) {
+		return false;
+	}
+	auto &cast = info.expression->Cast<CastExpression>();
+	if (cast.try_cast || cast.child->GetExpressionType() != ExpressionType::COLUMN_REF) {
+		return false;
+	}
+	auto &column = cast.child->Cast<ColumnRefExpression>();
+	return !column.IsQualified() && StringUtil::CIEquals(column.GetColumnName(), info.column_name);
+}
+
+static bool IsNested(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::MAP:
+	case LogicalTypeId::UNION:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const string &database,
+                                           const ClickhouseTableEntry &table, ChangeColumnTypeInfo &info) {
+	auto &cached = RequireColumn(table, info.column_name);
+	if (!IsPlainTypeChange(info)) {
+		throw NotImplementedException("ALTER COLUMN … TYPE … USING is not supported for ClickHouse tables; convert "
+		                              "the column with clickhouse_execute() instead");
+	}
+	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	auto &source = column.info.type;
+	auto &target = info.target_type;
+	if (source == target) {
+		return {};
+	}
+	auto &name = column.info.name;
+	if (IsNested(source) || IsNested(target)) {
+		// an element that does not convert becomes NULL (['1', 'x'] to [1, NULL]), which no check here can see
+		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": only scalar "
+		                              "columns can change type through ALTER TABLE; use clickhouse_execute() instead",
+		                              name, table.name);
+	}
+	// the DuckDB-level cast is only what ClickHouse does if the column holds exactly the type DuckDB reads it as:
+	// not, e.g., FixedString (VARCHAR), BFloat16 (FLOAT) or IPv4 (VARCHAR)
+	auto &node = column.info.type_node;
+	auto low_cardinality = node.name == "LowCardinality" && node.children.size() == 1;
+	auto &unwrapped_once = low_cardinality ? node.children[0] : node;
+	auto &base = unwrapped_once.name == "Nullable" && unwrapped_once.children.size() == 1 ? unwrapped_once.children[0]
+	                                                                                      : unwrapped_once;
+	string canonical;
+	try {
+		canonical = ClickhouseDdlTypes::ToClickhouse(source, false);
+	} catch (NotImplementedException &) {
+	}
+	if (base.text != canonical && !(source.id() == LogicalTypeId::DATE && base.name == "Date")) {
+		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": its "
+		                              "ClickHouse type %s is not one DuckDB converts exactly; use clickhouse_execute() "
+		                              "instead",
+		                              name, table.name, column.info.clickhouse_type);
+	}
+	try {
+		ClickhouseExpression::CheckPlainCast(source, target);
+	} catch (NotImplementedException &ex) {
+		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\" from %s to "
+		                              "%s: %s",
+		                              name, table.name, source.ToString(), target.ToString(),
+		                              ErrorData(ex).RawMessage());
+	}
+	ThrowIfNotRewritable(column, table);
+	auto nullable = ClickhouseTypes::IsNullable(node);
+	auto type = ClickhouseDdlTypes::ToClickhouse(target, nullable);
+	// a value that does not convert fails the mutation of a non-Nullable column (and the stuck mutation leaves the
+	// table unreadable), or silently becomes NULL in a Nullable one (CAST('x' AS Nullable(Int32)) is NULL)
+	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
+	auto quoted = ClickhouseUtils::QuoteIdentifier(name);
+	auto failures = CountStoredRows(catalog, qualified,
+	                                quoted + " IS NOT NULL AND CAST(" + quoted + " AS " +
+	                                    ClickhouseDdlTypes::ToClickhouse(target, true) + ") IS NULL");
+	if (failures > 0) {
+		throw InvalidInputException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\" to %s: %d "
+		                            "stored value(s) do not convert (counting deleted rows not purged yet: ALTER "
+		                            "TABLE … APPLY DELETED MASK purges those); nothing was changed",
+		                            name, table.name, target.ToString(), failures);
+	}
+	return {ModifyColumn(qualified, column.info, type), true};
+}
+
+ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, ClickhouseCatalog &catalog,
+                                                   const string &database, const ClickhouseTableEntry &table,
+                                                   AlterTableInfo &info) {
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
 	switch (info.alter_table_type) {
 	case AlterTableType::ADD_COLUMN: {
@@ -275,7 +539,7 @@ string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &databa
 		for (auto &column : table.GetClickhouseColumns()) {
 			if (StringUtil::CIEquals(column.name, new_name)) {
 				if (add.if_column_not_exists) {
-					return string();
+					return {};
 				}
 				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s", new_name,
 				                       table.name, SpelledAs(column, new_name));
@@ -284,22 +548,22 @@ string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &databa
 		// scalar columns are added Nullable (Array/Tuple/Map/JSON never are): DuckDB's ADD COLUMN carries no NOT
 		// NULL constraint
 		// IF NOT EXISTS still sent: the cached column list may be stale
-		return "ALTER TABLE " + qualified + " ADD COLUMN " + (add.if_column_not_exists ? "IF NOT EXISTS " : "") +
-		       ColumnSql(context, add.new_column, true);
+		return {"ALTER TABLE " + qualified + " ADD COLUMN " + (add.if_column_not_exists ? "IF NOT EXISTS " : "") +
+		        ColumnSql(context, add.new_column, true)};
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &remove = info.Cast<RemoveColumnInfo>();
 		auto column = ResolveColumn(table, remove.removed_column);
 		if (!column) {
 			if (remove.if_column_exists) {
-				return string();
+				return {};
 			}
 			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"",
 			                       remove.removed_column, table.name);
 		}
 		// IF EXISTS still sent: the cached column list may be stale
-		return "ALTER TABLE " + qualified + " DROP COLUMN " + (remove.if_column_exists ? "IF EXISTS " : "") +
-		       ClickhouseUtils::QuoteIdentifier(column->name);
+		return {"ALTER TABLE " + qualified + " DROP COLUMN " + (remove.if_column_exists ? "IF EXISTS " : "") +
+		        ClickhouseUtils::QuoteIdentifier(column->name)};
 	}
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename = info.Cast<RenameColumnInfo>();
@@ -315,17 +579,26 @@ string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &databa
 				                       rename.new_name, table.name, SpelledAs(other, rename.new_name));
 			}
 		}
-		return "ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(column->name) +
-		       " TO " + ClickhouseUtils::QuoteIdentifier(rename.new_name);
+		return {"ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(column->name) +
+		        " TO " + ClickhouseUtils::QuoteIdentifier(rename.new_name)};
 	}
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename = info.Cast<RenameTableInfo>();
-		return "RENAME TABLE " + qualified + " TO " + ClickhouseUtils::QualifiedName(database, rename.new_table_name);
+		return {"RENAME TABLE " + qualified + " TO " + ClickhouseUtils::QualifiedName(database, rename.new_table_name)};
 	}
+	case AlterTableType::SET_DEFAULT:
+		return SetDefault(context, catalog, database, table, info.Cast<SetDefaultInfo>());
+	case AlterTableType::DROP_NOT_NULL:
+		return ChangeNullability(catalog, database, table, info.Cast<DropNotNullInfo>().column_name, true);
+	case AlterTableType::SET_NOT_NULL:
+		return ChangeNullability(catalog, database, table, info.Cast<SetNotNullInfo>().column_name, false);
+	case AlterTableType::ALTER_COLUMN_TYPE:
+		return ChangeType(catalog, database, table, info.Cast<ChangeColumnTypeInfo>());
 	default:
 		throw NotImplementedException("This ALTER TABLE operation is not supported for ClickHouse tables (only ADD "
-		                              "COLUMN, DROP COLUMN, RENAME COLUMN and RENAME TO are); run it with "
-		                              "clickhouse_execute() instead");
+		                              "COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO and ALTER COLUMN SET/DROP "
+		                              "DEFAULT, SET/DROP NOT NULL and TYPE are); run it with clickhouse_execute() "
+		                              "instead");
 	}
 }
 
