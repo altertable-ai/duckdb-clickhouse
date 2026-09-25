@@ -22,6 +22,18 @@ include_directories(src/include database-connector/src/include ${CLICKHOUSE_CPP_
 
 add_subdirectory(src)
 
+# DuckDB core is C++11 and emits strong definitions of LogicalType's static
+# constexpr members. These targets are C++17, so GCC emits ODR-uses as
+# STB_GNU_UNIQUE symbols and the loadable extension fails to link with
+# "multiple definition of duckdb::LogicalType::*". -fno-gnu-unique emits them
+# as weak symbols that resolve to the core definitions. Clang does not use
+# GNU unique symbols.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  foreach(clickhouse_target clickhouse_ext clickhouse_ext_storage)
+    target_compile_options(${clickhouse_target} PRIVATE -fno-gnu-unique)
+  endforeach()
+endif()
+
 build_static_extension(${TARGET_NAME} ${ALL_OBJECT_FILES})
 build_loadable_extension(${TARGET_NAME} " " ${ALL_OBJECT_FILES})
 
