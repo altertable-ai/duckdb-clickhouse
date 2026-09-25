@@ -38,6 +38,11 @@ public:
 	static string ReadExpression(const ClickhouseTypeNode &node, const string &expr);
 	//! Whether filters and ORDER BY on a column of this type may be evaluated by ClickHouse
 	static bool SupportsPushdown(const ClickhouseTypeNode &node);
+	//! Whether ClickHouse compares values of this type exactly as DuckDB reads them, which UPDATE/DELETE predicates
+	//! rely on. False (mirroring SupportsPushdown's exclusions) for a type holding, at any nesting level:
+	//! - DateTime64 with a precision above 6, which DuckDB reads floor-truncated to microseconds;
+	//! - FixedString, whose NUL padding DuckDB sees but ClickHouse's `fs = 'ab'` ignores
+	static bool IsComparedExactly(const ClickhouseTypeNode &node);
 	static bool IsNullable(const ClickhouseTypeNode &node);
 };
 

@@ -18,22 +18,28 @@ namespace duckdb {
 	throw NotImplementedException("untranslatable expression: %s", expr.ToString());
 }
 
+//! A FLOAT/DOUBLE value as a ClickHouse Float64 literal (nan and inf included)
+static string FloatingPointLiteral(const Value &value) {
+	auto number = value.GetValue<double>();
+	if (std::isnan(number)) {
+		return "nan";
+	}
+	if (std::isinf(number)) {
+		return number > 0 ? "inf" : "-inf";
+	}
+	return value.ToString();
+}
+
 string ClickhouseExpression::Literal(const Value &value) {
 	if (value.IsNull()) {
 		return "NULL";
 	}
 	switch (value.type().id()) {
 	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE: {
-		auto number = value.GetValue<double>();
-		if (std::isnan(number)) {
-			return "nan";
-		}
-		if (std::isinf(number)) {
-			return number > 0 ? "inf" : "-inf";
-		}
-		return value.ToString();
-	}
+		// a bare 0.1 is a Float64 in ClickHouse, which does not equal the Float32 0.1 a REAL column holds
+		return "toFloat32(" + FloatingPointLiteral(value) + ")";
+	case LogicalTypeId::DOUBLE:
+		return FloatingPointLiteral(value);
 	case LogicalTypeId::UUID:
 		return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
 	case LogicalTypeId::TIMESTAMP:
@@ -46,6 +52,12 @@ string ClickhouseExpression::Literal(const Value &value) {
 	default:
 		return ClickhouseFilterPushdown::TransformConstant(value);
 	}
+}
+
+//! TIMESTAMP WITH TIME ZONE and TIME WITH TIME ZONE: every cast to or from another type (DATE, TIMESTAMP, VARCHAR,
+//! TIME, ...) goes through a time zone
+static bool IsTimeZoneDependent(const LogicalType &type) {
+	return type.id() == LogicalTypeId::TIMESTAMP_TZ || type.id() == LogicalTypeId::TIME_TZ;
 }
 
 static bool IsNullConstant(const Expression &expr) {
@@ -183,6 +195,11 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
 		return resolve(expr.Cast<BoundReferenceExpression>().index);
+	case ExpressionClass::BOUND_PARAMETER:
+		// a parameter whose value is not known yet (PREPARE): when one is supplied, DuckDB's binder emits it as a
+		// constant instead (ExpressionBinder::BindExpression(ParameterExpression &)). ClickhouseDml does not
+		// translate plans holding parameters (see ClickhouseDmlStatement::unbound_parameters)
+		throw NotImplementedException("prepared-statement parameter %s has no value yet", expr.ToString());
 	case ExpressionClass::BOUND_CONSTANT:
 		try {
 			return Literal(expr.Cast<BoundConstantExpression>().value);
@@ -237,6 +254,14 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		auto &cast = expr.Cast<BoundCastExpression>();
 		if (cast.try_cast) {
 			ThrowUntranslatable(expr);
+		}
+		auto &source_type = cast.child->return_type;
+		if (source_type != cast.return_type &&
+		    (IsTimeZoneDependent(source_type) || IsTimeZoneDependent(cast.return_type))) {
+			// DuckDB converts with the session's TimeZone setting, ClickHouse with the column's or the server's
+			// time zone
+			throw NotImplementedException("cast from %s to %s depends on the time zone: %s", source_type.ToString(),
+			                              cast.return_type.ToString(), expr.ToString());
 		}
 		string type;
 		try {

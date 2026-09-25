@@ -473,6 +473,21 @@ bool ClickhouseTypes::SupportsPushdown(const ClickhouseTypeNode &node) {
 	return PUSHDOWN_TYPES.find(type.name) != PUSHDOWN_TYPES.end();
 }
 
+bool ClickhouseTypes::IsComparedExactly(const ClickhouseTypeNode &node) {
+	if (node.name == "FixedString") {
+		return false;
+	}
+	if (node.name == "DateTime64" && ParseIntegerLiteral(node, 0, 3) > 6) {
+		return false;
+	}
+	for (auto &child : node.children) {
+		if (!IsComparedExactly(child)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool ClickhouseTypes::IsNullable(const ClickhouseTypeNode &node) {
 	if (node.name == "Nullable") {
 		return true;

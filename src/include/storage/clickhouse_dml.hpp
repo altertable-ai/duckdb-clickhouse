@@ -13,11 +13,17 @@ struct ClickhouseDmlStatement {
 	string catalog_name;
 	//! For errors and EXPLAIN, e.g. DELETE FROM `db`.`t`
 	string description;
-	//! SELECT count() FROM `db`.`t` [WHERE p]: the affected-row count
+	//! SELECT count() FROM `db`.`t` [WHERE p]: the affected-row count. Empty when no row can match (e.g.
+	//! WHERE 1 = 0): the statement then reports 0 without connecting to ClickHouse
 	string count_sql;
+	//! Empty when there is nothing to run
 	string sql;
 	//! Query-level settings sent with `sql`, e.g. lightweight_deletes_sync
 	vector<std::pair<string, string>> settings;
+	//! The plan holds prepared-statement parameters without values (PREPARE): nothing was translated and running it
+	//! throws. EXECUTE binds the statement again with the values as constants and plans it anew (the catalog reports
+	//! no catalog version, so DuckDB always rebinds, see PreparedStatementData::RequireRebind)
+	bool unbound_parameters = false;
 };
 
 //! The modified table and the exact ClickHouse WHERE predicate of an UPDATE/DELETE plan
@@ -25,8 +31,13 @@ struct ClickhouseDmlTarget {
 	ClickhouseTableEntry &table;
 	//! `db`.`t`
 	string qualified_name;
-	//! Empty: every row
+	//! Empty: every row (unless matches_nothing or unbound_parameters is set)
 	string predicate;
+	//! DuckDB folded the plan to an empty result (e.g. WHERE 1 = 0, WHERE NULL): no row matches
+	bool matches_nothing = false;
+	//! The plan holds prepared-statement parameters without values: nothing was translated (see
+	//! ClickhouseDmlStatement::unbound_parameters)
+	bool unbound_parameters = false;
 };
 
 //! Translates the logical plan of an UPDATE/DELETE on an attached ClickHouse table into one ClickHouse statement.
@@ -35,12 +46,19 @@ struct ClickhouseDmlTarget {
 //! operator's output, and before the child itself is planned
 class ClickhouseDml {
 public:
-	//! Checks the plan below a LogicalDelete/LogicalUpdate: [LogicalProjection | LogicalFilter]* ending at a
-	//! ClickHouse scan of `table`. Collects the exact predicate. Throws NotImplementedException ("<statement> on
-	//! ClickHouse tables must filter only the modified table with translatable expressions (…); …") otherwise
+	//! Checks the plan below a LogicalDelete/LogicalUpdate: [LogicalProjection | LogicalFilter | IN-list MARK join]*
+	//! ending at a ClickHouse scan of `table` (or at a LogicalEmptyResult: matches_nothing). Collects the exact
+	//! predicate. Throws NotImplementedException ("<statement> on ClickHouse tables must filter only the modified table
+	//! with translatable expressions (…); …") otherwise.
+	//!
+	//! An IN-list MARK join is what DuckDB's InClauseRewriter makes of `x [NOT] IN (<5 or more constants>)`: a MARK
+	//! join of the input with a LogicalColumnDataGet of the constants on `x = <constant column>`, whose mark column a
+	//! LogicalFilter above uses as its whole expression (IN) or under a NOT (NOT IN). It translates to x [NOT] IN
+	//! (...); any deviation from exactly that shape rejects the statement
 	static ClickhouseDmlTarget AnalyzeTarget(const string &statement, TableCatalogEntry &table,
 	                                         LogicalOperator &child);
-	//! ClickHouse SQL for output column `index` of `op` (a LogicalGet, LogicalFilter or LogicalProjection)
+	//! ClickHouse SQL for output column `index` of `op` (a LogicalGet, LogicalFilter, LogicalProjection or an IN-list
+	//! MARK join, whose mark column itself is only accepted where AnalyzeTarget translates it)
 	static string ResolveOutput(const LogicalOperator &op, idx_t index);
 	static ClickhouseDmlStatement PlanDelete(LogicalDelete &op);
 	//! Throws the "must filter only the modified table" error for `statement`, with `reason`

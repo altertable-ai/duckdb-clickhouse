@@ -188,13 +188,20 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
 lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
 `SELECT count()` run just before the statement, so it can be off if other clients write at the same time.
 
-- The `WHERE` clause must only use the modified table's columns, constants, comparisons, `AND`/`OR`/`NOT`,
-  `IS [NOT] NULL`, `IN`/`NOT IN` lists without `NULL`, `BETWEEN`, arithmetic, `LIKE`/`ILIKE`, `starts_with`,
-  `ends_with`, `contains`, `lower`, `upper`, `length`, `coalesce`, `CASE` and `CAST`. Anything else — other
-  functions, subqueries, `USING`, `RETURNING`, prepared-statement parameters (`?`, `$1`) — is rejected before
-  anything runs; use `clickhouse_execute`.
+- The `WHERE` clause must only use the modified table's columns, constants, prepared-statement parameters (`?`,
+  `$1`), comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN` lists of constants without `NULL`, `BETWEEN`,
+  arithmetic, `LIKE`/`ILIKE`, `starts_with`, `ends_with`, `contains`, `lower`, `upper`, `length`, `coalesce`, `CASE`
+  and `CAST`. Anything else — other functions, subqueries, `USING`, `RETURNING` — is rejected before anything runs;
+  use `clickhouse_execute`. An `IN` list of 5 or more values must be a condition of its own (e.g. not inside an
+  `OR`).
+- Also rejected, because ClickHouse would not pick the same rows as DuckDB:
+  - conditions on `DateTime64` columns with a precision above 6 (DuckDB reads them truncated to microseconds) and on
+    `FixedString` columns (DuckDB sees their padding);
+  - casts between `TIMESTAMP WITH TIME ZONE` and `DATE`, `TIMESTAMP`, `VARCHAR` or `TIME`, which DuckDB converts in
+    its `TimeZone` setting and ClickHouse in the column's or server's time zone.
+- A condition DuckDB proves always false (e.g. `WHERE 1 = 0`) deletes nothing and sends nothing.
 - The translated statement follows ClickHouse semantics where they differ from DuckDB's (e.g. `NaN` comparisons,
-  `UUID` ordering, integer division and division by zero).
+  `UUID` ordering, integer division and division by zero, and explicit `CAST`s).
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

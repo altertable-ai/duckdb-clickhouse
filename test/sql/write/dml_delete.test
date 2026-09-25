@@ -48,7 +48,8 @@ SELECT list(id ORDER BY id) FROM ch.w_dml.t;
 ----
 [0, 2, 4, 6, 7, 8]
 
-# a filter on a type the scan does not push (Float64): stays in a LogicalFilter
+# a filter on a type a SELECT does not push into ClickHouse (Float64): at the logical level it is still one of the
+# scan's table filters, which DELETE translates like any other
 query I
 DELETE FROM ch.w_dml.t WHERE v > 10.0;
 ----
@@ -82,7 +83,8 @@ DELETE FROM ch.w_dml.t WHERE id = 100;
 ----
 0
 
-# the same with filter pushdown off: the predicate arrives as a LogicalFilter only
+# the same with filter pushdown off: the setting only changes what a SELECT sends to ClickHouse, the DELETE is
+# translated the same way
 statement ok
 SET ch_filter_pushdown = false;
 
@@ -211,6 +213,154 @@ query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
 ----
 1
+
+# ---------------------------------------------------------------------------
+# Float32 constants, converted types, long IN lists, exactness exclusions, parameters
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.x (id Int32, f Float32, name String, ip IPv4, dt DateTime64(9, ''UTC''), fs FixedString(4), ts DateTime64(6, ''UTC'')) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml.x SELECT number, number / 10, concat(''n'', toString(number)), toIPv4(concat(''10.0.0.'', toString(number))), toDateTime64(''2024-01-01 00:00:00.123456789'', 9, ''UTC''), ''ab'', toDateTime64(''2024-01-01 23:30:00'', 6, ''UTC'') FROM numbers(20)');
+
+# a REAL constant is written as toFloat32(…): a Float64 0.1 would not equal the Float32 0.1 the column holds
+query I
+SELECT count(*) FROM ch.w_dml.x WHERE f = 0.1;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.x WHERE f = 0.1;
+----
+1
+
+# IPv4 is read through toString(): the predicate compares the same text DuckDB sees
+query I
+DELETE FROM ch.w_dml.x WHERE ip = '10.0.0.5';
+----
+1
+
+# 5 or more values: DuckDB rewrites the IN list into a MARK join over the constants, translated back into IN
+query I
+DELETE FROM ch.w_dml.x WHERE id IN (2, 4, 6, 8, 10);
+----
+5
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.x;
+----
+[0, 3, 7, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+query I
+DELETE FROM ch.w_dml.x WHERE id NOT IN (0, 3, 7, 9, 11, 12);
+----
+7
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x ORDER BY id)');
+----
+[0, 3, 7, 9, 11, 12]
+
+# NULL in a long IN / NOT IN list, or the list inside a larger expression: rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE id IN (0, 3, 7, 9, NULL);
+----
+IN list holding NULL
+
+statement error
+DELETE FROM ch.w_dml.x WHERE id NOT IN (1, 2, 4, 5, 6, NULL);
+----
+IN list holding NULL
+
+statement error
+DELETE FROM ch.w_dml.x WHERE id IN (0, 3, 7, 9, 11) OR name = 'n12';
+----
+IN list rewritten into a join
+
+# columns ClickHouse does not compare exactly as DuckDB reads them, and time-zone-dependent casts: rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE dt > TIMESTAMPTZ '2024-01-01 00:00:00.123456+00';
+----
+column "dt" (DateTime64(9, 'UTC')) is not compared exactly
+
+statement error
+DELETE FROM ch.w_dml.x WHERE fs = 'ab';
+----
+column "fs" (FixedString(4)) is not compared exactly
+
+statement error
+DELETE FROM ch.w_dml.x WHERE ts::DATE = DATE '2024-01-01';
+----
+cast from TIMESTAMP WITH TIME ZONE to DATE depends on the time zone
+
+# rowid (always NULL for ClickHouse tables): rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE rowid = 0;
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions (filter on a virtual column)
+
+# an always-false predicate: nothing to do
+query I
+DELETE FROM ch.w_dml.x WHERE 1 = 0;
+----
+0
+
+query I
+DELETE FROM ch.w_dml.x WHERE NULL;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.x');
+----
+6
+
+# a backslash in a LIKE pattern is a plain character in DuckDB, doubled for ClickHouse
+statement ok
+INSERT INTO ch.w_dml.x (id, name) VALUES (100, 'a\zb1'), (101, 'a\zb12'), (102, 'azb1');
+
+query I
+DELETE FROM ch.w_dml.x WHERE name LIKE 'a\%b_';
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x WHERE id >= 100 ORDER BY id)');
+----
+[101, 102]
+
+# prepared statements: every EXECUTE plans the DELETE again with the parameter values
+statement ok
+PREPARE del_by_id AS DELETE FROM ch.w_dml.x WHERE id = $1;
+
+query I
+EXECUTE del_by_id(0);
+----
+1
+
+query I
+EXECUTE del_by_id(3);
+----
+1
+
+query I
+EXECUTE del_by_id(3);
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x ORDER BY id)');
+----
+[7, 9, 11, 12, 101, 102]
+
+# dictionaries are not modified
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DICTIONARY w_dml.d (id UInt64, name String) PRIMARY KEY id SOURCE(NULL()) LAYOUT(FLAT()) LIFETIME(0)');
+
+statement error
+DELETE FROM ch.w_dml.d WHERE id = 1;
+----
+is a ClickHouse dictionary
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml');
