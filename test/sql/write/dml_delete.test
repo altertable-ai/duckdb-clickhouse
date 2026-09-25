@@ -424,6 +424,11 @@ cast from DECIMAL(18,2) to DOUBLE has no exact ClickHouse translation
 
 # ...a narrower one converts the same way in both
 query I
+SELECT count(*) FROM ch.w_dml.r WHERE dec / 2 < 0;
+----
+1
+
+query I
 DELETE FROM ch.w_dml.r WHERE dec / 2 < 0;
 ----
 1
@@ -448,6 +453,55 @@ query I
 SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.r');
 ----
 1
+
+# VARCHAR -> DOUBLE/FLOAT is rejected: ClickHouse's parse is not correctly rounded ('1.7091' is read as
+# 1.7090999999999998), so it would delete both rows where DuckDB deletes one
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.vf (id Int32, s String, dbl Float64) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.vf VALUES (1, '1.7091', 1.7091), (2, '2', 2);
+
+query I
+SELECT count(*) FROM ch.w_dml.vf WHERE CAST(s AS DOUBLE) != 1.7091;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.vf WHERE CAST(s AS Float64) != 1.7091');
+----
+2
+
+statement error
+DELETE FROM ch.w_dml.vf WHERE CAST(s AS DOUBLE) != 1.7091;
+----
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vf WHERE CAST(s AS FLOAT) = 2;
+----
+cast from VARCHAR to FLOAT has no exact ClickHouse translation
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vf ORDER BY id)');
+----
+[1, 2]
+
+# a DOUBLE constant written as a string cast is folded into a literal by DuckDB, and translates
+query I
+SELECT count(*) FROM ch.w_dml.vf WHERE dbl = '1.7091'::DOUBLE;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.vf WHERE dbl = '1.7091'::DOUBLE;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vf ORDER BY id)');
+----
+[2]
 
 # ---------------------------------------------------------------------------
 # // and % on FLOAT, DOUBLE and DECIMAL, and FLOAT arithmetic
@@ -553,6 +607,7 @@ DELETE FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8);
 ----
 2
 
+# SET id = id sends no mutation: this covers only the UPDATE's count query
 query I
 UPDATE ch_tn.w_dml.nn SET id = id WHERE n NOT IN (1, 2);
 ----

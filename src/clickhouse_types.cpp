@@ -498,6 +498,18 @@ bool ClickhouseTypes::IsNullable(const ClickhouseTypeNode &node) {
 	return false;
 }
 
+optional_idx ClickhouseTypes::DateTimePrecision(const ClickhouseTypeNode &node) {
+	auto &type = Unwrap(node);
+	if (type.name == "DateTime") {
+		return 0;
+	}
+	if (type.name == "DateTime64") {
+		auto precision = ParseIntegerLiteral(type, 0, 3);
+		return precision < 0 ? optional_idx() : optional_idx(static_cast<idx_t>(precision));
+	}
+	return optional_idx();
+}
+
 ClickhouseColumnInfo ClickhouseColumnInfo::Create(const string &name, const string &clickhouse_type) {
 	ClickhouseColumnInfo result;
 	result.name = name;

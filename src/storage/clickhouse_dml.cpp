@@ -40,7 +40,9 @@ string ClickhouseDml::DisplayName(const TableCatalogEntry &table) {
 
 vector<std::pair<string, string>> ClickhouseDml::SemanticSettings() {
 	// the translation relies on ClickHouse's defaults for these, whatever the ATTACH's settings= says:
-	// transform_null_in = 1 would make x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept)
+	// transform_null_in = 1 would make x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept). It is the
+	// count query that needs it: on ClickHouse 25.8, DELETE and ALTER TABLE … UPDATE ignore transform_null_in,
+	// whether it comes from the query's settings or from the server's default profile
 	return {{"transform_null_in", "0"}};
 }
 
@@ -466,6 +468,28 @@ static optional_idx UnchangedScanColumn(const LogicalOperator &op, idx_t index) 
 	return traced.column_id;
 }
 
+//! `sql`, a TIMESTAMP WITH TIME ZONE, floored to `precision` digits of a second like an INSERT does
+//! (ClickhouseUtils::ScaleTicks). ClickHouse's CAST to a coarser DateTime64 truncates toward zero instead, which
+//! differs before 1970 (1969-12-31 23:59:59.9995 would become 1970-01-01 00:00:00.000); so would its
+//! toStartOfMillisecond()
+static string FloorTimestamp(const string &sql, idx_t precision) {
+	auto micros = "toUnixTimestamp64Micro(CAST(" + sql + " AS " +
+	              ClickhouseDdlTypes::ToClickhouse(LogicalType::TIMESTAMP_TZ, true) + "))";
+	auto micros_per_tick = "1" + string(6 - precision, '0');
+	return "fromUnixTimestamp64Micro(" + micros + " - positiveModulo(" + micros + ", " + micros_per_tick + "), 'UTC')";
+}
+
+//! Whether a DateTime or DateTime64(p < 6) is nested in `node` (an Array, Tuple or Map element)
+static bool HoldsCoarseDateTime(const ClickhouseTypeNode &node) {
+	for (auto &child : node.children) {
+		auto precision = ClickhouseTypes::DateTimePrecision(child);
+		if ((precision.IsValid() && precision.GetIndex() < 6) || HoldsCoarseDateTime(child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, LogicalUpdate &op) {
 	if (op.return_chunk) {
 		throw NotImplementedException("RETURNING is not supported for ClickHouse tables");
@@ -519,11 +543,22 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			    ClickhouseExpression::Translate(expr, [&](idx_t index) { return ResolveOutput(child, index); });
 			// DuckDB's binder casts every SET value to the column's DuckDB type, and that cast is part of `expr`
 			// (translated, and rounded where DuckDB rounds, above). The CAST to the ClickHouse type below then
-			// converts the column's DuckDB type into its ClickHouse type: the same conversion an INSERT makes. Should
-			// the value's type ever differ from the column's, that first cast is checked (and rounded) here
+			// converts the column's DuckDB type into its ClickHouse type: exact for most types, and what an INSERT's
+			// server-side conversion does for the others (BFloat16, IPv4/6, (U)Int256, Decimal256, JSON, ...), except
+			// for DateTime and DateTime64(p < 6), floored first like an INSERT. Should the value's type ever differ
+			// from the column's, that first cast is checked (and rounded) here
 			if (expr.return_type != column.type) {
 				value = ClickhouseExpression::Cast(value, expr.return_type, column.type,
 				                                   ClickhouseDdlTypes::ToClickhouse(column.type, true));
+			}
+			auto precision = ClickhouseTypes::DateTimePrecision(column.type_node);
+			if (precision.IsValid() && precision.GetIndex() < 6) {
+				value = FloorTimestamp(value, precision.GetIndex());
+			} else if (HoldsCoarseDateTime(column.type_node)) {
+				throw NotImplementedException(
+				    "SET of column \"%s\" (%s), whose DateTime elements ClickHouse's CAST would truncate toward zero "
+				    "where an INSERT floors them",
+				    column.name, column.clickhouse_type);
 			}
 			assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = CAST(" + value + " AS " +
 			                      column.clickhouse_type + ")");

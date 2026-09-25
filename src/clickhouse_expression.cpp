@@ -173,8 +173,9 @@ static idx_t TimestampDigits(const LogicalType &type) {
 
 //! Whether (and how) a cast from `source` to `target` translates into a ClickHouse CAST with DuckDB's result.
 //! Throws NotImplementedException for every cast that does not (see the "as built" list in the design spec, §6):
-//! only casts listed here translate; a VARCHAR source follows ClickHouse's parse rules, where ClickHouse fails
-//! instead of rounding (e.g. CAST('2.5' AS Int32))
+//! only casts listed here translate. A VARCHAR source follows ClickHouse's parse rules, which accept and refuse
+//! other strings than DuckDB's (ClickHouse fails on CAST('2.5' AS Int32) instead of rounding), but only for
+//! targets whose parse does not round
 static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &target) {
 	if (source == target || source.id() == LogicalTypeId::SQLNULL) {
 		return CastRounding::NONE;
@@ -224,8 +225,8 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 		break;
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
-		if (source.IsFloating() || is_varchar) {
-			// both round to nearest (the C++ conversion, a correctly rounded parse)
+		if (source.IsFloating()) {
+			// both round to nearest (the C++ conversion)
 			return CastRounding::NONE;
 		}
 		if (source.IsIntegral() && source_id != LogicalTypeId::HUGEINT && source_id != LogicalTypeId::UHUGEINT) {
@@ -238,6 +239,8 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 			// (below 2^24 / 2^53); DuckDB computes wider values differently (TryCastDecimalToFloatingPoint)
 			return CastRounding::NONE;
 		}
+		// VARCHAR: ClickHouse's parse is not correctly rounded (CAST('1.7091' AS Float64) = 1.7090999999999998),
+		// and precise_float_parsing does not reach a mutation
 		break;
 	case LogicalTypeId::DECIMAL:
 		if (source.IsIntegral()) {
@@ -328,9 +331,9 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 	ThrowInexactCast(source, target, "has no exact ClickHouse translation");
 }
 
-string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, const LogicalType &target,
-                                  const string &clickhouse_type) {
-	switch (ClassifyCast(source, target)) {
+static string CastSql(CastRounding rounding, const string &sql, const LogicalType &target,
+                      const string &clickhouse_type) {
+	switch (rounding) {
 	case CastRounding::HALF_TO_EVEN:
 		return "CAST(roundBankers(" + sql + ") AS " + clickhouse_type + ")";
 	case CastRounding::HALF_AWAY_FROM_ZERO: {
@@ -340,6 +343,11 @@ string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, 
 	default:
 		return "CAST(" + sql + " AS " + clickhouse_type + ")";
 	}
+}
+
+string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, const LogicalType &target,
+                                  const string &clickhouse_type) {
+	return CastSql(ClassifyCast(source, target), sql, target, clickhouse_type);
 }
 
 //! DuckDB computes FLOAT arithmetic in single precision, ClickHouse promotes Float32 to Float64: rounding the
@@ -407,7 +415,7 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 	}
 	if (is_arithmetic) {
 		// DuckDB's // on FLOAT/DOUBLE (and DECIMAL, which it casts to DOUBLE) is a plain division; % on them is
-		// fmod(), which ClickHouse does not compute the same way for large values (1e20 % 3); "/" on DECIMAL
+		// fmod(), which ClickHouse does not compute the same way for large values (1e20 % 3)
 		throw NotImplementedException("%s on %s has no exact ClickHouse translation: %s", name,
 		                              function.return_type.ToString(), function.ToString());
 	}
@@ -558,8 +566,9 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		if (cast.try_cast) {
 			ThrowUntranslatable(expr);
 		}
+		CastRounding rounding;
 		try {
-			ClassifyCast(cast.child->return_type, cast.return_type);
+			rounding = ClassifyCast(cast.child->return_type, cast.return_type);
 		} catch (NotImplementedException &ex) {
 			throw NotImplementedException("%s: %s", ErrorData(ex).RawMessage(), expr.ToString());
 		}
@@ -569,7 +578,7 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		} catch (NotImplementedException &) {
 			ThrowUntranslatable(expr);
 		}
-		return Cast(Translate(*cast.child, resolve), cast.child->return_type, cast.return_type, type);
+		return CastSql(rounding, Translate(*cast.child, resolve), cast.return_type, type);
 	}
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();

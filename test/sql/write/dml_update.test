@@ -482,10 +482,90 @@ UPDATE ch.w_dml2.r SET i = dbl // 1;
 ----
 // on DOUBLE has no exact ClickHouse translation
 
-query II
-SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(dec), groupArray(i) FROM (SELECT dec, i FROM w_dml2.r ORDER BY id)');
+# rejected: VARCHAR -> DOUBLE (ClickHouse's parse is not correctly rounded: '1.7091' is read as 1.7090999999999998),
+# implicit or written
+statement error
+UPDATE ch.w_dml2.r SET dbl = s;
 ----
-[1.38, 1.49, -1.38, 2.26, 0.50, -2.26]	[1, 21, 19, 42, 1, -22]
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+statement error
+UPDATE ch.w_dml2.r SET dbl = s::DOUBLE * 2;
+----
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(dec), groupArray(i), groupArray(dbl) FROM (SELECT dec, i, dbl FROM w_dml2.r ORDER BY id)');
+----
+[1.38, 1.49, -1.38, 2.26, 0.50, -2.26]	[1, 21, 19, 42, 1, -22]	[0.5, 1.5, 2.5, 3.5, -0.5, -1.5]
+
+# ---------------------------------------------------------------------------
+# SET into DateTime and DateTime64(p < 6) floors the microsecond value like an INSERT does (ClickHouse's CAST alone
+# truncates toward zero: 1969-12-31 23:59:59.999999 would become 1970-01-01 00:00:00.000)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts (id Int32, src Nullable(DateTime64(6, ''UTC'')), t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC''), arr Array(DateTime64(3, ''UTC'')), arr2 Array(DateTime64(3, ''UTC''))) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.ts (id, src, t3) VALUES (1, ''1969-12-31 23:59:59.9995'', ''2000-01-01 00:00:00''), (2, ''1969-12-31 23:59:59.999999'', ''2000-01-01 00:00:00''), (3, ''1969-12-31 23:59:59.999'', ''2000-01-01 00:00:00''), (4, ''2024-06-01 12:00:00.123999'', ''2000-01-01 00:00:00''), (5, ''2024-06-01 12:00:00.123'', ''2000-01-01 00:00:00''), (6, NULL, ''2000-01-01 00:00:00'')');
+
+# what an INSERT writes for the same values (a DateTime cannot hold the pre-1970 ones)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts_ins (id Int32, t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC'')) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.ts_ins SELECT id, src, coalesce(src, t5), CASE WHEN id IN (4, 5) THEN src ELSE t0 END FROM ch.w_dml2.ts;
+
+query I
+UPDATE ch.w_dml2.ts SET t3 = src, t5 = coalesce(src, t5), t0 = CASE WHEN id IN (4, 5) THEN src ELSE t0 END;
+----
+6
+
+query IIII
+SELECT id, t3, t5, t0 FROM ch.w_dml2.ts ORDER BY id;
+----
+1	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.9995+00	1970-01-01 00:00:00+00
+2	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.99999+00	1970-01-01 00:00:00+00
+3	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.999+00	1970-01-01 00:00:00+00
+4	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00.12399+00	2024-06-01 12:00:00+00
+5	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00+00
+6	NULL	1970-01-01 00:00:00+00	1970-01-01 00:00:00+00
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t5, ''UTC''), toString(t0), toTypeName(t5) FROM w_dml2.ts ORDER BY id');
+----
+1	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99950	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+2	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99999	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+3	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99900	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+4	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12399	2024-06-01 12:00:00	DateTime64(5, 'Asia/Tokyo')
+5	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12300	2024-06-01 12:00:00	DateTime64(5, 'Asia/Tokyo')
+6	NULL	1970-01-01 00:00:00.00000	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t5, ''UTC''), toString(t0) FROM w_dml2.ts_ins ORDER BY id');
+----
+1	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99950	1970-01-01 00:00:00
+2	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99999	1970-01-01 00:00:00
+3	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99900	1970-01-01 00:00:00
+4	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12399	2024-06-01 12:00:00
+5	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12300	2024-06-01 12:00:00
+6	NULL	1970-01-01 00:00:00.00000	1970-01-01 00:00:00
+
+query I
+SELECT count(*) FROM ch.w_dml2.ts u JOIN ch.w_dml2.ts_ins i USING (id) WHERE u.t3 IS NOT DISTINCT FROM i.t3 AND u.t5 = i.t5 AND u.t0 = i.t0;
+----
+6
+
+# nested in an Array, Tuple or Map, such timestamps are rejected
+statement error
+UPDATE ch.w_dml2.ts SET arr = arr2 WHERE id = 1;
+----
+whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT countIf(empty(arr)) FROM w_dml2.ts');
+----
+6
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -44,6 +45,8 @@ public:
 	//! - FixedString, whose NUL padding DuckDB sees but ClickHouse's `fs = 'ab'` ignores
 	static bool IsComparedExactly(const ClickhouseTypeNode &node);
 	static bool IsNullable(const ClickhouseTypeNode &node);
+	//! Digits of a second of a DateTime (0) or DateTime64 (Nullable/LowCardinality unwrapped); invalid otherwise
+	static optional_idx DateTimePrecision(const ClickhouseTypeNode &node);
 };
 
 //! A column of a ClickHouse table or query result
