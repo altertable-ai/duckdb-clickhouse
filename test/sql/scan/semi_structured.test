@@ -1,0 +1,29 @@
+# name: test/sql/scan/semi_structured.test
+# description: JSON, Variant and Dynamic are read as DuckDB JSON
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+require json
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query ITTTT
+SELECT id, typeof(j), json_extract_string(j, '$.b.c'), json_extract_string(v, '$'), json_extract_string(dyn, '$') FROM ch.test_db.semi ORDER BY id;
+----
+1	JSON	x	str	42
+2	JSON	NULL	7	hello

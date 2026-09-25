@@ -1,0 +1,186 @@
+# name: test/sql/write/ddl_lifetime.test
+# description: DDL clears the attached database's metadata cache while other connections still use its entries
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+# Every DDL statement (and CTAS, clickhouse_execute(), clickhouse_clear_cache()) drops ch's cached schema and table
+# entries. They are retired rather than freed, and kept alive until every transaction active at that point has ended
+# (ClickhouseTransactionManager), so entries another connection has bound, or is holding in an open transaction, stay
+# valid. Run under the debug build too, where a use-after-free is most likely to show
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_life');
+
+statement ok
+CREATE SCHEMA ch.w_life;
+
+statement ok
+CREATE TABLE ch.w_life.t (id INTEGER PRIMARY KEY, s VARCHAR);
+
+statement ok
+INSERT INTO ch.w_life.t VALUES (1, 'a'), (2, 'b');
+
+# ---------------------------------------------------------------------------
+# a prepared statement survives DDL on another connection
+# ---------------------------------------------------------------------------
+statement ok con1
+PREPARE p AS SELECT count(*), max(s) FROM ch.w_life.t;
+
+query II con1
+EXECUTE p;
+----
+2	b
+
+statement ok con2
+ALTER TABLE ch.w_life.t ADD COLUMN extra INTEGER;
+
+statement ok con2
+CREATE TABLE ch.w_life.other (x INTEGER);
+
+query II con1
+EXECUTE p;
+----
+2	b
+
+statement ok con2
+CALL clickhouse_clear_cache();
+
+query II con1
+EXECUTE p;
+----
+2	b
+
+# a prepared statement with a parameter, re-executed across DDL
+statement ok con1
+PREPARE q AS SELECT s FROM ch.w_life.t WHERE id = $1;
+
+query I con1
+EXECUTE q(2);
+----
+b
+
+statement ok con2
+ALTER TABLE ch.w_life.t RENAME COLUMN s TO s2;
+
+# the rebind sees the renamed column is gone
+statement error con1
+EXECUTE q(2);
+----
+Referenced column "s" not found
+
+statement ok con2
+ALTER TABLE ch.w_life.t RENAME COLUMN s2 TO s;
+
+query I con1
+EXECUTE q(1);
+----
+a
+
+# ---------------------------------------------------------------------------
+# an open transaction keeps using entries it looked up while DDL runs elsewhere
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM ch.w_life.t;
+----
+2
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_life';
+----
+2
+
+statement ok con2
+DROP TABLE ch.w_life.other;
+
+statement ok con2
+ALTER TABLE ch.w_life.t DROP COLUMN extra;
+
+query I con1
+SELECT count(*) FROM ch.w_life.t;
+----
+2
+
+query I con1
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'ch' AND schema_name = 'w_life' AND table_name = 't';
+----
+2
+
+statement ok con1
+COMMIT;
+
+# ---------------------------------------------------------------------------
+# DDL and reads interleaved on two connections, in a loop
+# ---------------------------------------------------------------------------
+loop i 0 20
+
+statement ok con1
+PREPARE r AS SELECT count(*) FROM ch.w_life.t;
+
+statement ok con2
+CREATE OR REPLACE TABLE ch.w_life.churn (x INTEGER);
+
+query I con1
+EXECUTE r;
+----
+2
+
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_life';
+----
+2
+
+statement ok con2
+DROP TABLE ch.w_life.churn;
+
+query I con1
+SELECT count(*) FROM ch.w_life.t;
+----
+2
+
+statement ok con1
+COMMIT;
+
+statement ok con1
+DEALLOCATE r;
+
+endloop
+
+# ---------------------------------------------------------------------------
+# a prepared statement on a table dropped elsewhere fails cleanly
+# ---------------------------------------------------------------------------
+statement ok con1
+PREPARE gone AS SELECT count(*) FROM ch.w_life.t;
+
+statement ok con2
+DROP TABLE ch.w_life.t;
+
+statement error con1
+EXECUTE gone;
+----
+does not exist
+
+statement ok
+DROP SCHEMA ch.w_life CASCADE;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_life''');
+----
+0

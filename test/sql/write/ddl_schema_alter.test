@@ -1,0 +1,331 @@
+# name: test/sql/write/ddl_schema_alter.test
+# description: CREATE/DROP SCHEMA and ALTER TABLE on an attached ClickHouse database
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_ddl2');
+
+# ---------------------------------------------------------------------------
+# CREATE SCHEMA
+# ---------------------------------------------------------------------------
+statement ok
+CREATE SCHEMA ch.w_ddl2;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch' AND schema_name = 'w_ddl2';
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_ddl2''');
+----
+1
+
+statement error
+CREATE SCHEMA ch.w_ddl2;
+----
+DATABASE_ALREADY_EXISTS
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS ch.w_ddl2;
+
+# ---------------------------------------------------------------------------
+# ALTER TABLE
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl2.t (id INTEGER PRIMARY KEY, a VARCHAR);
+
+statement ok
+INSERT INTO ch.w_ddl2.t VALUES (1, 'x');
+
+statement ok
+ALTER TABLE ch.w_ddl2.t ADD COLUMN c INTEGER DEFAULT 7;
+
+query III
+SELECT * FROM ch.w_ddl2.t;
+----
+1	x	7
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type, default_expression FROM system.columns WHERE database = ''w_ddl2'' AND table = ''t'' AND name = ''c''');
+----
+c	Nullable(Int32)	7
+
+statement error
+ALTER TABLE ch.w_ddl2.t ADD COLUMN c INTEGER;
+----
+Column with name "c" already exists in ClickHouse table "t"
+
+statement ok
+ALTER TABLE ch.w_ddl2.t ADD COLUMN IF NOT EXISTS c INTEGER;
+
+statement ok
+ALTER TABLE ch.w_ddl2.t RENAME COLUMN a TO b;
+
+query I
+SELECT b FROM ch.w_ddl2.t;
+----
+x
+
+statement ok
+ALTER TABLE ch.w_ddl2.t DROP COLUMN c;
+
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl2' AND table_name = 't';
+----
+2
+
+statement ok
+ALTER TABLE ch.w_ddl2.t DROP COLUMN IF EXISTS c;
+
+statement ok
+ALTER TABLE ch.w_ddl2.t RENAME TO u;
+
+query II
+SELECT * FROM ch.w_ddl2.u;
+----
+1	x
+
+statement error
+SELECT * FROM ch.w_ddl2.t;
+----
+does not exist
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.tables WHERE database = ''w_ddl2''');
+----
+u
+
+statement error
+ALTER TABLE ch.w_ddl2.u SET PARTITIONED BY (id);
+----
+is not supported for ClickHouse tables
+
+# ALTER TABLE refuses ClickHouse views and dictionaries: forwarding e.g. RENAME TO to a MaterializedView's storage
+# would silently succeed in an inconsistent way
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_ddl2.v AS SELECT 1 AS one');
+
+statement error
+ALTER TABLE ch.w_ddl2.v RENAME TO v2;
+----
+is a ClickHouse view
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.tables WHERE database = ''w_ddl2'' AND name = ''v''');
+----
+v
+
+# ---------------------------------------------------------------------------
+# column names resolve case-insensitively, as DuckDB identifiers do, and the statement uses the real ClickHouse name
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl2.ci (id INTEGER PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO ch.w_ddl2.ci VALUES (1, 'x');
+
+# ClickHouse would accept "ID" next to "id", and the next metadata load could not list both
+statement error
+ALTER TABLE ch.w_ddl2.ci ADD COLUMN "ID" INTEGER;
+----
+Column with name "ID" already exists in ClickHouse table "ci" (ClickHouse column "id")
+
+statement ok
+ALTER TABLE ch.w_ddl2.ci ADD COLUMN IF NOT EXISTS "ID" INTEGER;
+
+statement error
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN val TO "ID";
+----
+Column with name "ID" already exists in ClickHouse table "ci" (ClickHouse column "id")
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+val
+
+# a case-mismatched old name renames the real column
+statement ok
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN "VAL" TO v;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+v
+
+# renaming a column to another spelling of its own name is fine
+statement ok
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN v TO "V";
+
+query II
+SELECT id, "V" FROM ch.w_ddl2.ci;
+----
+1	x
+
+statement error
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN nope TO other;
+----
+Column with name "nope" does not exist in ClickHouse table "ci"
+
+# DROP COLUMN IF EXISTS with a case-mismatched name drops the real column
+statement ok
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN IF EXISTS v;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' AND table_name = 'ci';
+----
+id
+
+statement ok
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN IF EXISTS nope;
+
+statement error
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN nope;
+----
+Column with name "nope" does not exist in ClickHouse table "ci"
+
+# a table whose columns collide case-insensitively (created outside DuckDB) does not make its siblings unreachable;
+# it is listed with the first of the colliding columns, and using it fails with a clear error
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_ddl2.dup (id Int32, ID String, other Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_ddl2.dup VALUES (1, ''one'', 10)');
+
+query I
+SELECT id FROM ch.w_ddl2.ci;
+----
+1
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' ORDER BY table_name;
+----
+ci
+dup
+u
+v
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' AND table_name = 'dup' ORDER BY column_index;
+----
+id
+other
+
+statement error
+SELECT * FROM ch.w_ddl2.dup;
+----
+ClickHouse table "w_ddl2"."dup" has columns whose names differ only in case ("id" and "ID")
+
+statement error
+INSERT INTO ch.w_ddl2.dup (id) VALUES (2);
+----
+has columns whose names differ only in case
+
+# a name matching several of its columns only case-insensitively is ambiguous
+statement error
+ALTER TABLE ch.w_ddl2.dup DROP COLUMN "Id";
+----
+is ambiguous
+
+# ALTER TABLE still works on it, with the exact name: renaming one of the columns makes it usable
+statement ok
+ALTER TABLE ch.w_ddl2.dup RENAME COLUMN "ID" TO label;
+
+query III
+SELECT * FROM ch.w_ddl2.dup;
+----
+1	one	10
+
+# ---------------------------------------------------------------------------
+# "main" stands for the connection's database (test_db): CREATE SCHEMA and DROP SCHEMA refuse it
+# ---------------------------------------------------------------------------
+statement error
+DROP SCHEMA ch.main CASCADE;
+----
+Cannot create or drop schema "main": in an attached ClickHouse database it stands for the connection's database ("test_db")
+
+statement error
+DROP SCHEMA IF EXISTS ch.main;
+----
+Cannot create or drop schema "main"
+
+statement error
+CREATE SCHEMA ch.main;
+----
+Cannot create or drop schema "main"
+
+statement error
+CREATE SCHEMA IF NOT EXISTS ch.main;
+----
+Cannot create or drop schema "main"
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.databases WHERE name IN (''test_db'', ''main'') ORDER BY name');
+----
+test_db
+
+query I
+SELECT count(*) FROM ch.main.t1;
+----
+3
+
+# ---------------------------------------------------------------------------
+# DROP SCHEMA
+# ---------------------------------------------------------------------------
+statement error
+DROP SCHEMA ch.w_ddl2;
+----
+use DROP SCHEMA … CASCADE
+
+statement ok
+DROP SCHEMA ch.w_ddl2 CASCADE;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_ddl2''');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch' AND schema_name = 'w_ddl2';
+----
+0
+
+statement ok
+DROP SCHEMA IF EXISTS ch.w_ddl2;
+
+statement error
+DROP SCHEMA ch.w_ddl2;
+----
+does not exist
+
+# an empty schema drops without CASCADE
+statement ok
+CREATE SCHEMA ch.w_ddl2;
+
+statement ok
+DROP SCHEMA ch.w_ddl2;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_ddl2''');
+----
+0

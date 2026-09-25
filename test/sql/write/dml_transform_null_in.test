@@ -1,0 +1,155 @@
+# name: test/sql/write/dml_transform_null_in.test
+# description: UPDATE and DELETE with IN / NOT IN on a server whose default profile sets transform_null_in = 1 at startup (see scripts/test_with_clickhouse.sh): mutations and lightweight DELETEs take it from there, whatever the query's settings say
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_TN_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_TN_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=default' AS tn (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('tn', 'DROP DATABASE IF EXISTS w_tn');
+
+statement ok
+CALL clickhouse_execute('tn', 'CREATE DATABASE w_tn');
+
+statement ok
+CALL clickhouse_execute('tn', 'CREATE TABLE w_tn.t (id Int32, n Nullable(Int32), m Int32, s LowCardinality(Nullable(String)), u Int32, b Nullable(Bool)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO tn.w_tn.t VALUES (1, 1, 1, 'a', 0, true), (2, NULL, 2, NULL, 0, true), (3, 5, 5, 'e', 0, true),
+    (4, 7, 7, 'g', 0, true), (5, NULL, 6, NULL, 0, true);
+
+# the server really runs with it: a bare NOT IN matches the NULL rows in ClickHouse itself
+query II
+SELECT * FROM clickhouse_query('tn', 'SELECT getSetting(''transform_null_in''), count() FROM w_tn.t WHERE n NOT IN (1, 5)');
+----
+true	3
+
+# 5 or more values (the IN list rewritten into a join): DuckDB keeps the NULL rows
+query I
+SELECT count(*) FROM tn.w_tn.t WHERE n NOT IN (1, 5, 6, 8, 10);
+----
+1
+
+query I
+UPDATE tn.w_tn.t SET u = 9 WHERE n NOT IN (1, 5, 6, 8, 10);
+----
+1
+
+# on an expression, under a NOT
+query I
+UPDATE tn.w_tn.t SET u = u + 10 WHERE NOT (n + 1 IN (2, 6, 7, 9, 11));
+----
+1
+
+# on a non-Nullable column
+query I
+UPDATE tn.w_tn.t SET u = u + 100 WHERE m NOT IN (1, 5, 10, 11, 12);
+----
+3
+
+# on a LowCardinality(Nullable(String)) column
+query I
+UPDATE tn.w_tn.t SET u = u + 1000 WHERE s NOT IN ('a', 'e', 'x', 'y', 'z');
+----
+1
+
+query II
+SELECT id, u FROM tn.w_tn.t ORDER BY id;
+----
+1	0
+2	100
+3	0
+4	1119
+5	100
+
+query II
+SELECT * FROM clickhouse_query('tn', 'SELECT id, u FROM w_tn.t ORDER BY id');
+----
+1	0
+2	100
+3	0
+4	1119
+5	100
+
+# without the rewrite into a join, the IN stays an expression: in SET values, a NULL n gives NULL, not false
+statement ok
+SET disabled_optimizers = 'in_clause';
+
+query I
+UPDATE tn.w_tn.t SET b = n IN (1, 5, 6, 8, 10);
+----
+5
+
+query I
+UPDATE tn.w_tn.t SET u = 50 WHERE n NOT IN (1, 5, 6, 8, 10);
+----
+1
+
+statement ok
+RESET disabled_optimizers;
+
+query III
+SELECT id, u, b FROM tn.w_tn.t ORDER BY id;
+----
+1	0	true
+2	100	NULL
+3	0	true
+4	50	false
+5	100	NULL
+
+query III
+SELECT * FROM clickhouse_query('tn', 'SELECT id, u, b FROM w_tn.t ORDER BY id');
+----
+1	0	true
+2	100	NULL
+3	0	true
+4	50	false
+5	100	NULL
+
+# lightweight DELETE
+query I
+DELETE FROM tn.w_tn.t WHERE m NOT IN (2, 6, 10, 11, 12) AND n NOT IN (1, 6, 8, 10, 11);
+----
+2
+
+query I
+DELETE FROM tn.w_tn.t WHERE s NOT IN ('a', 'g', 'x', 'y', 'z');
+----
+0
+
+query I
+DELETE FROM tn.w_tn.t WHERE n NOT IN (5, 6, 8, 10, 11);
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('tn', 'SELECT id FROM w_tn.t ORDER BY id');
+----
+2
+5
+
+# the statements carry the guard. A debug build's plan wraps some column references in extra parentheses, removed
+# here; GROUP BY: query_log keeps the statements of earlier runs on a kept server
+statement ok
+CALL clickhouse_execute('tn', 'SYSTEM FLUSH LOGS');
+
+query I
+SELECT * FROM clickhouse_query('tn', 'SELECT replaceRegexpAll(query, ''\\(\\((`\\w+`)\\)\\)'', ''\\1'') AS q FROM system.query_log WHERE type = ''QueryFinish'' AND (query LIKE ''ALTER TABLE `w_tn`.`t` UPDATE `u` = CAST((9)%'' OR query LIKE ''DELETE FROM `w_tn`.`t` WHERE%'') GROUP BY q ORDER BY min(event_time_microseconds)');
+----
+ALTER TABLE `w_tn`.`t` UPDATE `u` = CAST((9) AS Int32) WHERE if(isNull(`n`), NULL, (`n` NOT IN (1, 5, 6, 8, 10)))
+DELETE FROM `w_tn`.`t` WHERE if(isNull(`m`), NULL, (`m` NOT IN (2, 6, 10, 11, 12))) AND if(isNull(`n`), NULL, (`n` NOT IN (1, 6, 8, 10, 11)))
+DELETE FROM `w_tn`.`t` WHERE if(isNull(`s`), NULL, (`s` NOT IN ('a', 'g', 'x', 'y', 'z')))
+DELETE FROM `w_tn`.`t` WHERE if(isNull(`n`), NULL, (`n` NOT IN (5, 6, 8, 10, 11)))
+
+statement ok
+CALL clickhouse_execute('tn', 'DROP DATABASE w_tn');

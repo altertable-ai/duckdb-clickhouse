@@ -1,0 +1,292 @@
+# name: test/sql/attach/attach_schema.test
+# description: ATTACH … (SCHEMA 'db') exposes a single ClickHouse database
+# group: [attach]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS setup (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('setup', 'DROP DATABASE IF EXISTS w_schema');
+
+statement ok
+CALL clickhouse_execute('setup', 'DROP DATABASE IF EXISTS w_schema_other');
+
+statement ok
+CALL clickhouse_execute('setup', 'CREATE DATABASE w_schema');
+
+statement ok
+CALL clickhouse_execute('setup', 'CREATE TABLE w_schema.t (id Int32, v String) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('setup', 'INSERT INTO w_schema.t VALUES (1, ''a''), (2, ''b'')');
+
+# ---------------------------------------------------------------------------
+# only the SCHEMA database is listed, and it is the attached database's default schema, whatever database= says
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse, SCHEMA 'w_schema');
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch' ORDER BY schema_name;
+----
+w_schema
+
+query I
+SELECT DISTINCT schema_name FROM duckdb_tables() WHERE database_name = 'ch';
+----
+w_schema
+
+query II
+SELECT * FROM ch.w_schema.t ORDER BY id;
+----
+1	a
+2	b
+
+query II
+SELECT * FROM ch.t ORDER BY id;
+----
+1	a
+2	b
+
+query I
+SELECT count(*) FROM ch.main.t;
+----
+2
+
+statement error
+SELECT * FROM ch.test_db.t1;
+----
+<REGEX>:Catalog Error.*test_db.*
+
+statement error
+SELECT * FROM ch.other_db.other_table;
+----
+<REGEX>:Catalog Error.*other_db.*
+
+# clickhouse_query() is plain ClickHouse SQL and still uses the connection's database
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT currentDatabase()');
+----
+test_db
+
+# the restriction survives a cache clear
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch' ORDER BY schema_name;
+----
+w_schema
+
+statement ok
+USE ch;
+
+query I
+SELECT count(*) FROM t;
+----
+2
+
+statement ok
+USE memory;
+
+# ---------------------------------------------------------------------------
+# the name matches the way schema names do: exactly, else case-insensitively
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_ci (TYPE clickhouse, SCHEMA 'W_Schema');
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_ci';
+----
+w_schema
+
+query I
+SELECT count(*) FROM ch_ci.t;
+----
+2
+
+statement ok
+DETACH ch_ci;
+
+# ---------------------------------------------------------------------------
+# SCHEMA wins over SHOW_SYSTEM, and can name a system database
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_sys (TYPE clickhouse, SCHEMA 'w_schema', SHOW_SYSTEM true);
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_sys';
+----
+w_schema
+
+statement ok
+DETACH ch_sys;
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_sys (TYPE clickhouse, SCHEMA 'system');
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_sys';
+----
+system
+
+query I
+SELECT count(*) > 0 FROM ch_sys.one;
+----
+true
+
+statement ok
+DETACH ch_sys;
+
+# ---------------------------------------------------------------------------
+# a SCHEMA that does not exist fails the ATTACH
+# ---------------------------------------------------------------------------
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_missing (TYPE clickhouse, SCHEMA 'w_schema_nope');
+----
+ClickHouse database "w_schema_nope" (the SCHEMA option of ATTACH) does not exist
+
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_empty (TYPE clickhouse, SCHEMA '');
+----
+SCHEMA must name a ClickHouse database
+
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_null (TYPE clickhouse, SCHEMA NULL);
+----
+NULL is not supported as a valid option for ATTACH option "schema"
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ch_missing', 'ch_empty', 'ch_null');
+----
+0
+
+# ---------------------------------------------------------------------------
+# SCHEMA with READ_ONLY: the one database is readable, and nothing can be written
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_ro (TYPE clickhouse, SCHEMA 'w_schema', READ_ONLY);
+
+query II
+SELECT * FROM ch_ro.t ORDER BY id;
+----
+1	a
+2	b
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_ro';
+----
+w_schema
+
+statement error
+INSERT INTO ch_ro.t VALUES (3, 'c');
+----
+it is attached in read-only mode
+
+statement error
+ALTER TABLE ch_ro.t ALTER COLUMN v SET DEFAULT 'x';
+----
+read-only mode
+
+statement error
+CREATE SCHEMA ch_ro.w_schema_other;
+----
+read-only
+
+query I
+SELECT * FROM clickhouse_query('ch_ro', 'SELECT count() FROM w_schema.t');
+----
+2
+
+statement ok
+DETACH ch_ro;
+
+# ---------------------------------------------------------------------------
+# CREATE SCHEMA / DROP SCHEMA
+# ---------------------------------------------------------------------------
+statement error
+CREATE SCHEMA ch.w_schema_other;
+----
+Cannot create schema "w_schema_other": "ch" was attached with SCHEMA 'w_schema'
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_schema_other''');
+----
+0
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS ch.w_schema;
+
+# another database is not visible, so dropping it fails like any missing schema
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_schema_other');
+
+statement error
+DROP SCHEMA ch.w_schema_other;
+----
+does not exist
+
+statement ok
+DROP SCHEMA IF EXISTS ch.w_schema_other;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_schema_other''');
+----
+1
+
+statement error
+DROP SCHEMA ch.main;
+----
+Cannot create or drop schema "main": in this attached ClickHouse database it stands for the SCHEMA database ("w_schema")
+
+# the attached schema itself drops by the usual rules
+statement error
+DROP SCHEMA ch.w_schema;
+----
+use DROP SCHEMA … CASCADE
+
+statement ok
+DROP SCHEMA ch.w_schema CASCADE;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.databases WHERE name = ''w_schema''');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ch';
+----
+0
+
+# and can be created again, in any spelling that matches it
+statement ok
+CREATE SCHEMA ch.W_SCHEMA;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.databases WHERE name ILIKE ''w_schema''');
+----
+w_schema
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch';
+----
+w_schema
+
+statement ok
+DETACH ch;
+
+statement ok
+CALL clickhouse_execute('setup', 'DROP DATABASE IF EXISTS w_schema');
+
+statement ok
+CALL clickhouse_execute('setup', 'DROP DATABASE IF EXISTS w_schema_other');

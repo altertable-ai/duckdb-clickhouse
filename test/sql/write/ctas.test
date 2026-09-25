@@ -1,0 +1,326 @@
+# name: test/sql/write/ctas.test
+# description: CREATE TABLE … AS SELECT into an attached ClickHouse database
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_ctas');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_ctas');
+
+# many blocks, nested and naive-timestamp columns
+statement ok
+SET ch_insert_block_size = 1000;
+
+query I
+CREATE TABLE ch.w_ctas.t1 AS
+SELECT range::INTEGER AS id, 'v' || range AS s, (range * 1.5)::DOUBLE AS d,
+       TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (range) HOUR AS ts, [range, NULL] AS l
+FROM range(5000);
+----
+5000
+
+statement ok
+RESET ch_insert_block_size;
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ctas'' AND table = ''t1'' ORDER BY position');
+----
+id	Nullable(Int32)
+s	Nullable(String)
+d	Nullable(Float64)
+ts	Nullable(DateTime64(6, 'UTC'))
+l	Array(Nullable(Int64))
+
+query IIII
+SELECT count(*), sum(id), max(ts), max(len(l)) FROM ch.w_ctas.t1;
+----
+5000	12497500	2024-07-27 07:00:00+00	2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(max(ts)) FROM w_ctas.t1');
+----
+2024-07-27 07:00:00.000000
+
+# an empty result still creates the table
+query I
+CREATE TABLE ch.w_ctas.empty AS SELECT 1::INTEGER AS x WHERE false;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.columns WHERE database = ''w_ctas'' AND table = ''empty''');
+----
+1
+
+# IF NOT EXISTS leaves an existing table alone and writes nothing. DuckDB's own planner plans a plain
+# PhysicalCreateTable (not our ClickhouseInsert) for CREATE TABLE IF NOT EXISTS ... AS SELECT once the table already
+# exists, since CreatePlan() only reaches PlanCreateTableAs when there is no existing entry or OR REPLACE is used;
+# that path yields an empty result instead of a one-row 0
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.t1 AS SELECT 1 AS other;
+----
+
+query I
+SELECT count(*) FROM ch.w_ctas.t1;
+----
+5000
+
+# OR REPLACE replaces it
+query I
+CREATE OR REPLACE TABLE ch.w_ctas.t1 AS SELECT 42::INTEGER AS answer;
+----
+1
+
+query I
+SELECT * FROM ch.w_ctas.t1;
+----
+42
+
+# ---------------------------------------------------------------------------
+# a stale table-set cache: another alias creates the target behind ch's back
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch2 (TYPE clickhouse);
+
+# caches ch's metadata for w_ctas.exists_elsewhere as "not found"
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_ctas' AND table_name = 'exists_elsewhere';
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch2', 'CREATE TABLE w_ctas.exists_elsewhere (id Int32, extra String) ENGINE = MergeTree ORDER BY id');
+
+# IF NOT EXISTS re-checks fresh (PrepareTarget clears ch's cache before looking) rather than trusting the stale
+# "not found", finds the table ch2 created behind ch's back, and writes nothing: the operator's own skip path,
+# since ch's plan-time cache still says the table does not exist, so DuckDB routes this to our ClickhouseInsert
+# rather than to a plain CREATE TABLE
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.exists_elsewhere AS SELECT 1::INTEGER AS id;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_ctas.exists_elsewhere');
+----
+0
+
+# without IF NOT EXISTS, the duplicate CREATE is rejected: ch's cache now knows about the table (refreshed by the
+# check above), so DuckDB plans a plain CREATE TABLE, which ClickhouseSchemaEntry::CreateTable refuses without
+# sending anything; still nothing written
+statement error
+CREATE TABLE ch.w_ctas.exists_elsewhere AS SELECT 1::INTEGER AS id;
+----
+Table "exists_elsewhere" already exists in ClickHouse database "w_ctas"
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_ctas.exists_elsewhere');
+----
+0
+
+# a plain CREATE TABLE ... AS SELECT (no IF NOT EXISTS / OR REPLACE) on a table ch already knows about also fails,
+# and t1's contents are untouched
+statement error
+CREATE TABLE ch.w_ctas.t1 AS SELECT 1::INTEGER AS other;
+----
+Table "t1" already exists in ClickHouse database "w_ctas"
+
+query I
+SELECT * FROM ch.w_ctas.t1;
+----
+42
+
+# ---------------------------------------------------------------------------
+# the opposite stale cache: the target was dropped behind ch's back. DuckDB's planner still sees the cached table and
+# plans a plain CREATE TABLE, dropping the SELECT; sending that CREATE would leave an empty table and report
+# success. It is refused instead, and nothing is created or written
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_ctas.dropped_elsewhere (id Int32) ENGINE = MergeTree ORDER BY id');
+
+# loads ch's cache, which now has the table
+query I
+SELECT count(*) FROM ch.w_ctas.dropped_elsewhere;
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch2', 'DROP TABLE w_ctas.dropped_elsewhere');
+
+statement error
+CREATE TABLE ch.w_ctas.dropped_elsewhere AS SELECT 1::INTEGER AS id;
+----
+Table "dropped_elsewhere" already exists in ClickHouse database "w_ctas" (if it was dropped outside DuckDB, run CALL clickhouse_clear_cache())
+
+query I
+SELECT * FROM clickhouse_query('ch2', 'SELECT count() FROM system.tables WHERE database = ''w_ctas'' AND name = ''dropped_elsewhere''');
+----
+0
+
+# IF NOT EXISTS trusts the cache the same way: nothing is sent, nothing is created
+statement ok
+CREATE TABLE IF NOT EXISTS ch.w_ctas.dropped_elsewhere AS SELECT 1::INTEGER AS id;
+
+query I
+SELECT * FROM clickhouse_query('ch2', 'SELECT count() FROM system.tables WHERE database = ''w_ctas'' AND name = ''dropped_elsewhere''');
+----
+0
+
+# as does a plain CREATE TABLE
+statement error
+CREATE TABLE ch.w_ctas.dropped_elsewhere (id INTEGER);
+----
+already exists in ClickHouse database "w_ctas"
+
+# once the cache is refreshed, the CTAS creates and fills the table
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+CREATE TABLE ch.w_ctas.dropped_elsewhere AS SELECT 1::INTEGER AS id;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch2', 'SELECT sum(id) FROM w_ctas.dropped_elsewhere');
+----
+1
+
+# ---------------------------------------------------------------------------
+# CTAS reading from the same attached catalog: the sink creates the table -- and clears ch's cache -- while the scan
+# of ch is streaming
+# ---------------------------------------------------------------------------
+query I
+CREATE TABLE ch.w_ctas.from_ch AS SELECT id, name, value FROM ch.test_db.t1;
+----
+3
+
+query III
+SELECT * FROM ch.w_ctas.from_ch ORDER BY id;
+----
+1	Alice	99.5
+2	Bob	150.25
+3	Charlie	200.0
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()), toString(sum(id)), arrayStringConcat(groupArray(name), '','') FROM (SELECT * FROM w_ctas.from_ch ORDER BY id)');
+----
+3	6	Alice,Bob,Charlie
+
+# the source is untouched
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM test_db.t1');
+----
+3
+
+# self-reference: OR REPLACE reads the old table while replacing it
+query I
+CREATE OR REPLACE TABLE ch.w_ctas.from_ch AS SELECT id * 10 AS id, name FROM ch.w_ctas.from_ch;
+----
+3
+
+query II
+SELECT * FROM ch.w_ctas.from_ch ORDER BY id;
+----
+10	Alice
+20	Bob
+30	Charlie
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()), toString(sum(id)) FROM w_ctas.from_ch');
+----
+3	60
+
+# IF NOT EXISTS with a multi-chunk, multi-block source from the same catalog: the fresh existence check clears ch's
+# cache on the first chunk, while ch.test_db.big is still being scanned
+statement ok
+SET ch_insert_block_size = 1000;
+
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.big_copy AS SELECT n, s FROM ch.test_db.big WHERE n < 10000;
+----
+10000
+
+statement ok
+RESET ch_insert_block_size;
+
+query III
+SELECT count(*), sum(n), max(s::BIGINT) FROM ch.w_ctas.big_copy;
+----
+10000	49995000	9999
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()), toString(sum(n)) FROM w_ctas.big_copy');
+----
+10000	49995000
+
+# the same with a LIMIT on an unfiltered source (the scan is cut off mid-stream)
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.big_limit AS SELECT n FROM ch.test_db.big LIMIT 10000;
+----
+10000
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()) FROM w_ctas.big_limit');
+----
+10000
+
+# naive timestamp family, BLOB and ENUM sources keep their values
+query I
+CREATE TABLE ch.w_ctas.types AS SELECT
+    TIMESTAMP_S '2024-01-01 00:00:01' AS ts_s, TIMESTAMP_MS '2024-01-01 00:00:00.123' AS ts_ms,
+    TIMESTAMP_NS '2024-01-01 00:00:00.123456789' AS ts_ns, 'abc'::BLOB AS bl, 'y'::ENUM('x', 'y') AS e;
+----
+1
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ts_s), toString(ts_ms), toString(ts_ns), hex(bl), toString(e) FROM w_ctas.types');
+----
+2024-01-01 00:00:01	2024-01-01 00:00:00.123	2024-01-01 00:00:00.123456789	616263	y
+
+# from a DuckDB table
+statement ok
+CREATE TABLE local_rows AS SELECT range AS n FROM range(3);
+
+query I
+CREATE TABLE ch.w_ctas.from_local AS SELECT * FROM local_rows;
+----
+3
+
+query I
+SELECT sum(n) FROM ch.w_ctas.from_local;
+----
+3
+
+# types ClickHouse cannot hold fail before anything is created
+statement error
+CREATE TABLE ch.w_ctas.bad AS SELECT INTERVAL 1 DAY AS i;
+----
+has no ClickHouse equivalent
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ctas'' AND name = ''bad''');
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_ctas');

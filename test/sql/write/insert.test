@@ -1,0 +1,673 @@
+# name: test/sql/write/insert.test
+# description: INSERT, INSERT … SELECT and COPY into ClickHouse tables
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+# enable_time_time64_type lets clickhouse_execute create Time/Time64 columns
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse, SETTINGS 'enable_time_time64_type=1');
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_insert');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_insert');
+
+# ---------------------------------------------------------------------------
+# every natively written scalar type round-trips (same types as test_db.scalars, minus the server-converted ones)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.scalars (
+    id UInt8, b Bool,
+    i8 Int8, i16 Int16, i32 Int32, i64 Int64,
+    u8 UInt8, u16 UInt16, u32 UInt32, u64 UInt64,
+    i128 Int128, u128 UInt128,
+    f32 Float32, f64 Float64,
+    d9 Decimal(9, 2), d18 Decimal(18, 4), d38 Decimal(38, 10),
+    s String, fs FixedString(3),
+    d Date, d32 Date32,
+    dt DateTime(''UTC''), dt64_3 DateTime64(3, ''UTC''), dt64_9 DateTime64(9, ''Asia/Tokyo''),
+    uuid UUID,
+    e8 Enum8(''red'' = 1, ''green'' = 2, ''blue'' = -3), e16 Enum16(''small'' = 1000, ''large'' = 2000)
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_insert.scalars SELECT * EXCLUDE (i256, u256, d76, ip4, ip6) FROM ch.test_db.scalars;
+----
+2
+
+query I
+SELECT count(*) FROM ch.w_insert.scalars;
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT * FROM ch.w_insert.scalars EXCEPT SELECT * EXCLUDE (i256, u256, d76, ip4, ip6) FROM ch.test_db.scalars);
+----
+0
+
+# ClickHouse's own view; DateTime64(9) keeps DuckDB's microseconds
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(dt64_9), toString(e8), toString(uuid), hex(fs), toString(d32) FROM w_insert.scalars ORDER BY id');
+----
+1	2024-02-29 21:34:56.123456000	blue	61f0c404-5cb3-11e7-907b-a6006ad3dba0	616263	1900-01-01
+2	1970-01-01 09:00:00.000000000	red	00000000-0000-0000-0000-000000000000	78797A	1970-01-01
+
+# range limits; unlisted columns get ClickHouse defaults
+query I
+INSERT INTO ch.w_insert.scalars (id, i128, u128, d18, s, fs, d, d32, dt, dt64_3, dt64_9, uuid, e8) VALUES
+    (3, 170141183460469231731687303715884105727, '340282366920938463463374607431768211455'::UHUGEINT,
+     -99999999999999.9999, 'héllo', 'ab', DATE '2149-06-06', DATE '2299-12-31',
+     TIMESTAMPTZ '2106-02-07 06:28:15+00', TIMESTAMPTZ '2299-12-31 23:59:59.999+00',
+     TIMESTAMPTZ '2262-04-11 23:47:16.854775+00', 'ffffffff-ffff-ffff-ffff-ffffffffffff', 'green');
+----
+1
+
+query IIIIIIIIIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(i128), toString(u128), toString(d18), s, hex(fs), toString(d), toString(d32), toString(dt), toString(dt64_3), toString(dt64_9, ''UTC''), toString(uuid), toString(e8), i32 FROM w_insert.scalars WHERE id = 3');
+----
+170141183460469231731687303715884105727	340282366920938463463374607431768211455	-99999999999999.9999	héllo	616200	2149-06-06	2299-12-31	2106-02-07 06:28:15	2299-12-31 23:59:59.999	2262-04-11 23:47:16.854775000	ffffffff-ffff-ffff-ffff-ffffffffffff	green	0
+
+# ---------------------------------------------------------------------------
+# Nullable and LowCardinality
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.nullables (
+    id UInt8, i Nullable(Int32), s Nullable(String), d Nullable(Date), dt Nullable(DateTime(''UTC'')),
+    e Nullable(Enum8(''a'' = 1)), lc LowCardinality(Nullable(String)), lcs LowCardinality(String),
+    dec Nullable(Decimal(10, 2))
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_insert.nullables SELECT * EXCLUDE (ip) FROM ch.test_db.nullables;
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT * FROM ch.w_insert.nullables EXCEPT SELECT * EXCLUDE (ip) FROM ch.test_db.nullables);
+----
+0
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i IS NULL, ifNull(lc, ''<null>''), lcs FROM w_insert.nullables ORDER BY id');
+----
+1	1	<null>	x
+2	0	lc	y
+
+# ---------------------------------------------------------------------------
+# Array, Tuple and Map, including nested nulls
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.nested (
+    id UInt8, arr Array(Int32), arr_null Array(Nullable(String)), arr2 Array(Array(UInt8)),
+    tup Tuple(a Int32, b String), tup_unnamed Tuple(Int32, String), m Map(String, UInt64),
+    m_nested Map(String, Array(Nullable(Int32))), tup_nested Tuple(l Array(String), n Nullable(Int8))
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_insert.nested (id, arr, arr_null, arr2, tup, tup_unnamed, m)
+SELECT id, arr, arr_null, arr2, tup, tup_unnamed, m FROM ch.test_db.nested;
+----
+2
+
+query I
+INSERT INTO ch.w_insert.nested VALUES
+    (3, [4, 5], ['x', NULL], [[], [9, 8]], ROW(-1, 'two'), ROW(3, 'w'), MAP {'k': 42},
+     MAP {'a': [1, NULL], 'b': []}, ROW(['p', 'q'], NULL));
+----
+1
+
+query IIIIIIIII
+SELECT * FROM ch.w_insert.nested ORDER BY id;
+----
+1	[1, 2, 3]	[a, NULL]	[[1], [2, 3]]	{'a': 1, 'b': x}	{'1': 2, '2': y}	{k1=1, k2=2}	{}	{'l': [], 'n': NULL}
+2	[]	[]	[]	{'a': 0, 'b': ''}	{'1': 0, '2': ''}	{}	{}	{'l': [], 'n': NULL}
+3	[4, 5]	[x, NULL]	[[], [9, 8]]	{'a': -1, 'b': two}	{'1': 3, '2': w}	{k=42}	{a=[1, NULL], b=[]}	{'l': [p, q], 'n': NULL}
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(m_nested), toString(tup_nested) FROM w_insert.nested WHERE id = 3');
+----
+{'a':[1,NULL],'b':[]}	(['p','q'],NULL)
+
+# constant/dictionary input vectors: arr/tup/m are the same literal on every row, spanning several chunks
+query I
+INSERT INTO ch.w_insert.nested (id, arr, tup, m) SELECT 100 + (range % 100), [1, 2], ROW(7, 'k'), MAP {'a': 3} FROM range(3000);
+----
+3000
+
+query I
+SELECT count(*) FROM ch.w_insert.nested WHERE id >= 100;
+----
+3000
+
+query III
+SELECT arr, tup, m FROM ch.w_insert.nested WHERE id = 150 LIMIT 1;
+----
+[1, 2]	{'a': 7, 'b': k}	{a=3}
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(arr), toString(tup), toString(m) FROM w_insert.nested WHERE id = 150 LIMIT 1');
+----
+[1,2]	(7,'k')	{'a':3}
+
+# ---------------------------------------------------------------------------
+# Time / Time64
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.times (id UInt8, t Time, t3 Time64(3), t9 Time64(9)) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_insert.times SELECT * FROM ch.test_db.times;
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT * FROM ch.w_insert.times EXCEPT SELECT * FROM ch.test_db.times);
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(t9) FROM w_insert.times WHERE id = 1');
+----
+12:34:56.123456789
+
+# ---------------------------------------------------------------------------
+# column subsets: ClickHouse fills unlisted columns with their DEFAULTs; MATERIALIZED/ALIAS cannot be written
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.defaults (
+    id UInt32, s String DEFAULT ''dflt'', n UInt32 DEFAULT id * 10, m UInt32 MATERIALIZED id + 1,
+    a UInt32 ALIAS id + 2, e String EPHEMERAL ''x''
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_insert.defaults (id) VALUES (1), (2);
+----
+2
+
+query I
+INSERT INTO ch.w_insert.defaults (s, id) VALUES ('given', 3);
+----
+1
+
+query IIIII
+SELECT id, s, n, m, a FROM ch.w_insert.defaults ORDER BY id;
+----
+1	dflt	10	2	3
+2	dflt	20	3	4
+3	given	30	4	5
+
+statement error
+INSERT INTO ch.w_insert.defaults (id, m) VALUES (4, 0);
+----
+is a MATERIALIZED column
+
+statement error
+INSERT INTO ch.w_insert.defaults VALUES (4, 's', 0, 0, 0);
+----
+is a MATERIALIZED column
+
+# ---------------------------------------------------------------------------
+# values ClickHouse cannot store are rejected, never clamped; nothing is written
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.limits (
+    id UInt8, d Date, d32 Date32, dt DateTime(''UTC''), dt64 DateTime64(3, ''UTC''), dt64_9 DateTime64(9, ''UTC''),
+    fs FixedString(2), n Int32, arr Array(Int32), tup Tuple(a Int32, b String)
+) ENGINE = MergeTree ORDER BY id');
+
+statement error
+INSERT INTO ch.w_insert.limits (id, d) VALUES (1, DATE '1969-12-31');
+----
+outside the range of ClickHouse type Date
+
+statement error
+INSERT INTO ch.w_insert.limits (id, d) VALUES (1, DATE '2149-06-07');
+----
+outside the range of ClickHouse type Date
+
+statement error
+INSERT INTO ch.w_insert.limits (id, d) VALUES (1, 'infinity'::DATE);
+----
+outside the range of ClickHouse type Date
+
+statement error
+INSERT INTO ch.w_insert.limits (id, d32) VALUES (1, DATE '1899-12-31');
+----
+outside the range of ClickHouse type Date32
+
+statement error
+INSERT INTO ch.w_insert.limits (id, dt) VALUES (1, TIMESTAMPTZ '2106-02-07 06:28:16+00');
+----
+outside the range of ClickHouse type DateTime
+
+statement error
+INSERT INTO ch.w_insert.limits (id, dt64) VALUES (1, TIMESTAMPTZ '1899-12-31 23:59:59+00');
+----
+outside the range of ClickHouse type DateTime64
+
+statement error
+INSERT INTO ch.w_insert.limits (id, dt64_9) VALUES (1, TIMESTAMPTZ '2262-04-12 00:00:00+00');
+----
+outside the range of ClickHouse type DateTime64
+
+statement error
+INSERT INTO ch.w_insert.limits (id, fs) VALUES (1, 'abc');
+----
+does not fit ClickHouse type FixedString(2)
+
+statement error
+INSERT INTO ch.w_insert.limits (id, n) VALUES (1, NULL);
+----
+is not Nullable
+
+statement error
+INSERT INTO ch.w_insert.limits (id, arr) VALUES (1, [1, NULL]);
+----
+is not Nullable
+
+statement error
+INSERT INTO ch.w_insert.limits (id, arr) VALUES (1, NULL);
+----
+is not Nullable
+
+statement error
+INSERT INTO ch.w_insert.limits (id, tup) VALUES (1, NULL);
+----
+is not Nullable
+
+query I
+SELECT count(*) FROM ch.w_insert.limits;
+----
+0
+
+# a short FixedString value is zero-padded
+query I
+INSERT INTO ch.w_insert.limits (id, fs) VALUES (1, 'a');
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT hex(fs) FROM w_insert.limits');
+----
+6100
+
+# failing after a block has already been flushed: with ch_insert_block_size=1000, the first 4096 rows (two full
+# 2048-row chunks) are flushed before the NULL at range=5000 (in the third chunk) is rejected. ClickHouse may or
+# may not have committed those blocks, so nothing about their row count is asserted -- only that the connection
+# was discarded rather than reused mid-insert, proven by the INSERT below succeeding
+statement ok
+SET ch_insert_block_size = 1000;
+
+statement error
+INSERT INTO ch.w_insert.limits (id, n) SELECT 2, CASE WHEN range = 5000 THEN NULL ELSE range END FROM range(6000);
+----
+is not Nullable
+
+statement ok
+RESET ch_insert_block_size;
+
+query I
+INSERT INTO ch.w_insert.limits (id, fs) VALUES (9, 'zz');
+----
+1
+
+query I
+SELECT count(*) FROM ch.w_insert.limits WHERE id = 9;
+----
+1
+
+# ---------------------------------------------------------------------------
+# column types that cannot be written natively
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.unsupported (
+    id UInt8, v Variant(String, UInt64), dyn Dynamic, agg AggregateFunction(sum, UInt64),
+    sa SimpleAggregateFunction(anyLast, String), arr_ip Array(IPv4), m_ip Map(String, IPv4)
+) ENGINE = Memory');
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, v) VALUES (1, 'x');
+----
+Cannot insert into ClickHouse column "v" of type Variant(String, UInt64)
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, dyn) VALUES (1, '"x"');
+----
+Cannot insert into ClickHouse column "dyn" of type Dynamic
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, agg) VALUES (1, 'x');
+----
+Cannot insert into ClickHouse column "agg" of type AggregateFunction(sum, UInt64)
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, sa) VALUES (1, 'x');
+----
+Cannot insert into ClickHouse column "sa" of type SimpleAggregateFunction(anyLast, String)
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, arr_ip) VALUES (1, ['1.1.1.1']);
+----
+Cannot insert into ClickHouse column "arr_ip" of type Array(IPv4)
+
+statement error
+INSERT INTO ch.w_insert.unsupported (id, m_ip) VALUES (1, MAP {'a': '1.1.1.1'});
+----
+Cannot insert into ClickHouse column "m_ip" of type Map(String, IPv4)
+
+# the columns that can be written still can
+query I
+INSERT INTO ch.w_insert.unsupported (id) VALUES (1);
+----
+1
+
+query I
+SELECT id FROM ch.w_insert.unsupported;
+----
+1
+
+# ---------------------------------------------------------------------------
+# many blocks, INSERT … SELECT from DuckDB, COPY, empty inserts
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.big (n UInt64, s String) ENGINE = MergeTree ORDER BY n');
+
+statement error
+SET ch_insert_block_size = 0;
+----
+ch_insert_block_size must be greater than 0
+
+statement ok
+SET ch_insert_block_size = 1000;
+
+query I
+INSERT INTO ch.w_insert.big SELECT range, 'v' || range FROM range(10500);
+----
+10500
+
+query III
+SELECT count(*), sum(n), max(s) FROM ch.w_insert.big;
+----
+10500	55119750	v9999
+
+statement ok
+RESET ch_insert_block_size;
+
+statement ok
+CREATE TABLE local_rows AS SELECT range + 20000 AS n, 'local ' || range AS s FROM range(5);
+
+query I
+INSERT INTO ch.w_insert.big SELECT * FROM local_rows;
+----
+5
+
+query I
+INSERT INTO ch.w_insert.big SELECT * FROM local_rows WHERE n < 0;
+----
+0
+
+statement ok
+COPY (SELECT range + 30000 AS n, 'csv ' || range AS s FROM range(50)) TO '__TEST_DIR__/ch_rows.csv' (HEADER);
+
+query I
+COPY ch.w_insert.big FROM '__TEST_DIR__/ch_rows.csv';
+----
+50
+
+query I
+SELECT count(*) FROM ch.w_insert.big WHERE n >= 20000;
+----
+55
+
+# an empty INSERT … SELECT never reaches ClickHouse: the INSERT is opened by the first row, not when DuckDB
+# schedules the query (which happens before any upstream work, e.g. an ORDER BY, has produced a row)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.empty_target (n UInt64, s String) ENGINE = MergeTree ORDER BY n');
+
+query I
+INSERT INTO ch.w_insert.empty_target SELECT * FROM local_rows WHERE n < 0 ORDER BY n;
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.query_log WHERE query LIKE ''INSERT INTO `w_insert`.`empty_target`%''');
+----
+0
+
+# a prepared INSERT outlives a cache clear, which frees the table entry it was planned against
+statement ok
+PREPARE p AS INSERT INTO ch.w_insert.big VALUES ($1, $2);
+
+statement ok
+EXECUTE p(60000, 'p1');
+
+statement ok
+CALL clickhouse_clear_cache();
+
+statement ok
+EXECUTE p(60001, 'p2');
+
+# clickhouse_execute() clears the cache too
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+statement ok
+EXECUTE p(60002, 'p3');
+
+statement ok
+DEALLOCATE p;
+
+query II
+SELECT n, s FROM ch.w_insert.big WHERE n >= 60000 ORDER BY n;
+----
+60000	p1
+60001	p2
+60002	p3
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT n, s FROM w_insert.big WHERE n >= 60000 ORDER BY n');
+----
+60000	p1
+60001	p2
+60002	p3
+
+# the INSERT carried the connection's settings (the clickhouse-cpp patch). enable_time_time64_type is an alias for
+# allow_experimental_time_time64_type, and system.query_log.Settings records settings under their canonical name
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT Settings[''allow_experimental_time_time64_type''], Settings[''low_cardinality_allow_in_native_format''] FROM system.query_log WHERE type = ''QueryFinish'' AND query LIKE ''INSERT INTO `w_insert`.`big`%'' ORDER BY event_time_microseconds DESC LIMIT 1');
+----
+1	0
+
+# ---------------------------------------------------------------------------
+# unsupported INSERT forms
+# ---------------------------------------------------------------------------
+statement error
+INSERT INTO ch.w_insert.big VALUES (1, 'x') RETURNING n;
+----
+RETURNING is not supported for ClickHouse tables
+
+# rejected by DuckDB's binder or by PlanInsert, whichever comes first
+statement error
+INSERT OR IGNORE INTO ch.w_insert.big VALUES (1, 'x');
+----
+
+# ---------------------------------------------------------------------------
+# transactions: the write is committed right away; ROLLBACK warns
+# ---------------------------------------------------------------------------
+statement ok
+CALL enable_logging(level = 'warning');
+
+statement ok
+BEGIN;
+
+query I
+INSERT INTO ch.w_insert.big VALUES (40000, 'in transaction');
+----
+1
+
+query I
+SELECT count(*) FROM ch.w_insert.big WHERE n = 40000;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ch.w_insert.big WHERE n = 40000;
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
+----
+1
+
+# nothing was sent to ClickHouse: an empty INSERT, and one whose input fails before its first row. The transaction is
+# not marked as written, so this ROLLBACK does not warn
+statement ok
+BEGIN;
+
+query I
+INSERT INTO ch.w_insert.big SELECT * FROM local_rows WHERE n < 0;
+----
+0
+
+statement error
+INSERT INTO ch.w_insert.big SELECT range, error('upstream failure') FROM range(1);
+----
+upstream failure
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
+----
+1
+
+# ---------------------------------------------------------------------------
+# server errors; the failed INSERT's connection is discarded, not reused mid-insert
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch2 (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.gone (n UInt8) ENGINE = MergeTree ORDER BY n');
+
+query I
+SELECT count(*) FROM ch.w_insert.gone;
+----
+0
+
+# dropped behind ch's back: ch's metadata cache still has the table
+statement ok
+CALL clickhouse_execute('ch2', 'DROP TABLE w_insert.gone');
+
+statement error
+INSERT INTO ch.w_insert.gone VALUES (1);
+----
+UNKNOWN_TABLE
+
+query I
+INSERT INTO ch.w_insert.big VALUES (50000, 'after error');
+----
+1
+
+# ---------------------------------------------------------------------------
+# stale metadata: a column's type changes behind ch's back; the mismatch must not invalidate the database
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.stale (id UInt8, n Int32) ENGINE = MergeTree ORDER BY id');
+
+# caches ch's metadata for w_insert.stale with n as Int32
+query I
+SELECT count(*) FROM ch.w_insert.stale;
+----
+0
+
+# widened behind ch's back; ch2's cache is cleared, ch's is not
+statement ok
+CALL clickhouse_execute('ch2', 'ALTER TABLE w_insert.stale MODIFY COLUMN n Int64');
+
+statement error
+INSERT INTO ch.w_insert.stale VALUES (1, 2);
+----
+clickhouse_clear_cache()
+
+# an ordinary query still works: the mismatch did not invalidate the database
+query I
+SELECT 1;
+----
+1
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query I
+INSERT INTO ch.w_insert.stale VALUES (1, 2);
+----
+1
+
+# the read path: a SELECT through ch's stale metadata fails without invalidating the database
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_insert.stale_read (id UInt8, n Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_insert.stale_read VALUES (1, 5)');
+
+# caches ch's metadata for w_insert.stale_read with n as Int32 (DuckDB INTEGER)
+query II
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+1	5
+
+statement ok
+CALL clickhouse_execute('ch2', 'ALTER TABLE w_insert.stale_read MODIFY COLUMN n String');
+
+statement error
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+clickhouse_clear_cache()
+
+query I
+SELECT 1;
+----
+1
+
+statement ok
+CALL clickhouse_clear_cache();
+
+query II
+SELECT id, n FROM ch.w_insert.stale_read;
+----
+1	5
+
+query T
+SELECT typeof(n) FROM ch.w_insert.stale_read;
+----
+VARCHAR
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_insert');

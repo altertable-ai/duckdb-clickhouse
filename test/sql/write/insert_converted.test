@@ -1,0 +1,290 @@
+# name: test/sql/write/insert_converted.test
+# description: INSERT into column types ClickHouse converts: values travel as the read path's text and are converted back
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_conv');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_conv');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.source (
+    id UInt8, ip4 IPv4, ip6 Nullable(IPv6), i256 Int256, u256 UInt256, d76 Decimal(76, 5), bf BFloat16, j JSON,
+    p Point, r Ring, ls LineString, mls MultiLineString, poly Polygon, mpoly MultiPolygon, n Int32
+) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.converted AS w_conv.source');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_conv.source VALUES
+    (1, ''192.168.0.1'', ''2001:db8::1'', -1, 1, 12345.67891, 1.5, ''{"a": "x", "b": {"c": "y"}}'',
+     (1, 2), [(0, 0), (1, 0), (1, 1), (0, 0)], [(0, 0), (1, 1)], [[(0, 0), (1, 1)], [(2, 2), (3, 3)]],
+     [[(0, 0), (4, 0), (4, 4), (0, 0)]], [[[(0, 0), (1, 0), (1, 1), (0, 0)]]], 7),
+    (2, ''0.0.0.0'', NULL, 0, 0, 0, 0, ''{}'', (0, 0), [(0, 0), (2, 0), (2, 2), (0, 0)], [(5, 5), (6, 6)],
+     [[(1, 1), (2, 2)]], [[(0, 0), (3, 0), (3, 3), (0, 0)]], [[[(0, 0), (2, 0), (2, 2), (0, 0)]]], 0)');
+
+# ClickHouse -> DuckDB -> ClickHouse
+query I
+INSERT INTO ch.w_conv.converted SELECT * FROM ch.w_conv.source;
+----
+2
+
+# DuckDB's view: identical
+query I
+SELECT count(*) FROM (SELECT * FROM ch.w_conv.converted EXCEPT SELECT * FROM ch.w_conv.source);
+----
+0
+
+# ClickHouse's own view: identical values, compared as ClickHouse types
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_conv.source AS s INNER JOIN w_conv.converted AS c ON s.id = c.id
+    WHERE s.ip4 = c.ip4 AND ((s.ip6 IS NULL AND c.ip6 IS NULL) OR s.ip6 = c.ip6) AND s.i256 = c.i256 AND s.u256 = c.u256
+    AND s.d76 = c.d76 AND s.bf = c.bf AND toJSONString(s.j) = toJSONString(c.j) AND wkt(s.p) = wkt(c.p)
+    AND wkt(s.r) = wkt(c.r) AND wkt(s.ls) = wkt(c.ls) AND wkt(s.mls) = wkt(c.mls) AND wkt(s.poly) = wkt(c.poly)
+    AND wkt(s.mpoly) = wkt(c.mpoly) AND s.n = c.n');
+----
+2
+
+# literal values, a column subset and a NULL
+query I
+INSERT INTO ch.w_conv.converted (id, ip4, ip6, i256, d76, j, p) VALUES
+    (3, '10.0.0.1', NULL, '-57896044618658097711785492504343953926634992332820282019728792003956564819968', '-1.5',
+     '{"k": "v"}', 'POINT (3 4)');
+----
+1
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip4), ip6 IS NULL, toString(i256), toString(d76), toJSONString(j), wkt(p) FROM w_conv.converted WHERE id = 3');
+----
+10.0.0.1	1	-57896044618658097711785492504343953926634992332820282019728792003956564819968	-1.5	{"k":"v"}	POINT(3 4)
+
+# ClickHouse rejects text it cannot convert; nothing is written and the next INSERT works
+statement error
+INSERT INTO ch.w_conv.converted (id, ip4) VALUES (4, 'not an ip');
+----
+ClickHouse error
+
+query I
+SELECT count(*) FROM ch.w_conv.converted WHERE id = 4;
+----
+0
+
+query I
+INSERT INTO ch.w_conv.converted (id, ip4) VALUES (5, '1.1.1.1');
+----
+1
+
+# natively written columns keep working alongside converted ones, including many blocks
+statement ok
+SET ch_insert_block_size = 100;
+
+query I
+INSERT INTO ch.w_conv.converted (id, ip4, n) SELECT 10 + (range % 200), '10.0.' || (range // 256) || '.' || (range % 256), range::INTEGER FROM range(1000);
+----
+1000
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT count(), sum(n) FROM w_conv.converted WHERE id >= 10');
+----
+1000	499500
+
+# native types whose names hold quotes (and so are quoted again inside input()'s structure literal) next to a
+# converted column, in one INSERT
+statement ok
+RESET ch_insert_block_size;
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.mixed (
+    id UInt8, dt64 DateTime64(3, ''UTC''), e Enum8(''a'' = 1, ''b'' = 2), lc LowCardinality(String), ip IPv4
+) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_conv.mixed VALUES
+    (1, TIMESTAMPTZ '2024-01-02 03:04:05.678+00', 'b', 'it''s', '1.2.3.4'),
+    (2, TIMESTAMPTZ '1970-01-01 00:00:00+00', 'a', '', '255.255.255.255');
+----
+2
+
+query IIIII
+SELECT * FROM ch.w_conv.mixed ORDER BY id;
+----
+1	2024-01-02 03:04:05.678+00	b	it's	1.2.3.4
+2	1970-01-01 00:00:00+00	a	(empty)	255.255.255.255
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(dt64), toString(e), lc, toString(ip) FROM w_conv.mixed ORDER BY id');
+----
+1	2024-01-02 03:04:05.678	b	it's	1.2.3.4
+2	1970-01-01 00:00:00.000	a	(empty)	255.255.255.255
+
+# a Nullable column too rejects text it cannot convert (its CAST alone would store NULL), even in a block with valid
+# rows: nothing is written. NULL stays NULL, valid text round-trips
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.nul (id UInt8, ip Nullable(IPv4), ip6 Nullable(IPv6), i Nullable(Int256), u Nullable(UInt256), d Nullable(Decimal(76, 2))) ENGINE = MergeTree ORDER BY id');
+
+foreach col ip ip6 i u d
+
+statement error
+INSERT INTO ch.w_conv.nul (id, {col}) VALUES (1, 'bogus');
+----
+ClickHouse error
+
+endloop
+
+statement error
+INSERT INTO ch.w_conv.nul (id, ip) VALUES (1, '1.1.1.1'), (2, NULL), (3, 'bogus');
+----
+ClickHouse error
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_conv.nul');
+----
+0
+
+query I
+INSERT INTO ch.w_conv.nul VALUES (1, '1.2.3.4', '::1', '-5', '5', '1.25'), (2, NULL, NULL, NULL, NULL, NULL);
+----
+2
+
+query IIIIII
+SELECT * FROM ch.w_conv.nul ORDER BY id;
+----
+1	1.2.3.4	::1	-5	5	1.25
+2	NULL	NULL	NULL	NULL	NULL
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(ip6), toString(i), toString(u), toString(d) FROM w_conv.nul ORDER BY id');
+----
+1	1.2.3.4	::1	-5	5	1.25
+2	NULL	NULL	NULL	NULL	NULL
+
+# whatever the ATTACH's settings= say: an IP that does not parse is not turned into 0.0.0.0, and NULLs still skip
+# the conversion
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=cast_ipv4_ipv6_default_on_conversion_error=1' AS ch_lax (TYPE clickhouse);
+
+statement error
+INSERT INTO ch_lax.w_conv.nul (id, ip) VALUES (3, 'bogus');
+----
+ClickHouse error
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=short_circuit_function_evaluation=disable' AS ch_nsc (TYPE clickhouse);
+
+query I
+INSERT INTO ch_nsc.w_conv.nul (id, ip, i) VALUES (4, NULL, NULL), (5, '5.5.5.5', '7');
+----
+2
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(i) FROM w_conv.nul WHERE id >= 3 ORDER BY id');
+----
+4	NULL	NULL
+5	5.5.5.5	7
+
+# a JSON object with a duplicated path fails, even when the ATTACH's settings= would keep the first one
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=type_json_skip_duplicated_paths=1' AS ch_dup (TYPE clickhouse);
+
+statement error
+INSERT INTO ch_dup.w_conv.converted (id, j) VALUES (6, '{"a": 1, "a": 2}');
+----
+ClickHouse error
+
+query I
+SELECT count(*) FROM ch.w_conv.converted WHERE id = 6;
+----
+0
+
+statement ok
+DETACH ch_dup;
+
+statement ok
+DETACH ch_lax;
+
+statement ok
+DETACH ch_nsc;
+
+# (U)Int256 and Decimal(P > 38) text is converted exactly or rejected: out of range, too many decimals, or not plain
+# decimal notation fails (ClickHouse's CAST alone would wrap around or truncate). A sign and leading zeros are fine
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_conv.big (id UInt8, i Int256, u Nullable(UInt256), d Decimal(76, 2), dn Nullable(Decimal256(2))) ENGINE = MergeTree ORDER BY id');
+
+foreach v 57896044618658097711785492504343953926634992332820282019728792003956564819968 -57896044618658097711785492504343953926634992332820282019728792003956564819969 999999999999999999999999999999999999999999999999999999999999999999999999999999 1.5 1e3 +-5
+
+statement error
+INSERT INTO ch.w_conv.big (id, i) VALUES (1, '{v}');
+----
+ClickHouse error
+
+endloop
+
+foreach v 115792089237316195423570985008687907853269984665640564039457584007913129639936 -1
+
+statement error
+INSERT INTO ch.w_conv.big (id, u) VALUES (1, '{v}');
+----
+ClickHouse error
+
+endloop
+
+foreach v 1.009 -1.999 999999999999999999999999999999999999999999999999999999999999999999999999999 1e3 1.2.3 .
+
+statement error
+INSERT INTO ch.w_conv.big (id, d) VALUES (1, '{v}');
+----
+ClickHouse error
+
+endloop
+
+statement error
+INSERT INTO ch.w_conv.big (id, dn) VALUES (1, '2.567'), (2, NULL);
+----
+ClickHouse error
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_conv.big');
+----
+0
+
+query I
+INSERT INTO ch.w_conv.big VALUES
+    (1, '57896044618658097711785492504343953926634992332820282019728792003956564819967', '115792089237316195423570985008687907853269984665640564039457584007913129639935', '99999999999999999999999999999999999999999999999999999999999999999999999999.99', '-99999999999999999999999999999999999999999999999999999999999999999999999999.99'),
+    (2, '-57896044618658097711785492504343953926634992332820282019728792003956564819968', '0', '1.500', '.5'),
+    (3, '+007', '+007', '+001.50', '-0'),
+    (4, '-007', NULL, '-1.', NULL),
+    (5, '-0', '000', '7', '-.25');
+----
+5
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(i), toString(u), toString(d), toString(dn) FROM w_conv.big ORDER BY id');
+----
+1	57896044618658097711785492504343953926634992332820282019728792003956564819967	115792089237316195423570985008687907853269984665640564039457584007913129639935	99999999999999999999999999999999999999999999999999999999999999999999999999.99	-99999999999999999999999999999999999999999999999999999999999999999999999999.99
+2	-57896044618658097711785492504343953926634992332820282019728792003956564819968	0	1.5	0.5
+3	7	7	1.5	0
+4	-7	NULL	-1	NULL
+5	0	0	7	-0.25
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_conv');

@@ -1,0 +1,37 @@
+diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
+index b5d287b..a92c026 100644
+--- a/clickhouse/client.cpp
++++ b/clickhouse/client.cpp
+@@ -546,7 +546,7 @@ Block Client::Impl::BeginInsert(Query query) {
+         return true;
+     });
+
+-    SendQuery(query.GetText());
++    SendQuery(query);
+
+     // Wait for a data packet and return
+     uint64_t server_packet = 0;
+@@ -1381,6 +1381,10 @@ Block Client::BeginInsert(const std::string& query, const std::string& query_id) {
+     return impl_->BeginInsert(Query(query, query_id));
+ }
+
++Block Client::BeginInsert(const Query& query) {
++    return impl_->BeginInsert(query);
++}
++
+ void Client::SendInsertBlock(const Block& block) {
+     impl_->SendInsertBlock(block);
+ }
+diff --git a/clickhouse/client.h b/clickhouse/client.h
+index a55fd74..a0949cf 100644
+--- a/clickhouse/client.h
++++ b/clickhouse/client.h
+@@ -304,6 +304,8 @@ public:
+     /// Start an \p INSERT statement, insert batches of data, then finish the insert.
+     Block BeginInsert(const std::string& query);
+     Block BeginInsert(const std::string& query, const std::string& query_id);
++    /// Same, but sends the query's settings (and id) along with it.
++    Block BeginInsert(const Query& query);
+
+     /// Insert data using a \p block returned by \p BeginInsert.
+     void SendInsertBlock(const Block& block);

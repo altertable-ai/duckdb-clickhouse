@@ -1,0 +1,162 @@
+# name: test/sql/pushdown/uuid.test
+# description: UUID filters are evaluated by ClickHouse, ORDER BY on a UUID is not
+# group: [pushdown]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS p_uuid');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE p_uuid');
+
+# ClickHouse orders UUIDs by their second 64-bit half first: sorted natively, ids come out as 3, 6, 1, 2, 4, 5, 7.
+# ids follow DuckDB's order, which is also the order of the canonical text.
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE p_uuid.t (id Int32, u UUID, n Nullable(UUID)) ENGINE = MergeTree ORDER BY u');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO p_uuid.t VALUES
+    (1, ''00000000-0000-0000-0000-000000000001'', NULL),
+    (2, ''00000000-0000-0000-8000-000000000000'', ''00000000-0000-0000-8000-000000000000''),
+    (3, ''00000000-0000-0001-0000-000000000000'', ''00000000-0000-0001-0000-000000000000''),
+    (4, ''00112233-4455-6677-8899-aabbccddeeff'', ''00112233-4455-6677-8899-aabbccddeeff''),
+    (5, ''7fffffff-ffff-ffff-ffff-ffffffffffff'', ''7fffffff-ffff-ffff-ffff-ffffffffffff''),
+    (6, ''80000000-0000-0000-0000-000000000000'', ''80000000-0000-0000-0000-000000000000''),
+    (7, ''ffffffff-ffff-ffff-ffff-ffffffffffff'', ''ffffffff-ffff-ffff-ffff-ffffffffffff'')');
+
+# equality and inequality compare native UUIDs
+query I
+SELECT id FROM ch.p_uuid.t WHERE u = '00112233-4455-6677-8899-aabbccddeeff';
+----
+4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE u = '00112233-4455-6677-8899-aabbccddeeff';
+----
+analyzed_plan	<REGEX>:.*WHERE `u` = toUUID\('00112233-4455-6677-8899-aabbccddeeff'\)".*
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u != '00000000-0000-0001-0000-000000000000' ORDER BY id;
+----
+1
+2
+4
+5
+6
+7
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE u != '00000000-0000-0001-0000-000000000000';
+----
+analyzed_plan	<REGEX>:.*WHERE `u` != toUUID\('00000000-0000-0001-0000-000000000000'\)".*
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u IN ('00000000-0000-0000-0000-000000000001', 'ffffffff-ffff-ffff-ffff-ffffffffffff') ORDER BY id;
+----
+1
+7
+
+# range comparisons compare the canonical text, which orders like DuckDB's UUID. Compared natively, u < ...0001...
+# would match nothing and u >= 80000000-... would also match ids 1, 2, 4, 5
+query I
+SELECT id FROM ch.p_uuid.t WHERE u < '00000000-0000-0001-0000-000000000000' ORDER BY id;
+----
+1
+2
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE u < '00000000-0000-0001-0000-000000000000';
+----
+analyzed_plan	<REGEX>:.*WHERE toString\(`u`\) < '00000000-0000-0001-0000-000000000000'".*
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u <= '00000000-0000-0000-8000-000000000000' ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u > '7fffffff-ffff-ffff-ffff-ffffffffffff' ORDER BY id;
+----
+6
+7
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u >= '80000000-0000-0000-0000-000000000000' ORDER BY id;
+----
+6
+7
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE u BETWEEN '00000000-0000-0000-8000-000000000000' AND '7fffffff-ffff-ffff-ffff-ffffffffffff' ORDER BY id;
+----
+2
+3
+4
+5
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE u BETWEEN '00000000-0000-0000-8000-000000000000' AND '7fffffff-ffff-ffff-ffff-ffffffffffff';
+----
+analyzed_plan	<REGEX>:.*WHERE \(toString\(`u`\) >= '00000000-0000-0000-8000-000000000000' AND toString\(`u`\) <= '7fffffff-ffff-ffff-ffff-ffffffffffff'\)".*
+
+# Nullable(UUID): NULL never matches a comparison
+query I
+SELECT id FROM ch.p_uuid.t WHERE n < '00000000-0000-0001-0000-000000000000' ORDER BY id;
+----
+2
+
+query I
+SELECT id FROM ch.p_uuid.t WHERE n IS NULL;
+----
+1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE n IS NULL;
+----
+analyzed_plan	<REGEX>:.*WHERE `n` IS NULL".*
+
+# ORDER BY a UUID is never pushed: ClickHouse would pick different rows
+query I
+SELECT id FROM ch.p_uuid.t ORDER BY u LIMIT 3;
+----
+1
+2
+3
+
+query I
+SELECT id FROM ch.p_uuid.t ORDER BY u DESC LIMIT 2;
+----
+7
+6
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t ORDER BY u LIMIT 3;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `p_uuid`.`t`".*
+
+# a pushed UUID filter does not stop a LIMIT from being pushed
+query I
+SELECT count(*) FROM (SELECT id FROM ch.p_uuid.t WHERE u >= '80000000-0000-0000-0000-000000000000' LIMIT 1);
+----
+1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.p_uuid.t WHERE u >= '80000000-0000-0000-0000-000000000000' LIMIT 1;
+----
+analyzed_plan	<REGEX>:.*WHERE toString\(`u`\) >= '80000000-0000-0000-0000-000000000000' LIMIT 1".*
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE p_uuid');

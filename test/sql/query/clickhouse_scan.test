@@ -1,0 +1,38 @@
+# name: test/sql/query/clickhouse_scan.test
+# description: clickhouse_scan reads a table without ATTACH
+# group: [query]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+query II
+SELECT id, name FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 't1') ORDER BY id;
+----
+1	Alice
+2	Bob
+3	Charlie
+
+query I
+SELECT name FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 't1') WHERE id = 3;
+----
+Charlie
+
+statement ok
+CREATE SECRET scan_secret (TYPE clickhouse, USER '${CLICKHOUSE_TEST_USER}', PASSWORD '${CLICKHOUSE_TEST_PASSWORD}');
+
+query I
+SELECT count(*) FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT}', 'test_db', 'big', secret := 'scan_secret');
+----
+10000000
+
+statement error
+SELECT * FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}', 'test_db', 'nope');
+----
+ClickHouse table "test_db"."nope" not found

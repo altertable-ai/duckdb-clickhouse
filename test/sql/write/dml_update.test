@@ -1,0 +1,985 @@
+# name: test/sql/write/dml_update.test
+# description: UPDATE on attached ClickHouse tables, translated into ALTER TABLE … UPDATE
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_dml2');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_dml2');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.u (id Int32, name String, n Nullable(Int64), ip IPv4, e Enum8(''x'' = 1, ''y'' = 2)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.u SELECT range::INTEGER, 'name' || range, range, '10.0.0.' || range, 'x' FROM range(5);
+
+# several columns, expressions over the row, affected-row count
+query I
+UPDATE ch.w_dml2.u SET name = upper(name), n = n * 10 WHERE id >= 3;
+----
+2
+
+query III
+SELECT id, name, n FROM ch.w_dml2.u ORDER BY id;
+----
+0	name0	0
+1	name1	1
+2	name2	2
+3	NAME3	30
+4	NAME4	40
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w_dml2.u ORDER BY id)');
+----
+[0, 1, 2, 30, 40]
+
+# NULL, coalesce, no WHERE
+query I
+UPDATE ch.w_dml2.u SET n = NULL WHERE id = 1;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, n FROM w_dml2.u ORDER BY id');
+----
+0	0
+1	NULL
+2	2
+3	30
+4	40
+
+query I
+UPDATE ch.w_dml2.u SET n = coalesce(n, 0) + 1;
+----
+5
+
+query I
+SELECT list(n ORDER BY id) FROM ch.w_dml2.u;
+----
+[1, 1, 3, 31, 41]
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w_dml2.u ORDER BY id)');
+----
+[1, 1, 3, 31, 41]
+
+# enums, server-converted types (constants only, see below), CASE
+statement error
+UPDATE ch.w_dml2.u SET e = 'y', ip = '192.168.1.' || id::VARCHAR WHERE e = 'x' AND id < 2;
+----
+SET of column "ip" (IPv4) to a value that is not a constant: ClickHouse parses it from text
+
+query I
+UPDATE ch.w_dml2.u SET e = 'y', ip = '192.168.1.7' WHERE e = 'x' AND id < 2;
+----
+2
+
+query I
+UPDATE ch.w_dml2.u SET name = CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END;
+----
+5
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, name, toString(e), toString(ip) FROM w_dml2.u WHERE id <= 2 ORDER BY id');
+----
+0	even	y	192.168.1.7
+1	odd	y	192.168.1.7
+2	even	x	10.0.0.2
+
+# no row can match (DuckDB folds the plan to an empty result): nothing is updated, never every row
+query I
+UPDATE ch.w_dml2.u SET name = 'z' WHERE 1 = 0;
+----
+0
+
+query I
+SELECT count(*) FROM ch.w_dml2.u WHERE name = 'z';
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml2.u WHERE name = ''z''');
+----
+0
+
+# prepared statements: every EXECUTE plans the UPDATE again with the parameter values
+statement ok
+PREPARE pu AS UPDATE ch.w_dml2.u SET n = n + 100 WHERE id = $1;
+
+query I
+EXECUTE pu(2);
+----
+1
+
+query I
+EXECUTE pu(3);
+----
+1
+
+query II
+SELECT id, n FROM ch.w_dml2.u ORDER BY id;
+----
+0	1
+1	1
+2	103
+3	131
+4	41
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w_dml2.u ORDER BY id)');
+----
+[1, 1, 103, 131, 41]
+
+# a parameter in SET
+statement ok
+PREPARE pn AS UPDATE ch.w_dml2.u SET name = $2 WHERE id = $1;
+
+query I
+EXECUTE pn(4, 'four');
+----
+1
+
+query II
+SELECT id, name FROM ch.w_dml2.u ORDER BY id;
+----
+0	even
+1	odd
+2	even
+3	odd
+4	four
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, name FROM w_dml2.u ORDER BY id');
+----
+0	even
+1	odd
+2	even
+3	odd
+4	four
+
+# ClickHouse refuses to update a sorting-key column; the error is ClickHouse's
+statement error
+UPDATE ch.w_dml2.u SET id = 99 WHERE id = 1;
+----
+ClickHouse error
+
+# rejected before anything runs
+statement error
+UPDATE ch.w_dml2.u SET name = md5(name);
+----
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.u SET name = 'z' FROM (SELECT 1 AS k) s WHERE u.id = s.k;
+----
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.u SET name = 'z' WHERE id = 1 RETURNING id;
+----
+RETURNING is not supported for ClickHouse tables
+
+statement error
+UPDATE ch.w_dml2.u SET n = DEFAULT;
+----
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
+
+query I
+SELECT count(*) FROM ch.w_dml2.u WHERE name = 'z';
+----
+0
+
+# ch_mutations_sync
+statement error
+SET ch_mutations_sync = 3;
+----
+ch_mutations_sync must be 0, 1 or 2
+
+statement ok
+SET ch_mutations_sync = 1;
+
+query I
+UPDATE ch.w_dml2.u SET name = 'synced' WHERE id = 4;
+----
+1
+
+statement ok
+RESET ch_mutations_sync;
+
+query I
+SELECT name FROM ch.w_dml2.u WHERE id = 4;
+----
+synced
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM w_dml2.u WHERE id = 4');
+----
+synced
+
+# the setting is sent with the ALTER TABLE … UPDATE: 2 by default, 1 while ch_mutations_sync = 1
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT position(query, ''synced'') > 0, Settings[''mutations_sync''] FROM system.query_log WHERE type = ''QueryFinish'' AND query LIKE ''ALTER TABLE `w_dml2`.`u` UPDATE%'' AND (query LIKE ''%synced%'' OR query LIKE ''%192.168.1.%'') ORDER BY event_time_microseconds');
+----
+0	2
+1	1
+
+# an UPDATE of an array column is a DELETE + INSERT for DuckDB, which adds col = col for every other column: those
+# are dropped (the sorting key, and columns an expression may not read, included)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.a (id Int32, arr Array(Int32), arr2 Array(Int32), fs FixedString(2), d DateTime64(9)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.a VALUES (1, [1], [10, 11], ''ab'', ''2020-01-01 00:00:00.123456789''), (2, [2], [20], ''cd'', ''2021-01-01 00:00:00'')');
+
+query I
+UPDATE ch.w_dml2.a SET arr = arr2 WHERE id = 1;
+----
+1
+
+query II
+SELECT id, arr FROM ch.w_dml2.a ORDER BY id;
+----
+1	[10, 11]
+2	[2]
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(arr), fs, toString(d) FROM w_dml2.a ORDER BY id');
+----
+1	[10,11]	ab	2020-01-01 00:00:00.123456789
+2	[2]	cd	2021-01-01 00:00:00.000000000
+
+# FixedString and DateTime64(9) columns can be written (CAST to their own type)...
+query I
+UPDATE ch.w_dml2.a SET fs = 'zz', d = TIMESTAMP_NS '2022-02-02 02:02:02' WHERE id = 2;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT fs, toString(d) FROM w_dml2.a WHERE id = 2');
+----
+zz	2022-02-02 02:02:02.000000000
+
+# ...but not read: DuckDB and ClickHouse do not compare them the same way
+statement error
+UPDATE ch.w_dml2.a SET arr = [] WHERE d > TIMESTAMPTZ '2000-01-01 00:00:00+00';
+----
+UPDATE on ClickHouse table "w_dml2"."a" must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.a SET fs = upper(fs) WHERE id = 1;
+----
+UPDATE on ClickHouse table "w_dml2"."a" must filter only the modified table with translatable expressions
+
+# a hand-written col = col changes nothing: only the count runs
+query I
+UPDATE ch.w_dml2.a SET id = id WHERE id = 2;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml2.a ORDER BY id)');
+----
+[1, 2]
+
+# || (ClickHouse concat): NULL if an operand is NULL, in both
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.c (id Int32, s Nullable(String), lc LowCardinality(String), d Float64, k UInt32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.c VALUES (1, 'a', 'l1', 1.0, 10), (2, NULL, 'l2', 2.5, 20), (3, 'c', 'l3', 3.0, 30), (4, NULL, 'l4', 4.0, 40), (5, 'e', 'l5', 5.0, 50), (6, 'f', 'l6', 6.0, 60);
+
+query I
+UPDATE ch.w_dml2.c SET s = s || 'x';
+----
+6
+
+query II
+SELECT id, s FROM ch.w_dml2.c ORDER BY id;
+----
+1	ax
+2	NULL
+3	cx
+4	NULL
+5	ex
+6	fx
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, s FROM w_dml2.c ORDER BY id');
+----
+1	ax
+2	NULL
+3	cx
+4	NULL
+5	ex
+6	fx
+
+# an integer converts to the same text in both (DuckDB's implicit cast to VARCHAR); a LowCardinality(String) target
+query I
+UPDATE ch.w_dml2.c SET lc = 'x' || k WHERE id <= 2;
+----
+2
+
+query II
+SELECT id, lc FROM ch.w_dml2.c WHERE id <= 3 ORDER BY id;
+----
+1	x10
+2	x20
+3	l3
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, lc, toTypeName(lc) FROM w_dml2.c WHERE id <= 3 ORDER BY id');
+----
+1	x10	LowCardinality(String)
+2	x20	LowCardinality(String)
+3	l3	LowCardinality(String)
+
+# a DOUBLE does not (DuckDB's 1.0 is ClickHouse's 1): rejected, implicit or written
+statement error
+UPDATE ch.w_dml2.c SET lc = 'x' || d;
+----
+cast from DOUBLE to VARCHAR, which ClickHouse formats differently
+
+statement error
+UPDATE ch.w_dml2.c SET lc = 'z' WHERE d::VARCHAR = '1.0';
+----
+cast from DOUBLE to VARCHAR, which ClickHouse formats differently
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml2.c WHERE lc = ''z'' OR startsWith(lc, ''x'') AND id > 2');
+----
+0
+
+# an IN list of 5 or more values (rewritten into a MARK join) with a SET reading columns
+query I
+UPDATE ch.w_dml2.c SET k = k + id WHERE id IN (1, 3, 5, 7, 9);
+----
+3
+
+query II
+SELECT id, k FROM ch.w_dml2.c ORDER BY id;
+----
+1	11
+2	20
+3	33
+4	40
+5	55
+6	60
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(k) FROM (SELECT k FROM w_dml2.c ORDER BY id)');
+----
+[11, 20, 33, 40, 55, 60]
+
+# WHERE NULL: no row matches, nothing is sent
+query I
+UPDATE ch.w_dml2.c SET k = 0 WHERE NULL;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml2.c WHERE k = 0');
+----
+0
+
+# views are refused
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_dml2.v AS SELECT 1 AS one');
+
+statement error
+UPDATE ch.w_dml2.v SET one = 2;
+----
+is a ClickHouse view
+
+# ---------------------------------------------------------------------------
+# SET values cast with DuckDB's rounding: DOUBLE -> INTEGER half to even, DECIMAL scale-down half away from zero
+# (ClickHouse's CAST alone truncates both)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.r (id Int32, i Int32, dec Decimal(10, 2), dbl Float64, s String) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.r VALUES (1, 1, 1.25, 0.5, '1.25'), (2, 3, 1.35, 1.5, '1'), (3, 5, -1.25, 2.5, '1'),
+    (4, 7, 2.05, 3.5, '1'), (5, -1, 0.45, -0.5, '1'), (6, -3, -2.05, -1.5, '1');
+
+# what DuckDB itself writes, on a DuckDB copy of the table
+statement ok
+CREATE TABLE r_local AS SELECT * FROM ch.w_dml2.r;
+
+statement ok
+UPDATE r_local SET i = i / 2, dec = dec * 1.1;
+
+query I
+UPDATE ch.w_dml2.r SET i = i / 2, dec = dec * 1.1;
+----
+6
+
+query III
+SELECT id, i, dec FROM ch.w_dml2.r ORDER BY id;
+----
+1	0	1.38
+2	2	1.49
+3	2	-1.38
+4	4	2.26
+5	0	0.50
+6	-2	-2.26
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i, dec FROM w_dml2.r ORDER BY id');
+----
+1	0	1.38
+2	2	1.49
+3	2	-1.38
+4	4	2.26
+5	0	0.50
+6	-2	-2.26
+
+query I
+SELECT count(*) FROM ch.w_dml2.r c JOIN r_local l USING (id) WHERE c.i = l.i AND c.dec = l.dec;
+----
+6
+
+# an explicit cast, and DECIMAL -> INTEGER (half away from zero)
+query I
+UPDATE ch.w_dml2.r SET i = CAST(dbl AS INTEGER) * 10 + CAST(dec AS INTEGER);
+----
+6
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i FROM w_dml2.r ORDER BY id');
+----
+1	1
+2	21
+3	19
+4	42
+5	1
+6	-22
+
+# rejected: DOUBLE and VARCHAR -> DECIMAL (DuckDB rounds to the scale, ClickHouse truncates)
+statement error
+UPDATE ch.w_dml2.r SET dec = dbl;
+----
+cast from DOUBLE to DECIMAL(10,2) has no exact ClickHouse translation
+
+statement error
+UPDATE ch.w_dml2.r SET dec = s::DECIMAL(10, 1);
+----
+cast from VARCHAR to DECIMAL(10,1) has no exact ClickHouse translation
+
+statement error
+UPDATE ch.w_dml2.r SET i = dbl // 1;
+----
+// on DOUBLE has no exact ClickHouse translation
+
+# rejected: VARCHAR -> DOUBLE (ClickHouse's parse is not correctly rounded: '1.7091' is read as 1.7090999999999998),
+# implicit or written
+statement error
+UPDATE ch.w_dml2.r SET dbl = s;
+----
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+statement error
+UPDATE ch.w_dml2.r SET dbl = s::DOUBLE * 2;
+----
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(dec), groupArray(i), groupArray(dbl) FROM (SELECT dec, i, dbl FROM w_dml2.r ORDER BY id)');
+----
+[1.38, 1.49, -1.38, 2.26, 0.50, -2.26]	[1, 21, 19, 42, 1, -22]	[0.5, 1.5, 2.5, 3.5, -0.5, -1.5]
+
+# ---------------------------------------------------------------------------
+# SET into DateTime and DateTime64(p < 6) floors the microsecond value like an INSERT does (ClickHouse's CAST alone
+# truncates toward zero: 1969-12-31 23:59:59.999999 would become 1970-01-01 00:00:00.000)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts (id Int32, src Nullable(DateTime64(6, ''UTC'')), t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC''), arr Array(DateTime64(3, ''UTC'')), arr2 Array(DateTime64(3, ''UTC'')), tup Tuple(a DateTime64(3, ''UTC'')), tup2 Tuple(a DateTime64(3, ''UTC'')), mp Map(String, DateTime(''UTC'')), mp2 Map(String, DateTime(''UTC''))) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.ts (id, src, t3) VALUES (1, ''1969-12-31 23:59:59.9995'', ''2000-01-01 00:00:00''), (2, ''1969-12-31 23:59:59.999999'', ''2000-01-01 00:00:00''), (3, ''1969-12-31 23:59:59.999'', ''2000-01-01 00:00:00''), (4, ''2024-06-01 12:00:00.123999'', ''2000-01-01 00:00:00''), (5, ''2024-06-01 12:00:00.123'', ''2000-01-01 00:00:00''), (6, NULL, ''2000-01-01 00:00:00'')');
+
+# what an INSERT writes for the same values (a DateTime cannot hold the pre-1970 ones)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts_ins (id Int32, t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC'')) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.ts_ins SELECT id, src, coalesce(src, t5), CASE WHEN id IN (4, 5) THEN src ELSE t0 END FROM ch.w_dml2.ts;
+
+query I
+UPDATE ch.w_dml2.ts SET t3 = src, t5 = coalesce(src, t5), t0 = CASE WHEN id IN (4, 5) THEN src ELSE t0 END;
+----
+6
+
+query IIII
+SELECT id, t3, t5, t0 FROM ch.w_dml2.ts ORDER BY id;
+----
+1	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.9995+00	1970-01-01 00:00:00+00
+2	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.99999+00	1970-01-01 00:00:00+00
+3	1969-12-31 23:59:59.999+00	1969-12-31 23:59:59.999+00	1970-01-01 00:00:00+00
+4	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00.12399+00	2024-06-01 12:00:00+00
+5	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00.123+00	2024-06-01 12:00:00+00
+6	NULL	1970-01-01 00:00:00+00	1970-01-01 00:00:00+00
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t5, ''UTC''), toString(t0), toTypeName(t5) FROM w_dml2.ts ORDER BY id');
+----
+1	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99950	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+2	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99999	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+3	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99900	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+4	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12399	2024-06-01 12:00:00	DateTime64(5, 'Asia/Tokyo')
+5	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12300	2024-06-01 12:00:00	DateTime64(5, 'Asia/Tokyo')
+6	NULL	1970-01-01 00:00:00.00000	1970-01-01 00:00:00	DateTime64(5, 'Asia/Tokyo')
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t5, ''UTC''), toString(t0) FROM w_dml2.ts_ins ORDER BY id');
+----
+1	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99950	1970-01-01 00:00:00
+2	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99999	1970-01-01 00:00:00
+3	1969-12-31 23:59:59.999	1969-12-31 23:59:59.99900	1970-01-01 00:00:00
+4	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12399	2024-06-01 12:00:00
+5	2024-06-01 12:00:00.123	2024-06-01 12:00:00.12300	2024-06-01 12:00:00
+6	NULL	1970-01-01 00:00:00.00000	1970-01-01 00:00:00
+
+query I
+SELECT count(*) FROM ch.w_dml2.ts u JOIN ch.w_dml2.ts_ins i USING (id) WHERE u.t3 IS NOT DISTINCT FROM i.t3 AND u.t5 = i.t5 AND u.t0 = i.t0;
+----
+6
+
+# literals (fromUnixTimestamp64Micro) are floored too
+query I
+UPDATE ch.w_dml2.ts SET t3 = NULL WHERE id = 5;
+----
+1
+
+query I
+UPDATE ch.w_dml2.ts SET t3 = TIMESTAMPTZ '1969-12-31 23:59:59.9995+00' WHERE id = 4;
+----
+1
+
+query I
+UPDATE ch.w_dml2.ts SET t0 = TIMESTAMPTZ '2024-01-01 00:00:00.9+00' WHERE id = 4;
+----
+1
+
+query III
+SELECT id, t3, t0 FROM ch.w_dml2.ts WHERE id IN (4, 5) ORDER BY id;
+----
+4	1969-12-31 23:59:59.999+00	2024-01-01 00:00:00+00
+5	NULL	2024-06-01 12:00:00+00
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t0) FROM w_dml2.ts WHERE id IN (4, 5) ORDER BY id');
+----
+4	1969-12-31 23:59:59.999	2024-01-01 00:00:00
+5	NULL	2024-06-01 12:00:00
+
+# nested in an Array, Tuple or Map, such timestamps are rejected
+statement error
+UPDATE ch.w_dml2.ts SET arr = arr2 WHERE id = 1;
+----
+whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+statement error
+UPDATE ch.w_dml2.ts SET tup = tup2 WHERE id = 1;
+----
+SET of column "tup" (Tuple(a DateTime64(3, 'UTC'))), whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+statement error
+UPDATE ch.w_dml2.ts SET mp = mp2 WHERE id = 1;
+----
+SET of column "mp" (Map(String, DateTime('UTC'))), whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT countIf(empty(arr)), countIf(tup.a = toDateTime64(0, 3, ''UTC'')), countIf(empty(mp)) FROM w_dml2.ts');
+----
+6	6	6
+
+# ---------------------------------------------------------------------------
+# a cast from VARCHAR to another type on a column is rejected: ClickHouse turns a string it cannot parse into NULL
+# (or fails the mutation, which then stays stuck), where DuckDB fails the statement. Constants are folded by DuckDB
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.vs (id Int32, s String, i Nullable(Int32), j Int32, b Nullable(Bool), d Nullable(Date32), e Nullable(Enum8(''x'' = 1, ''y'' = 2)), u Nullable(UUID)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.vs (id, s, j) VALUES (1, '1', 0), (2, 'abc', 0), (3, '3000000000', 0);
+
+foreach set i=s j=s i=s::INTEGER+1 b=s d=s e=s u=s i=(s||'1')::INTEGER j=coalesce(s::INTEGER,0)
+
+statement error
+UPDATE ch.w_dml2.vs SET {set};
+----
+<REGEX>:.*cast from VARCHAR to (INTEGER|BOOLEAN|DATE|ENUM.*|UUID) has no exact ClickHouse translation.*
+
+endloop
+
+statement error
+UPDATE ch.w_dml2.vs SET j = 1 WHERE s::INTEGER <> 4;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+query IIIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, s, i, j, b, d, e FROM w_dml2.vs ORDER BY id');
+----
+1	1	NULL	0	NULL	NULL	NULL
+2	abc	NULL	0	NULL	NULL	NULL
+3	3000000000	NULL	0	NULL	NULL	NULL
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''vs''');
+----
+0
+
+# string constants: folded into literals of the column's type by DuckDB
+query I
+UPDATE ch.w_dml2.vs SET i = '5', b = 'true', d = '2024-02-29', e = 'y', u = '00000000-0000-0000-0000-000000000001' WHERE id = 1;
+----
+1
+
+query I
+UPDATE ch.w_dml2.vs SET j = 7 WHERE i = '5' AND d = '2024-02-29' AND e = 'y' AND b = 'true';
+----
+1
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT i, j, b, toString(d), toString(e), toString(u) FROM w_dml2.vs WHERE id = 1');
+----
+5	7	true	2024-02-29	y	00000000-0000-0000-0000-000000000001
+
+# a string constant DuckDB cannot convert stays a cast, rejected like the others: nothing is written
+statement error
+UPDATE ch.w_dml2.vs SET i = 'abc';
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation: CAST('abc' AS INTEGER)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(i) FROM (SELECT i FROM w_dml2.vs ORDER BY id)');
+----
+[5]
+
+# ---------------------------------------------------------------------------
+# columns DuckDB reads as text that ClickHouse stores as IPv4, IPv6 or FixedString: the mutation would parse the
+# text, turning what does not parse into NULL or failing (and then staying stuck). Only constants are written,
+# converted on the server before the mutation is sent. The other types ClickHouse converts are refused (see w_dml2.cv)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ip (id Int32, s String, ip Nullable(IPv4), ipn IPv4, fs FixedString(2), i Nullable(Int256), p Point) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.ip VALUES (1, 'abc', '1.2.3.4', '1.2.3.4', 'ab', '1', 'POINT (0 0)'), (2, '5.6.7.8', NULL, '0.0.0.0', 'cd', NULL, 'POINT (1 1)');
+
+foreach set ip=s ipn=s fs=s fs=upper(s) ip=coalesce(s,'1.1.1.1')
+
+statement error
+UPDATE ch.w_dml2.ip SET {set} WHERE id = 1;
+----
+<REGEX>:.*UPDATE on ClickHouse table "w_dml2"."ip" must filter only the modified table with translatable expressions \(SET of column "(ip|ipn|fs)" \(.*\) to a value that is not a constant: ClickHouse parses it from text\); use clickhouse_execute\(\) for anything else.*
+
+endloop
+
+foreach set i=s p=s i='x' p='nope' i='-7'
+
+statement error
+UPDATE ch.w_dml2.ip SET {set} WHERE id = 1;
+----
+<REGEX>:.*SET of column "(i|p)" \(.*\): ClickHouse converts the new value on the server, not always exactly.*
+
+endloop
+
+statement error
+UPDATE ch.w_dml2.ip SET p = 'POINT (3 4)' WHERE id = 1;
+----
+SET of column "p" (Point): ClickHouse converts the new value on the server, not always exactly
+
+foreach set ip='bogus' ipn='bogus' fs='abc'
+
+statement error
+UPDATE ch.w_dml2.ip SET {set} WHERE id = 2;
+----
+ClickHouse error
+
+endloop
+
+# NULL into the non-Nullable IPv4 column: refused while planning, like DuckDB's own NOT NULL check
+statement error
+UPDATE ch.w_dml2.ip SET ipn = NULL WHERE id = 2;
+----
+Constraint Error: NOT NULL constraint failed: ip.ipn
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(ipn), fs, toString(i), wkt(p) FROM w_dml2.ip ORDER BY id');
+----
+1	1.2.3.4	1.2.3.4	ab	1	POINT(0 0)
+2	NULL	0.0.0.0	cd	NULL	POINT(1 1)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''ip''');
+----
+0
+
+query I
+UPDATE ch.w_dml2.ip SET ip = '9.9.9.9', ipn = '8.8.8.8', fs = 'z' WHERE id = 1;
+----
+1
+
+query IIII
+SELECT ip, ipn, i, p FROM ch.w_dml2.ip WHERE id = 1;
+----
+9.9.9.9	8.8.8.8	1	POINT(0 0)
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip), toString(ipn), hex(fs), toString(i), wkt(p) FROM w_dml2.ip WHERE id = 1');
+----
+9.9.9.9	8.8.8.8	7A00	1	POINT(0 0)
+
+query I
+UPDATE ch.w_dml2.ip SET ip = NULL, i = NULL WHERE id = 1;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(ip), toString(i) FROM w_dml2.ip WHERE id = 1');
+----
+NULL	NULL
+
+# no mutation was left stuck: a later DELETE runs
+query I
+DELETE FROM ch.w_dml2.ip WHERE id = 2;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''ip'' AND NOT is_done');
+----
+0
+
+# ---------------------------------------------------------------------------
+# NULL into a column ClickHouse cannot store NULL in: the mutation would fail on the first such row and stay stuck.
+# DuckDB raises its NOT NULL error instead, and nothing is sent
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.nn (id Int32, i Int32, n Nullable(Int32), lc LowCardinality(String), ln LowCardinality(Nullable(String)), a Array(Int32), v Variant(Int32, String)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.nn VALUES (1, 1, NULL, ''a'', NULL, [1], NULL), (2, 2, 5, ''b'', ''x'', [2], ''w''), (3, 3, 7, ''c'', ''y'', [3], 3)');
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n;
+----
+Constraint Error: NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s) the WHERE clause matches
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n WHERE id <= 2;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s)
+
+statement error
+UPDATE ch.w_dml2.nn SET i = CASE WHEN id = 3 THEN NULL ELSE i END WHERE id >= 2;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s)
+
+# LowCardinality(String) is not Nullable either; the first SET column that would get a NULL is named
+statement error
+UPDATE ch.w_dml2.nn SET i = coalesce(n, 0), lc = ln;
+----
+NOT NULL constraint failed: nn.lc (the new value is NULL in 1 row(s)
+
+# a NULL constant is refused while planning
+foreach set i=NULL lc=NULL a=NULL i=NULL::INTEGER+1
+
+statement error
+UPDATE ch.w_dml2.nn SET {set} WHERE id = 2;
+----
+<REGEX>:Constraint Error: NOT NULL constraint failed: nn\.(i|lc|a)\s*
+
+endloop
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i, n, lc, toString(ln) FROM w_dml2.nn ORDER BY id');
+----
+1	1	NULL	a	NULL
+2	2	5	b	x
+3	3	7	c	y
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nn''');
+----
+0
+
+# a WHERE clause that leaves out the NULL rows
+query I
+UPDATE ch.w_dml2.nn SET i = n, lc = ln WHERE id >= 2;
+----
+2
+
+# no NULL can come out: nothing to check
+query I
+UPDATE ch.w_dml2.nn SET i = i + 10 WHERE id <> 2;
+----
+2
+
+# a Variant column holds NULL
+query I
+UPDATE ch.w_dml2.nn SET v = NULL WHERE id = 2;
+----
+1
+
+query IIIII
+SELECT id, i, n, lc, v FROM ch.w_dml2.nn ORDER BY id;
+----
+1	11	NULL	a	null
+2	5	5	x	null
+3	17	7	y	3
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i, n, lc, toString(ln), isNull(v) FROM w_dml2.nn ORDER BY id');
+----
+1	11	NULL	a	NULL	1
+2	5	5	x	x	1
+3	17	7	y	y	0
+
+# a deleted row that is not purged yet still reaches the mutation, so it counts
+query I
+DELETE FROM ch.w_dml2.nn WHERE id = 1;
+----
+1
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s) the WHERE clause matches, counting deleted rows not purged yet
+
+statement ok
+CALL clickhouse_execute('ch', 'ALTER TABLE w_dml2.nn APPLY DELETED MASK SETTINGS mutations_sync = 2');
+
+query I
+UPDATE ch.w_dml2.nn SET i = n;
+----
+2
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i FROM w_dml2.nn ORDER BY id');
+----
+2	5
+3	7
+
+# nothing was left stuck: later statements run
+query I
+DELETE FROM ch.w_dml2.nn WHERE id = 3;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nn'' AND NOT is_done');
+----
+0
+
+# ---------------------------------------------------------------------------
+# NULL elements (Array, Tuple, Map, at any level) into a column whose elements cannot hold NULL: the mutation would
+# fail on the first one and stay stuck. Refused while planning, from the ClickHouse types of the source column
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.nest (id Int32, a Array(Int32), a2 Array(Int32), b Array(Nullable(Int32)), t Tuple(x Int32, y String), t2 Tuple(x Nullable(Int32), y String), t3 Tuple(x Int32, y String), m Map(String, Int32), m2 Map(String, Int32), mn Map(String, Nullable(Int32)), aa Array(Array(Int32)), ab Array(Array(Nullable(Int32)))) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.nest VALUES (1, [1], [2], [NULL], (1, ''a''), (NULL, ''b''), (3, ''c''), {''k'': 1}, {''k'': 2}, {''k'': NULL}, [[1]], [[NULL]])');
+
+foreach set a=b t=t2 m=mn aa=ab
+
+statement error
+UPDATE ch.w_dml2.nest SET {set} WHERE id = 1;
+----
+<REGEX>:.*UPDATE on ClickHouse table "w_dml2"."nest" must filter only the modified table with translatable expressions \(SET of column "(a|t|m|aa)" \(.*\) to column "(b|t2|mn|ab)" \(.*\), whose elements can be NULL where the column's cannot\); use clickhouse_execute\(\) for anything else.*
+
+endloop
+
+# any other value that is not a constant: its elements could be NULL
+statement error
+UPDATE ch.w_dml2.nest SET a = CASE WHEN id = 1 THEN a2 ELSE a END WHERE id = 1;
+----
+SET of column "a" (Array(Int32)) to a computed value, whose elements could be NULL where the column's cannot
+
+statement error
+UPDATE ch.w_dml2.nest SET a = [1, NULL] WHERE id = 1;
+----
+NOT NULL constraint failed: nest.a (an element of the new value is NULL, which ClickHouse type Array(Int32) cannot store)
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(a), toString(t), toString(m), toString(aa) FROM w_dml2.nest');
+----
+[1]	(1,'a')	{'k':1}	[[1]]
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nest''');
+----
+0
+
+# the same types, or elements that cannot be NULL into ones that can
+query I
+UPDATE ch.w_dml2.nest SET a = a2, t = t3, m = m2, b = a, mn = m WHERE id = 1;
+----
+1
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT toString(a), toString(t), toString(m), toString(b), toString(mn) FROM w_dml2.nest');
+----
+[2]	(3,'c')	{'k':2}	[1]	{'k':1}
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nest'' AND NOT is_done');
+----
+0
+
+# ---------------------------------------------------------------------------
+# types ClickHouse converts on the server other than IPv4, IPv6 and FixedString ((U)Int256, Decimal256, BFloat16,
+# JSON, Variant, Dynamic, geo types): the conversion is not always exact, so only NULL can be set (where the column
+# holds NULL)
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.cv (id Int32, u UInt256, d Decimal(76, 2), bf BFloat16, bfn Nullable(BFloat16), j JSON, v Variant(Int32, String), dy Dynamic, g Point, i Nullable(Int256)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.cv VALUES (1, 1, 1.5, 1.5, 1.5, ''{"a": 1}'', 1, 1, (0, 0), 1)');
+
+foreach set u='5' d='2.567' bf=2.5 bfn=2.5 j='{"b":2}' v='"42"' dy='x' g='x' i='-7' bf=bf+1
+
+statement error
+UPDATE ch.w_dml2.cv SET {set} WHERE id = 1;
+----
+<REGEX>:.*UPDATE on ClickHouse table "w_dml2"."cv" must filter only the modified table with translatable expressions \(SET of column "(u|d|bf|bfn|j|v|dy|g|i)" \(.*\): ClickHouse converts the new value on the server, not always exactly\); use clickhouse_execute\(\) for anything else.*
+
+endloop
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''cv''');
+----
+0
+
+query I
+UPDATE ch.w_dml2.cv SET bfn = NULL, i = NULL, v = NULL WHERE id = 1;
+----
+1
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT isNull(bfn), isNull(i), isNull(v), toString(u) FROM w_dml2.cv');
+----
+1	1	1	1
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

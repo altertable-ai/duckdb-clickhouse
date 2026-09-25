@@ -1,0 +1,101 @@
+# name: test/sql/catalog/columns.test
+# description: ClickHouse column types map to the expected DuckDB types and nullability
+# group: [catalog]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query III
+SELECT column_name, data_type, is_nullable FROM duckdb_columns() WHERE database_name = 'ch' AND table_name = 'scalars' ORDER BY column_index;
+----
+id	UTINYINT	false
+b	BOOLEAN	false
+i8	TINYINT	false
+i16	SMALLINT	false
+i32	INTEGER	false
+i64	BIGINT	false
+u8	UTINYINT	false
+u16	USMALLINT	false
+u32	UINTEGER	false
+u64	UBIGINT	false
+i128	HUGEINT	false
+u128	UHUGEINT	false
+i256	VARCHAR	false
+u256	VARCHAR	false
+f32	FLOAT	false
+f64	DOUBLE	false
+d9	DECIMAL(9,2)	false
+d18	DECIMAL(18,4)	false
+d38	DECIMAL(38,10)	false
+d76	VARCHAR	false
+s	VARCHAR	false
+fs	VARCHAR	false
+d	DATE	false
+d32	DATE	false
+dt	TIMESTAMP WITH TIME ZONE	false
+dt64_3	TIMESTAMP WITH TIME ZONE	false
+dt64_9	TIMESTAMP WITH TIME ZONE	false
+uuid	UUID	false
+ip4	VARCHAR	false
+ip6	VARCHAR	false
+e8	ENUM('blue', 'red', 'green')	false
+e16	ENUM('small', 'large')	false
+
+query III
+SELECT column_name, data_type, is_nullable FROM duckdb_columns() WHERE database_name = 'ch' AND table_name = 'nullables' ORDER BY column_index;
+----
+id	UTINYINT	false
+i	INTEGER	true
+s	VARCHAR	true
+d	DATE	true
+dt	TIMESTAMP WITH TIME ZONE	true
+e	ENUM('a')	true
+lc	VARCHAR	true
+lcs	VARCHAR	false
+dec	DECIMAL(10,2)	true
+ip	VARCHAR	true
+
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'ch' AND table_name = 'nested' ORDER BY column_index;
+----
+id	UTINYINT
+arr	INTEGER[]
+arr_null	VARCHAR[]
+arr2	UTINYINT[][]
+tup	STRUCT(a INTEGER, b VARCHAR)
+tup_unnamed	STRUCT("1" INTEGER, "2" VARCHAR)
+m	MAP(VARCHAR, UBIGINT)
+m_ip	MAP(VARCHAR, VARCHAR)
+arr_ip	VARCHAR[]
+tup_ip	STRUCT(ip VARCHAR, n TINYINT)
+
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'ch' AND table_name IN ('semi', 'times', 'aggregates') ORDER BY table_name, column_index;
+----
+k	UTINYINT
+total	VARCHAR
+last	VARCHAR
+id	UTINYINT
+j	JSON
+v	JSON
+dyn	JSON
+id	UTINYINT
+t	TIME
+t3	TIME
+t9	TIME_NS
+
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'ch' AND table_name = 'v1' ORDER BY column_index;
+----
+id	UBIGINT
+name	VARCHAR

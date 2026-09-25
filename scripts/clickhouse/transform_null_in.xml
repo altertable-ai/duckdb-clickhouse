@@ -1,0 +1,9 @@
+<!-- Second test server (see scripts/test_with_clickhouse.sh): transform_null_in = 1 in the default profile, loaded at
+     startup, reaches mutations and lightweight DELETEs, which no query setting overrides -->
+<clickhouse>
+    <profiles>
+        <default>
+            <transform_null_in>1</transform_null_in>
+        </default>
+    </profiles>
+</clickhouse>

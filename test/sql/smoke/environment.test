@@ -1,0 +1,20 @@
+# name: test/sql/smoke/environment.test
+# description: make smoke exports the ClickHouse connection variables
+# group: [smoke]
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_TLS_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require-env CLICKHOUSE_TEST_CA_CERT
+
+query IIII
+SELECT '${CLICKHOUSE_TEST_HOST}', '${CLICKHOUSE_TEST_PORT}'::INTEGER > 0, '${CLICKHOUSE_TEST_TLS_PORT}'::INTEGER > 0, '${CLICKHOUSE_TEST_PORT}' <> '${CLICKHOUSE_TEST_TLS_PORT}';
+----
+127.0.0.1	true	true	true

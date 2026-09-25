@@ -1,0 +1,229 @@
+# name: test/sql/scale/volume.test
+# description: scans, filters, inserts and mutations past one vector and one insert block, checked against ClickHouse
+# group: [scale]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_scale');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_scale');
+
+# 200000 rows: more than one DuckDB vector (2048) and, once inserted from DuckDB below, more than one
+# insert block. Every 17th n is NULL, every 1000th string is 4000 bytes, arrays cycle through lengths 0..4.
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_scale.t (
+    id UInt32, n Nullable(Int64), s String, tag LowCardinality(String), v Float64, arr Array(Int32), ip IPv4
+) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_scale.t
+    SELECT number,
+           if(number % 17 = 0, NULL, toInt64(number)),
+           if(number % 1000 = 0, repeat(''x'', 4000), toString(number)),
+           if(number % 2 = 0, ''even'', ''odd''),
+           number / 10,
+           range(number % 5),
+           toIPv4(toUInt32(number % 200 + 1))
+    FROM numbers(200000)');
+
+statement ok
+SET threads = 4;
+
+# the scan and ClickHouse agree on the row count and on sum(), which skips the NULLs
+query I
+SELECT count(*) FROM (
+    SELECT count(*)::VARCHAR AS c, sum(n)::VARCHAR AS s FROM ch.w_scale.t
+    EXCEPT
+    SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()) AS c, toString(sum(n)) AS s FROM w_scale.t')
+);
+----
+0
+
+# array lengths and the long strings survive the chunk boundary
+query I
+SELECT count(*) FROM (
+    SELECT sum(len(arr))::VARCHAR AS n FROM ch.w_scale.t
+    EXCEPT
+    SELECT * FROM clickhouse_query('ch', 'SELECT toString(sum(length(arr))) AS n FROM w_scale.t')
+);
+----
+0
+
+query I
+SELECT count(*) FROM ch.w_scale.t WHERE length(s) = 4000;
+----
+200
+
+# IPv4 is read as text; id % 200 = 0 stores 0.0.0.1 (1000 of the 200000 rows)
+query I
+SELECT count(*) FROM ch.w_scale.t WHERE ip = '0.0.0.1';
+----
+1000
+
+# a pushed integer filter
+query I
+SELECT count(*) FROM ch.w_scale.t WHERE id >= 1000 AND id < 51000;
+----
+50000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ch.w_scale.t WHERE id >= 1000 AND id < 51000;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `id` FROM `w_scale`.`t` WHERE \(`id` >= 1000 AND `id` < 51000\)".*
+
+# a float filter stays in DuckDB and still matches the same rows ClickHouse would
+query I
+SELECT count(*) FROM (
+    SELECT count(*)::VARCHAR AS c FROM ch.w_scale.t WHERE v > 100
+    EXCEPT
+    SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()) AS c FROM w_scale.t WHERE v > 100')
+);
+----
+0
+
+# a local join against a handful of keys
+query I
+SELECT count(*) FROM ch.w_scale.t AS t JOIN (VALUES (0::UINTEGER), (17::UINTEGER), (199999::UINTEGER)) v(x) ON t.id = v.x;
+----
+3
+
+# NaN and infinities are readable and are not compared as ordinary numbers
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_scale.floats (id UInt8, v Float64) ENGINE = Memory');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_scale.floats SELECT number, multiIf(number = 0, nan, number = 1, inf, -inf) FROM numbers(3)');
+
+query I
+SELECT count(*) FROM ch.w_scale.floats WHERE isnan(v);
+----
+1
+
+query I
+SELECT count(*) FROM ch.w_scale.floats WHERE isinf(v);
+----
+2
+
+# DuckDB orders NaN above every number, so NaN > 0 is true here. The comparison stays in DuckDB:
+# ClickHouse would not count the NaN.
+query I
+SELECT count(*) FROM ch.w_scale.floats WHERE v > 0;
+----
+2
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ch.w_scale.floats WHERE v > 0;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `v` FROM `w_scale`.`floats`".*
+
+# sixteen integer columns, so a wide row is projected and summed
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_scale.wide (
+    id UInt32,
+    c0 Int32, c1 Int32, c2 Int32, c3 Int32, c4 Int32, c5 Int32, c6 Int32, c7 Int32,
+    c8 Int32, c9 Int32, c10 Int32, c11 Int32, c12 Int32, c13 Int32, c14 Int32, c15 Int32
+) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_scale.wide
+    SELECT number, number, number + 1, number + 2, number + 3, number + 4, number + 5, number + 6, number + 7,
+           number + 8, number + 9, number + 10, number + 11, number + 12, number + 13, number + 14, number + 15
+    FROM numbers(100000)');
+
+query I
+SELECT count(*) FROM (
+    SELECT sum(c0)::VARCHAR AS a, sum(c15)::VARCHAR AS b FROM ch.w_scale.wide
+    EXCEPT
+    SELECT * FROM clickhouse_query('ch', 'SELECT toString(sum(c0)) AS a, toString(sum(c15)) AS b FROM w_scale.wide')
+);
+----
+0
+
+# one long string, then an insert of 50000 rows split across many blocks, with a NULL every tenth row
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_scale.blobs (id UInt32, s String) ENGINE = MergeTree ORDER BY id');
+
+query I
+INSERT INTO ch.w_scale.blobs VALUES (1, repeat('x', 200000));
+----
+1
+
+query I
+SELECT length(s) FROM ch.w_scale.blobs WHERE id = 1;
+----
+200000
+
+statement ok
+SET ch_insert_block_size = 1000;
+
+query I
+INSERT INTO ch.w_scale.t (id, n, s, tag, v, arr, ip)
+SELECT 200000 + range,
+       CASE WHEN range % 10 = 0 THEN NULL ELSE range::BIGINT END,
+       range::VARCHAR,
+       'ins',
+       range / 10.0,
+       [range % 3],
+       '10.1.2.3'
+FROM range(50000);
+----
+50000
+
+statement ok
+RESET ch_insert_block_size;
+
+query I
+SELECT count(*) FROM ch.w_scale.t;
+----
+250000
+
+query II
+SELECT count(*), count(n) FROM ch.w_scale.t WHERE tag = 'ins';
+----
+50000	45000
+
+# UPDATE and DELETE over more than a handful of rows, with the reported count checked afterwards
+query I
+UPDATE ch.w_scale.t SET tag = 'mod' WHERE id < 1000;
+----
+1000
+
+query I
+SELECT count(*) FROM ch.w_scale.t WHERE tag = 'mod';
+----
+1000
+
+query I
+DELETE FROM ch.w_scale.t WHERE id >= 240000 AND id < 250000;
+----
+10000
+
+query I
+SELECT count(*) FROM ch.w_scale.t;
+----
+240000
+
+query I
+SELECT count(*) FROM (
+    SELECT count(*)::VARCHAR AS c FROM ch.w_scale.t
+    EXCEPT
+    SELECT * FROM clickhouse_query('ch', 'SELECT toString(count()) AS c FROM w_scale.t')
+);
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_scale');

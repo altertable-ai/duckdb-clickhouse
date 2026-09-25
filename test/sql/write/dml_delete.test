@@ -1,0 +1,774 @@
+# name: test/sql/write/dml_delete.test
+# description: DELETE and TRUNCATE on attached ClickHouse tables, translated into single ClickHouse statements
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_dml');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_dml');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.t (id Int32, name String, v Nullable(Float64), tag Enum8(''a'' = 1, ''b'' = 2)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, CASE WHEN range % 3 = 0 THEN NULL ELSE range * 1.5 END,
+    CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END FROM range(10);
+
+# ---------------------------------------------------------------------------
+# DELETE … WHERE, with the affected-row count
+# ---------------------------------------------------------------------------
+# a filter pushed into the scan (table_filters)
+query I
+DELETE FROM ch.w_dml.t WHERE id = 3;
+----
+1
+
+# a non-dense IN list becomes an OPTIONAL_FILTER hint plus a LogicalFilter: nothing may be dropped
+query I
+DELETE FROM ch.w_dml.t WHERE id IN (1, 5, 9);
+----
+3
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.t;
+----
+[0, 2, 4, 6, 7, 8]
+
+# a filter on a type a SELECT does not push into ClickHouse (Float64): at the logical level it is still one of the
+# scan's table filters, which DELETE translates like any other
+query I
+DELETE FROM ch.w_dml.t WHERE v > 10.0;
+----
+2
+
+# functions, LIKE, OR
+query I
+DELETE FROM ch.w_dml.t WHERE lower(name) LIKE 'n2%' OR starts_with(name, 'n6');
+----
+2
+
+# IS NULL, enum comparison, BETWEEN, arithmetic
+query I
+DELETE FROM ch.w_dml.t WHERE v IS NULL AND tag = 'a' AND id + 1 BETWEEN 1 AND 5;
+----
+1
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.t;
+----
+[4]
+
+# ClickHouse's own view agrees
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.t ORDER BY id)');
+----
+[4]
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 100;
+----
+0
+
+# the same with filter pushdown off: the setting only changes what a SELECT sends to ClickHouse, the DELETE is
+# translated the same way
+statement ok
+SET ch_filter_pushdown = false;
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 4 AND name = 'n4';
+----
+1
+
+statement ok
+RESET ch_filter_pushdown;
+
+# ---------------------------------------------------------------------------
+# DELETE without WHERE and TRUNCATE -> TRUNCATE TABLE
+# ---------------------------------------------------------------------------
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, NULL, 'a' FROM range(5);
+
+query I
+DELETE FROM ch.w_dml.t;
+----
+5
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.t');
+----
+0
+
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, NULL, 'a' FROM range(3);
+
+query I
+TRUNCATE ch.w_dml.t;
+----
+3
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+0
+
+# ---------------------------------------------------------------------------
+# rejected: nothing runs, nothing changes
+# ---------------------------------------------------------------------------
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, range * 1.0, 'b' FROM range(4);
+
+statement error
+DELETE FROM ch.w_dml.t WHERE md5(name) = 'x';
+----
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t WHERE id IN (SELECT 1);
+----
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t USING (SELECT 1 AS k) s WHERE t.id = s.k;
+----
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
+
+# an untranslatable branch of an OR must not be dropped (that would widen the DELETE)
+statement error
+DELETE FROM ch.w_dml.t WHERE id = 0 OR md5(name) = 'x';
+----
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
+
+# NOT IN with a NULL differs between DuckDB and ClickHouse: rejected
+statement error
+DELETE FROM ch.w_dml.t WHERE id NOT IN (1, NULL);
+----
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t WHERE id = 0 RETURNING id;
+----
+RETURNING is not supported for ClickHouse tables
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+4
+
+# ---------------------------------------------------------------------------
+# views, engines without lightweight DELETE, transactions
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_dml.v AS SELECT 1 AS one');
+
+statement error
+DELETE FROM ch.w_dml.v WHERE one = 1;
+----
+is a ClickHouse view
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.mem (id Int32) ENGINE = Memory');
+
+statement ok
+INSERT INTO ch.w_dml.mem VALUES (1), (2);
+
+statement error
+DELETE FROM ch.w_dml.mem WHERE id = 1;
+----
+ClickHouse error
+
+statement ok
+CALL enable_logging(level = 'warning');
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 0;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+3
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
+----
+1
+
+# ---------------------------------------------------------------------------
+# Float32 constants, converted types, long IN lists, exactness exclusions, parameters
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.x (id Int32, f Float32, name String, ip IPv4, dt DateTime64(9, ''UTC''), fs FixedString(4), ts DateTime64(6, ''UTC'')) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml.x SELECT number, number / 10, concat(''n'', toString(number)), toIPv4(concat(''10.0.0.'', toString(number))), toDateTime64(''2024-01-01 00:00:00.123456789'', 9, ''UTC''), ''ab'', toDateTime64(''2024-01-01 23:30:00'', 6, ''UTC'') FROM numbers(20)');
+
+# a REAL constant is written as toFloat32(…): a Float64 0.1 would not equal the Float32 0.1 the column holds
+query I
+SELECT count(*) FROM ch.w_dml.x WHERE f = 0.1;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.x WHERE f = 0.1;
+----
+1
+
+# IPv4 is read through toString(): the predicate compares the same text DuckDB sees
+query I
+DELETE FROM ch.w_dml.x WHERE ip = '10.0.0.5';
+----
+1
+
+# 5 or more values: DuckDB rewrites the IN list into a MARK join over the constants, translated back into IN
+query I
+DELETE FROM ch.w_dml.x WHERE id IN (2, 4, 6, 8, 10);
+----
+5
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.x;
+----
+[0, 3, 7, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+query I
+DELETE FROM ch.w_dml.x WHERE id NOT IN (0, 3, 7, 9, 11, 12);
+----
+7
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x ORDER BY id)');
+----
+[0, 3, 7, 9, 11, 12]
+
+# NULL in a long IN / NOT IN list, or the list inside a larger expression: rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE id IN (0, 3, 7, 9, NULL);
+----
+IN list holding NULL
+
+statement error
+DELETE FROM ch.w_dml.x WHERE id NOT IN (1, 2, 4, 5, 6, NULL);
+----
+IN list holding NULL
+
+statement error
+DELETE FROM ch.w_dml.x WHERE id IN (0, 3, 7, 9, 11) OR name = 'n12';
+----
+IN list rewritten into a join
+
+# columns ClickHouse does not compare exactly as DuckDB reads them, and time-zone-dependent casts: rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE dt > TIMESTAMPTZ '2024-01-01 00:00:00.123456+00';
+----
+column "dt" (DateTime64(9, 'UTC')) is not compared exactly
+
+statement error
+DELETE FROM ch.w_dml.x WHERE fs = 'ab';
+----
+column "fs" (FixedString(4)) is not compared exactly
+
+statement error
+DELETE FROM ch.w_dml.x WHERE ts::DATE = DATE '2024-01-01';
+----
+cast from TIMESTAMP WITH TIME ZONE to DATE depends on the time zone
+
+# rowid (always NULL for ClickHouse tables): rejected
+statement error
+DELETE FROM ch.w_dml.x WHERE rowid = 0;
+----
+DELETE on ClickHouse table "w_dml"."x" must filter only the modified table with translatable expressions (filter on a virtual column)
+
+# an always-false predicate: nothing to do
+query I
+DELETE FROM ch.w_dml.x WHERE 1 = 0;
+----
+0
+
+query I
+DELETE FROM ch.w_dml.x WHERE NULL;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.x');
+----
+6
+
+# a backslash in a LIKE pattern is a plain character in DuckDB, doubled for ClickHouse
+statement ok
+INSERT INTO ch.w_dml.x (id, name) VALUES (100, 'a\zb1'), (101, 'a\zb12'), (102, 'azb1');
+
+query I
+DELETE FROM ch.w_dml.x WHERE name LIKE 'a\%b_';
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x WHERE id >= 100 ORDER BY id)');
+----
+[101, 102]
+
+# prepared statements: every EXECUTE plans the DELETE again with the parameter values
+statement ok
+PREPARE del_by_id AS DELETE FROM ch.w_dml.x WHERE id = $1;
+
+query I
+EXECUTE del_by_id(0);
+----
+1
+
+query I
+EXECUTE del_by_id(3);
+----
+1
+
+query I
+EXECUTE del_by_id(3);
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.x ORDER BY id)');
+----
+[7, 9, 11, 12, 101, 102]
+
+# dictionaries are not modified
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DICTIONARY w_dml.d (id UInt64, name String) PRIMARY KEY id SOURCE(NULL()) LAYOUT(FLAT()) LIFETIME(0)');
+
+statement error
+DELETE FROM ch.w_dml.d WHERE id = 1;
+----
+is a ClickHouse dictionary
+
+# ---------------------------------------------------------------------------
+# casts that round in DuckDB (DOUBLE -> INTEGER rounds half to even) are translated with DuckDB's rounding
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.r (id Int32, dbl Float64, dec Decimal(10, 2), s String, d Date, big Decimal(18, 2)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.r VALUES (1, 0.5, 0.5, '1', '2024-01-01', 1), (2, 1.5, 1.5, '2', '2024-01-02', 2),
+    (3, 2.5, 2.5, '3', '2024-01-03', 3), (4, -0.5, -0.5, '4', '2024-01-04', 4), (5, -1.5, -1.5, '5', '2024-01-05', 5),
+    (6, -2.5, -2.5, '6', '2024-01-06', 6);
+
+# DuckDB's own count first: 1.5 and 2.5 both round to 2 (ClickHouse's CAST alone would truncate 1.5 to 1)
+query I
+SELECT count(*) FROM ch.w_dml.r WHERE CAST(dbl AS INTEGER) = 2;
+----
+2
+
+query I
+DELETE FROM ch.w_dml.r WHERE CAST(dbl AS INTEGER) = 2;
+----
+2
+
+# DECIMAL -> INTEGER rounds half away from zero: -0.5 and -1.5 round to -1 and -2, -2.5 to -3
+query I
+SELECT count(*) FROM ch.w_dml.r WHERE CAST(dec AS INTEGER) IN (-1, -3);
+----
+2
+
+query I
+DELETE FROM ch.w_dml.r WHERE CAST(dec AS INTEGER) IN (-1, -3);
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.r ORDER BY id)');
+----
+[1, 5]
+
+# rejected: DuckDB rounds where ClickHouse truncates, or computes differently
+statement error
+DELETE FROM ch.w_dml.r WHERE CAST(dbl AS DECIMAL(10, 1)) = 0.5;
+----
+cast from DOUBLE to DECIMAL(10,1) has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.r WHERE CAST(s AS DECIMAL(10, 1)) = 1;
+----
+cast from VARCHAR to DECIMAL(10,1) has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.r WHERE d::TIMESTAMP::TIMESTAMP_S = TIMESTAMP_S '2024-01-01 00:00:00';
+----
+cast from TIMESTAMP to TIMESTAMP_S has no exact ClickHouse translation
+
+# DECIMAL / 2 is a DOUBLE division: DuckDB converts a DECIMAL wider than 15 digits to DOUBLE its own way
+statement error
+DELETE FROM ch.w_dml.r WHERE big / 2 > 0;
+----
+cast from DECIMAL(18,2) to DOUBLE has no exact ClickHouse translation
+
+# ...a narrower one converts the same way in both
+query I
+SELECT count(*) FROM ch.w_dml.r WHERE dec / 2 < 0;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.r WHERE dec / 2 < 0;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.r ORDER BY id)');
+----
+[1]
+
+# a TIMESTAMP_NS constant keeps its nanoseconds (truncated to microseconds, it would match 2024-01-01 00:00:00)
+query I
+SELECT count(*) FROM ch.w_dml.r WHERE d::TIMESTAMP_NS = TIMESTAMP_NS '2024-01-01 00:00:00.000000001';
+----
+0
+
+query I
+DELETE FROM ch.w_dml.r WHERE d::TIMESTAMP_NS = TIMESTAMP_NS '2024-01-01 00:00:00.000000001';
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.r');
+----
+1
+
+# VARCHAR -> DOUBLE/FLOAT is rejected: ClickHouse's parse is not correctly rounded ('1.7091' is read as
+# 1.7090999999999998), so it would delete both rows where DuckDB deletes one
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.vf (id Int32, s String, dbl Float64) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.vf VALUES (1, '1.7091', 1.7091), (2, '2', 2);
+
+query I
+SELECT count(*) FROM ch.w_dml.vf WHERE CAST(s AS DOUBLE) != 1.7091;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.vf WHERE CAST(s AS Float64) != 1.7091');
+----
+2
+
+statement error
+DELETE FROM ch.w_dml.vf WHERE CAST(s AS DOUBLE) != 1.7091;
+----
+cast from VARCHAR to DOUBLE has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vf WHERE CAST(s AS FLOAT) = 2;
+----
+cast from VARCHAR to FLOAT has no exact ClickHouse translation
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vf ORDER BY id)');
+----
+[1, 2]
+
+# a DOUBLE constant written as a string cast is folded into a literal by DuckDB, and translates
+query I
+SELECT count(*) FROM ch.w_dml.vf WHERE dbl = '1.7091'::DOUBLE;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.vf WHERE dbl = '1.7091'::DOUBLE;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vf ORDER BY id)');
+----
+[2]
+
+# ---------------------------------------------------------------------------
+# // and % on FLOAT, DOUBLE and DECIMAL, and FLOAT arithmetic
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.fl (id Int32, d Float64, f Float32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.fl VALUES (1, 7.0, 0.1), (2, 1e20, 0.2);
+
+# DuckDB's // on a DOUBLE is a plain division (7.0 // 2 = 3.5), not ClickHouse's intDiv; % on it is fmod()
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE d // 2 = 3;
+----
+0
+
+statement error
+DELETE FROM ch.w_dml.fl WHERE d // 2 = 3;
+----
+// on DOUBLE has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.fl WHERE d % 3 = 1;
+----
+% on DOUBLE has no exact ClickHouse translation
+
+# FLOAT + FLOAT is computed in single precision by DuckDB: 0.1 + 0.1 < 0.3 but 0.2 + 0.1 = 0.3 (as FLOATs)
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE f + 0.1 < 0.3;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.fl WHERE f + 0.1 < 0.3;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.fl ORDER BY id)');
+----
+[2]
+
+# unary minus (negate(), so that a minus before a negative value never reads as a "--" comment), on a FLOAT
+query I
+SELECT count(*) FROM ch.w_dml.fl WHERE -f < -0.15;
+----
+1
+
+query I
+DELETE FROM ch.w_dml.fl WHERE -f < -0.15;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.fl');
+----
+0
+
+# ---------------------------------------------------------------------------
+# the ATTACH's settings= does not change which rows match: IN / NOT IN are guarded against a NULL left side, and the
+# count pins transform_null_in to 0
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.nn (id Int32, n Nullable(Int32)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.nn VALUES (1, 1), (2, NULL), (3, 7), (4, NULL), (5, 3), (6, 9);
+
+# 5 or more values (the IN list rewritten into a join): DuckDB keeps the NULL rows
+query I
+SELECT count(*) FROM ch.w_dml.nn WHERE n NOT IN (1, 2, 3, 4, 5);
+----
+2
+
+query I
+DELETE FROM ch.w_dml.nn WHERE n NOT IN (1, 2, 3, 4, 5);
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.nn ORDER BY id)');
+----
+[1, 2, 4, 5]
+
+# guarded against a NULL n whatever transform_null_in says, which no query setting overrides in a lightweight DELETE
+# or a mutation (see dml_transform_null_in.test)
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT DISTINCT query FROM system.query_log WHERE type = ''QueryFinish'' AND query LIKE ''DELETE FROM `w_dml`.`nn` WHERE%(1, 2, 3, 4, 5)%''');
+----
+DELETE FROM `w_dml`.`nn` WHERE if(isNull(`n`), NULL, (`n` NOT IN (1, 2, 3, 4, 5)))
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=transform_null_in=1' AS ch_tn (TYPE clickhouse);
+
+# with transform_null_in = 1, ClickHouse itself would count the NULL rows too
+query I
+SELECT * FROM clickhouse_query('ch_tn', 'SELECT count() FROM w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8)');
+----
+3
+
+statement ok
+INSERT INTO ch_tn.w_dml.nn VALUES (3, 7), (6, 9);
+
+query I
+SELECT count(*) FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8);
+----
+2
+
+query I
+DELETE FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8);
+----
+2
+
+# SET id = id sends no mutation: this covers only the UPDATE's count query
+query I
+UPDATE ch_tn.w_dml.nn SET id = id WHERE n NOT IN (1, 2);
+----
+1
+
+query I
+DELETE FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 2);
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.nn ORDER BY id)');
+----
+[1, 2, 4]
+
+statement ok
+DETACH ch_tn;
+
+# the affected-row counts leave out deleted rows whatever apply_deleted_mask the ATTACH's settings= say
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.adm (id Int32, v Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.adm VALUES (1, 1), (2, 2), (3, 3);
+
+query I
+DELETE FROM ch.w_dml.adm WHERE id = 1;
+----
+1
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=apply_deleted_mask=0' AS ch_adm (TYPE clickhouse);
+
+# ClickHouse itself shows the deleted row with that setting
+query I
+SELECT * FROM clickhouse_query('ch_adm', 'SELECT count() FROM w_dml.adm');
+----
+3
+
+query I
+UPDATE ch_adm.w_dml.adm SET v = 9 WHERE id >= 1;
+----
+2
+
+query I
+DELETE FROM ch_adm.w_dml.adm WHERE id = 1;
+----
+0
+
+query I
+DELETE FROM ch_adm.w_dml.adm WHERE id <= 2;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id), groupArray(v) FROM (SELECT id, v FROM w_dml.adm ORDER BY id)');
+----
+[3]	[9]
+
+statement ok
+DETACH ch_adm;
+
+# ---------------------------------------------------------------------------
+# DELETE without WHERE / TRUNCATE only where TRUNCATE TABLE removes the rows
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.local_t (id Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml.local_t VALUES (1), (2)');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.dist (id Int32) ENGINE = Distributed(''default'', ''w_dml'', ''local_t'')');
+
+statement error
+DELETE FROM ch.w_dml.dist;
+----
+DELETE without WHERE (or TRUNCATE) on ClickHouse table "w_dml"."dist" would run TRUNCATE TABLE, which does not remove the rows of a table with engine Distributed
+
+statement error
+TRUNCATE ch.w_dml.dist;
+----
+with engine Distributed
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.local_t');
+----
+2
+
+# Memory (and the MergeTree family, above) are truncated
+query I
+TRUNCATE ch.w_dml.mem;
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.mem');
+----
+0
+
+# ---------------------------------------------------------------------------
+# a cast from VARCHAR to another type on a column is rejected: ClickHouse turns a string it cannot parse into NULL,
+# where DuckDB fails the statement (and would delete nothing). Constants are folded by DuckDB
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.vs (id Int32, s String, i Int32, d Date32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.vs VALUES (1, '1', 1, '2024-01-01'), (2, 'abc', 2, '2024-01-02'), (3, '2.5', 3, '2024-01-03'), (4, '4', 4, '2024-01-04');
+
+statement error
+SELECT count(*) FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) IS NULL;
+----
+Could not convert string 'abc' to INT32
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) IS NULL;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) = 1;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE s::DATE = d OR s::BOOLEAN;
+----
+has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE i = s;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vs ORDER BY id)');
+----
+[1, 2, 3, 4]
+
+# string constants: folded into literals of the column's type by DuckDB
+query I
+DELETE FROM ch.w_dml.vs WHERE i = '1' OR d = '2024-01-02' OR i IN ('3', '9');
+----
+3
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vs ORDER BY id)');
+----
+[4]
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_dml');

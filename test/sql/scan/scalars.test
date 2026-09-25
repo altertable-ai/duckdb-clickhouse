@@ -1,0 +1,51 @@
+# name: test/sql/scan/scalars.test
+# description: scalar ClickHouse types are read with the right values
+# group: [scan]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+query IIIIIIIII
+SELECT id, b, i8, i16, i32, i64, u8, u16, u32 FROM ch.test_db.scalars ORDER BY id;
+----
+1	true	-128	-32768	-2147483648	-9223372036854775808	255	65535	4294967295
+2	false	0	0	0	0	0	0	0
+
+query IIIIII
+SELECT id, u64, i128, u128, i256, u256 FROM ch.test_db.scalars ORDER BY id;
+----
+1	18446744073709551615	-170141183460469231731687303715884105728	340282366920938463463374607431768211455	-1	1
+2	0	0	0	0	0
+
+query IIIIIII
+SELECT id, f32, f64, d9, d18, d38, d76 FROM ch.test_db.scalars ORDER BY id;
+----
+1	1.5	-2.25	1234567.89	12345678901234.5678	1234567890123456789012345678.0123456789	12345.67891
+2	0.0	0.0	0.00	0.0000	0.0000000000	0
+
+query IIIIIIII
+SELECT id, s, fs, d, d32, dt, dt64_3, dt64_9 FROM ch.test_db.scalars ORDER BY id;
+----
+1	hello	abc	2024-02-29	1900-01-01	2024-02-29 12:34:56+00	2024-02-29 12:34:56.789+00	2024-02-29 12:34:56.123456+00
+2	(empty)	xyz	1970-01-01	1970-01-01	1970-01-01 00:00:00+00	1970-01-01 00:00:00+00	1970-01-01 00:00:00+00
+
+query IIIIII
+SELECT id, uuid, ip4, ip6, e8, e16 FROM ch.test_db.scalars ORDER BY id;
+----
+1	61f0c404-5cb3-11e7-907b-a6006ad3dba0	192.168.0.1	2001:db8::1	blue	large
+2	00000000-0000-0000-0000-000000000000	0.0.0.0	::	red	small
