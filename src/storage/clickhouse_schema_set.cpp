@@ -16,6 +16,7 @@ static bool IsSystemDatabase(const string &name) {
 void ClickhouseSchemaSet::LoadEntries(ClientContext &context) {
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	auto show_system = ch_catalog.GetAttachOptions().show_system;
+	auto &only_schema = ch_catalog.GetAttachOptions().schema;
 	auto &default_database = ch_catalog.GetConfig().database;
 	auto connection = ch_catalog.GetConnectionPool().GetConnection();
 	auto blocks = connection->Query("SELECT name FROM system.databases ORDER BY name");
@@ -23,7 +24,12 @@ void ClickhouseSchemaSet::LoadEntries(ClientContext &context) {
 		auto names = block[0]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {
 			string name(names->At(row));
-			if (IsSystemDatabase(name) && !show_system && name != default_database) {
+			if (!only_schema.empty()) {
+				// SCHEMA wins over SHOW_SYSTEM and the connection's database
+				if (name != only_schema) {
+					continue;
+				}
+			} else if (IsSystemDatabase(name) && !show_system && name != default_database) {
 				continue;
 			}
 			CreateSchemaInfo info;

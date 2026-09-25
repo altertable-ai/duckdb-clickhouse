@@ -41,6 +41,30 @@ ClickhouseCatalog &ClickhouseCatalog::GetAttachedDatabase(ClientContext &context
 	return catalog.Cast<ClickhouseCatalog>();
 }
 
+//! The real name of the database the SCHEMA option `name` refers to, by the rule ClickhouseCatalogSet::GetEntry()
+//! applies to schema names: the exact name, else the first case-insensitive match in name order (ClickHouse's lower()
+//! is ASCII-only, like StringUtil::CIEquals())
+static string ResolveSchemaOption(ClickhousePoolConnection &connection, const string &name) {
+	string match;
+	for (auto &block : connection->Query("SELECT name FROM system.databases WHERE lower(name) = lower(" +
+	                                     ClickhouseUtils::QuoteLiteral(name) + ") ORDER BY name")) {
+		auto names = block[0]->As<clickhouse::ColumnString>();
+		for (size_t row = 0; row < block.GetRowCount(); row++) {
+			string candidate(names->At(row));
+			if (candidate == name) {
+				return candidate;
+			}
+			if (match.empty()) {
+				match = candidate;
+			}
+		}
+	}
+	if (match.empty()) {
+		throw BinderException("ClickHouse database \"%s\" (the SCHEMA option of ATTACH) does not exist", name);
+	}
+	return match;
+}
+
 ClickhouseCatalog::ClickhouseCatalog(AttachedDatabase &db, ClickhouseConnectionConfig config_p,
                                      ClickhouseAttachOptions options_p, ClientContext &context)
     : Catalog(db), config(std::move(config_p)), options(options_p),
@@ -49,6 +73,10 @@ ClickhouseCatalog::ClickhouseCatalog(AttachedDatabase &db, ClickhouseConnectionC
       schemas(*this) {
 	// connect now so that a wrong host, port, certificate or password fails the ATTACH itself
 	auto connection = connection_pool->GetConnection();
+	if (!options.schema.empty()) {
+		// fail the ATTACH, too, for a SCHEMA that does not exist
+		options.schema = ResolveSchemaOption(connection, options.schema);
+	}
 }
 
 ClickhouseCatalog::~ClickhouseCatalog() = default;
@@ -68,22 +96,37 @@ shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &na
 	return schemas.GetEntryOwner(name);
 }
 
-//! "main" is not a ClickHouse database name here: LookupSchema() maps it to the connection's database, so DROP SCHEMA
+//! "main" is not a ClickHouse database name here: LookupSchema() maps it to GetDefaultSchema(), so DROP SCHEMA
 //! ch.main would drop that database (and then trip DuckDB's own PhysicalDrop assertion that "main" is never dropped),
 //! and CREATE SCHEMA ch.main would create a real `main` database that silently takes over what ch.main means from
 //! then on (any case: LookupSchema() also finds a `MAIN` database case-insensitively)
 void ClickhouseCatalog::ThrowIfDefaultSchema(const string &schema_name) const {
-	if (StringUtil::CIEquals(schema_name, DEFAULT_SCHEMA)) {
-		throw CatalogException("Cannot create or drop schema \"%s\": in an attached ClickHouse database it stands for "
-		                       "the connection's database (\"%s\"); use clickhouse_execute() to manage a ClickHouse "
-		                       "database with that name",
-		                       schema_name, config.database);
+	if (!StringUtil::CIEquals(schema_name, DEFAULT_SCHEMA)) {
+		return;
 	}
+	if (!options.schema.empty()) {
+		throw CatalogException("Cannot create or drop schema \"%s\": in this attached ClickHouse database it stands "
+		                       "for the SCHEMA database (\"%s\"); use its own name instead",
+		                       schema_name, options.schema);
+	}
+	throw CatalogException("Cannot create or drop schema \"%s\": in an attached ClickHouse database it stands for "
+	                       "the connection's database (\"%s\"); use clickhouse_execute() to manage a ClickHouse "
+	                       "database with that name",
+	                       schema_name, config.database);
 }
 
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	auto &context = transaction.GetContext();
 	ThrowIfDefaultSchema(info.schema);
+	if (!options.schema.empty()) {
+		if (!StringUtil::CIEquals(info.schema, options.schema)) {
+			throw CatalogException("Cannot create schema \"%s\": \"%s\" was attached with SCHEMA '%s' and shows no "
+			                       "other ClickHouse database; use clickhouse_execute() to create it",
+			                       info.schema, GetName(), options.schema);
+		}
+		// the one name the schema list shows
+		info.schema = options.schema;
+	}
 	string sql = "CREATE DATABASE ";
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		sql += "IF NOT EXISTS ";
@@ -144,8 +187,8 @@ optional_ptr<SchemaCatalogEntry> ClickhouseCatalog::LookupSchema(CatalogTransact
 	auto &schema_name = schema_lookup.GetEntryName();
 	auto entry = schemas.GetEntry(context, schema_name);
 	if (!entry && schema_name == DEFAULT_SCHEMA) {
-		// "main" refers to the database named in the connection settings
-		entry = schemas.GetEntry(context, config.database);
+		// "main" refers to the SCHEMA database, else to the database named in the connection settings
+		entry = schemas.GetEntry(context, GetDefaultSchema());
 	}
 	if (!entry) {
 		if (if_not_found == OnEntryNotFound::RETURN_NULL) {

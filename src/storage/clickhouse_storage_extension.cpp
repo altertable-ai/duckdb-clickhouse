@@ -25,6 +25,11 @@ static unique_ptr<Catalog> ClickhouseAttach(optional_ptr<StorageExtensionInfo> s
 			settings = entry.second.ToString();
 		} else if (key == "show_system") {
 			options.show_system = BooleanValue::Get(entry.second.DefaultCastAs(LogicalType::BOOLEAN));
+		} else if (key == "schema") {
+			options.schema = entry.second.ToString();
+			if (options.schema.empty()) {
+				throw BinderException("SCHEMA must name a ClickHouse database");
+			}
 		} else {
 			throw BinderException("Unrecognized option for ClickHouse attach: %s", entry.first);
 		}

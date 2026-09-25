@@ -10,6 +10,10 @@ namespace duckdb {
 struct ClickhouseAttachOptions {
 	//! Also expose system, INFORMATION_SCHEMA and information_schema
 	bool show_system = false;
+	//! SCHEMA: the only ClickHouse database exposed, and the default schema. Empty exposes every database. Holds
+	//! the database's real name once the catalog is constructed (the option itself matches it like a schema name:
+	//! exactly, else case-insensitively)
+	string schema;
 };
 
 class ClickhouseCatalog : public Catalog {
@@ -71,8 +75,9 @@ public:
 	string GetCatalogType() override {
 		return CATALOG_TYPE;
 	}
+	//! The SCHEMA database if the ATTACH named one, else the connection's database
 	string GetDefaultSchema() const override {
-		return config.database;
+		return options.schema.empty() ? config.database : options.schema;
 	}
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
@@ -115,7 +120,7 @@ public:
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
-	//! CREATE SCHEMA / DROP SCHEMA refuse "main", which stands for config.database
+	//! CREATE SCHEMA / DROP SCHEMA refuse "main", which stands for GetDefaultSchema()
 	void ThrowIfDefaultSchema(const string &schema_name) const;
 
 	ClickhouseConnectionConfig config;

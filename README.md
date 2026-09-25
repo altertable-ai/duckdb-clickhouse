@@ -18,7 +18,7 @@ SELECT event, count(*) FROM ch.analytics.events WHERE ts > now() - INTERVAL 1 DA
 ## Connecting
 
 ```sql
-ATTACH '<connection>' AS ch (TYPE clickhouse [, SECRET name] [, SETTINGS 'k=v,…'] [, SHOW_SYSTEM true] [, READ_ONLY]);
+ATTACH '<connection>' AS ch (TYPE clickhouse [, SECRET name] [, SETTINGS 'k=v,…'] [, SHOW_SYSTEM true] [, SCHEMA 'db'] [, READ_ONLY]);
 ```
 
 `<connection>` is either `key=value` pairs (`host=localhost port=9000 user=default password='p w'`) or a URI
@@ -39,7 +39,8 @@ provides everything. Values in the connection string override the secret's.
 | `settings`    |                             | ClickHouse settings sent with every query: `k1=v1,k2=v2` |
 
 Each ClickHouse database appears as a DuckDB schema; the system databases are hidden unless you pass
-`SHOW_SYSTEM true`. `READ_ONLY` rejects every write. Table and column lists are cached: run
+`SHOW_SYSTEM true`. `SCHEMA 'analytics'` shows only that database, so `ch.events` means `ch.analytics.events`
+(`clickhouse_query` and `clickhouse_execute` still reach every database). `READ_ONLY` rejects every write. Table and column lists are cached: run
 `CALL clickhouse_clear_cache()` after changing tables outside DuckDB.
 
 ## Reading
