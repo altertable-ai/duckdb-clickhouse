@@ -180,6 +180,8 @@ clickhouse::Query ClickhouseConnection::MakeQuery(const string &sql,
 		query.SetSetting(setting.first,
 		                 clickhouse::QuerySettingsField {setting.second, clickhouse::QuerySettingsField::IMPORTANT});
 	}
+	// after the connection's settings: clickhouse::Query keeps one value per key (the last one set), so a query
+	// setting overrides the same key from the ATTACH's settings=
 	for (auto &setting : query_settings) {
 		query.SetSetting(setting.first, clickhouse::QuerySettingsField {setting.second, 0});
 	}
@@ -245,9 +247,10 @@ bool ClickhouseConnection::IsQueryRunning() const {
 	return client->IsSelecting();
 }
 
-vector<clickhouse::Block> ClickhouseConnection::Query(const string &sql) {
+vector<clickhouse::Block> ClickhouseConnection::Query(const string &sql,
+                                                      const vector<std::pair<string, string>> &query_settings) {
 	vector<clickhouse::Block> result;
-	BeginQuery(sql);
+	BeginQuery(sql, query_settings);
 	while (true) {
 		auto block = NextBlock();
 		if (!block) {

@@ -176,12 +176,12 @@ ClickHouse error
 statement error
 UPDATE ch.w_dml2.u SET name = md5(name);
 ----
-UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
 
 statement error
 UPDATE ch.w_dml2.u SET name = 'z' FROM (SELECT 1 AS k) s WHERE u.id = s.k;
 ----
-UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
 
 statement error
 UPDATE ch.w_dml2.u SET name = 'z' WHERE id = 1 RETURNING id;
@@ -191,7 +191,7 @@ RETURNING is not supported for ClickHouse tables
 statement error
 UPDATE ch.w_dml2.u SET n = DEFAULT;
 ----
-UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+UPDATE on ClickHouse table "w_dml2"."u" must filter only the modified table with translatable expressions
 
 query I
 SELECT count(*) FROM ch.w_dml2.u WHERE name = 'z';
@@ -275,12 +275,12 @@ zz	2022-02-02 02:02:02.000000000
 statement error
 UPDATE ch.w_dml2.a SET arr = [] WHERE d > TIMESTAMPTZ '2000-01-01 00:00:00+00';
 ----
-UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+UPDATE on ClickHouse table "w_dml2"."a" must filter only the modified table with translatable expressions
 
 statement error
 UPDATE ch.w_dml2.a SET fs = upper(fs) WHERE id = 1;
 ----
-UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+UPDATE on ClickHouse table "w_dml2"."a" must filter only the modified table with translatable expressions
 
 # a hand-written col = col changes nothing: only the count runs
 query I

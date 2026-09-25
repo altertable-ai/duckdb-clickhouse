@@ -16,8 +16,6 @@ public:
 	static bool IsValidUtf8(const char *data, idx_t size);
 	//! Removes trailing whitespace and semicolons, which the native protocol does not accept
 	static string StripTrailingSemicolons(string sql);
-	//! Throws the error for a write statement that attached ClickHouse databases do not support (yet)
-	[[noreturn]] static void ThrowUnsupportedWrite(const string &statement);
 	//! Throws the error for a write that reaches the extension on a database attached with READ_ONLY. Raised
 	//! through ClickhouseCatalog::ThrowIfReadOnly() by every write path: the catalog's Plan* hooks (which run
 	//! before DuckDB's own read-only check), the INSERT sink (which resolves its database again when it runs) and

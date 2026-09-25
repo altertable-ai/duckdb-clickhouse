@@ -40,14 +40,15 @@ public:
 	void Cancel();
 	bool IsQueryRunning() const;
 
-	//! Runs a query to completion and returns all of its blocks
-	vector<clickhouse::Block> Query(const string &sql);
+	//! Runs a query to completion and returns all of its blocks. `query_settings` are sent like Execute()'s, after
+	//! (so they override) the connection's own settings
+	vector<clickhouse::Block> Query(const string &sql, const vector<std::pair<string, string>> &query_settings = {});
 
 	//! Runs a statement that is not expected to return rows, e.g. DDL. Returns false -- after cancelling the rest
 	//! of the result -- as soon as the statement returns a row, true once it has finished without returning any
 	bool Execute(const string &sql);
 	//! Same as Execute(sql), with extra query-level settings. They are sent as non-IMPORTANT settings (a server that
-	//! does not know one ignores it), after the connection's own settings
+	//! does not know one ignores it), after the connection's own settings: a key in both takes this value
 	bool Execute(const string &sql, const vector<std::pair<string, string>> &query_settings);
 
 	//! Starts an INSERT (`INSERT INTO … VALUES` or `INSERT INTO … SELECT … FROM input(…)`) with the connection's

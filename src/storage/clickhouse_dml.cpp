@@ -7,7 +7,9 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
@@ -25,10 +27,29 @@
 
 namespace duckdb {
 
-void ClickhouseDml::ThrowUnsupportedShape(const string &statement, const string &reason) {
-	throw NotImplementedException("%s on ClickHouse tables must filter only the modified table with translatable "
+void ClickhouseDml::ThrowUnsupportedShape(const string &statement, const TableCatalogEntry &table,
+                                          const string &reason) {
+	throw NotImplementedException("%s on ClickHouse table %s must filter only the modified table with translatable "
 	                              "expressions (%s); use clickhouse_execute() for anything else",
-	                              statement, reason);
+	                              statement, DisplayName(table), reason);
+}
+
+string ClickhouseDml::DisplayName(const TableCatalogEntry &table) {
+	return KeywordHelper::WriteQuoted(table.schema.name, '"') + "." + KeywordHelper::WriteQuoted(table.name, '"');
+}
+
+vector<std::pair<string, string>> ClickhouseDml::SemanticSettings() {
+	// the translation relies on ClickHouse's defaults for these, whatever the ATTACH's settings= says:
+	// transform_null_in = 1 would make x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept)
+	return {{"transform_null_in", "0"}};
+}
+
+//! Whether TRUNCATE TABLE really removes the rows of a table with this engine: the MergeTree family (Replicated,
+//! Shared, Summing, ... included), Memory, the Log family, Set and Join. Not, e.g., Distributed (whose TRUNCATE
+//! leaves the shards' data alone), Merge, Buffer or the integration engines
+static bool TruncateRemovesRows(const string &engine) {
+	static const unordered_set<string> ENGINES = {"Memory", "Log", "TinyLog", "StripeLog", "Set", "Join"};
+	return StringUtil::EndsWith(engine, "MergeTree") || ENGINES.find(engine) != ENGINES.end();
 }
 
 static const ClickhouseScanBindData &ScanBindData(const LogicalGet &get) {
@@ -222,7 +243,7 @@ static optional_ptr<const LogicalComparisonJoin> FindMarkJoin(const LogicalOpera
 
 //! A LogicalFilter expression over `input` that is exactly an IN-list mark column (IN) or NOT of one (NOT IN), as
 //! `<x> [NOT] IN (<constants>)`; "" for any other expression. The mark is NULL when x is NULL (no NULL constants,
-//! which are rejected), as is ClickHouse's x [NOT] IN (...) with the default transform_null_in = 0
+//! which are rejected), as is ClickHouse's x [NOT] IN (...) with transform_null_in = 0 (see SemanticSettings)
 static string TranslateInListFilter(const Expression &expr, const LogicalOperator &input) {
 	auto inner = &expr;
 	bool negated = false;
@@ -353,6 +374,11 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 			throw NotImplementedException("scan with an input");
 		}
 		auto &bind_data = ScanBindData(get);
+		if (!bind_data.order_by_clause.empty() || !bind_data.limit_clause.empty()) {
+			// never expected (a LIMIT or ORDER BY cannot be written in UPDATE/DELETE), but a scan limited in
+			// ClickHouse would not match the rows the predicate alone selects
+			throw NotImplementedException("scan with a pushed-down ORDER BY or LIMIT");
+		}
 		// at the logical level (before PhysicalPlanGenerator::CreatePlan(LogicalGet) renumbers them for the
 		// physical scan), table_filters is keyed by the table column id itself (TableFilterSet::PushFilter keys by
 		// ColumnIndex::GetPrimaryIndex()), not by position in the get's column_ids. Every filter is here, whether
@@ -383,7 +409,7 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 		}
 	} catch (NotImplementedException &ex) {
 		ErrorData error(ex);
-		ThrowUnsupportedShape(statement, error.RawMessage());
+		ThrowUnsupportedShape(statement, table, error.RawMessage());
 	}
 	result.predicate = StringUtil::Join(conditions, " AND ");
 	return result;
@@ -407,7 +433,15 @@ ClickhouseDmlStatement ClickhouseDml::PlanDelete(LogicalDelete &op) {
 		return result;
 	}
 	result.count_sql = "SELECT count() FROM " + target.qualified_name;
+	result.settings = SemanticSettings();
 	if (target.predicate.empty()) {
+		auto &engine = target.table.GetEngine();
+		if (!TruncateRemovesRows(engine)) {
+			throw NotImplementedException(
+			    "DELETE without WHERE (or TRUNCATE) on ClickHouse table %s would run TRUNCATE TABLE, which does not "
+			    "remove the rows of a table with engine %s; run the statement you need with clickhouse_execute() instead",
+			    DisplayName(op.table), engine.empty() ? string("(unknown)") : engine);
+		}
 		result.description = "TRUNCATE TABLE " + target.qualified_name;
 		result.sql = result.description;
 	} else {
@@ -442,16 +476,16 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	target.table.ThrowIfColumnsCollide();
 	auto &columns = target.table.GetClickhouseColumns();
 	if (op.columns.size() != op.expressions.size()) {
-		ThrowUnsupportedShape("UPDATE", "SET list does not match its columns");
+		ThrowUnsupportedShape("UPDATE", op.table, "SET list does not match its columns");
 	}
 	for (idx_t i = 0; i < op.columns.size(); i++) {
 		if (op.columns[i].index >= columns.size()) {
-			ThrowUnsupportedShape("UPDATE", "SET of an unknown column");
+			ThrowUnsupportedShape("UPDATE", op.table, "SET of an unknown column");
 		}
 		if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
 			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE; checked before the matches_nothing and
 			// unbound_parameters early returns, so such a statement is refused even when no row matches
-			ThrowUnsupportedShape("UPDATE", "SET " + columns[op.columns[i].index].name + " = DEFAULT");
+			ThrowUnsupportedShape("UPDATE", op.table, "SET " + columns[op.columns[i].index].name + " = DEFAULT");
 		}
 	}
 	ClickhouseDmlStatement result;
@@ -496,7 +530,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 		}
 	} catch (NotImplementedException &ex) {
 		ErrorData error(ex);
-		ThrowUnsupportedShape("UPDATE", error.RawMessage());
+		ThrowUnsupportedShape("UPDATE", op.table, error.RawMessage());
 	}
 	auto where = target.predicate.empty() ? string("1") : target.predicate;
 	result.count_sql = "SELECT count() FROM " + target.qualified_name + " WHERE " + where;
@@ -505,6 +539,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 		return result;
 	}
 	result.sql = result.description + " " + StringUtil::Join(assignments, ", ") + " WHERE " + where;
+	result.settings = SemanticSettings();
 	Value mutations_sync;
 	string sync = "2";
 	if (context.TryGetCurrentSetting("ch_mutations_sync", mutations_sync) && !mutations_sync.IsNull()) {
@@ -533,7 +568,8 @@ SourceResultType ClickhouseDmlOperator::GetDataInternal(ExecutionContext &contex
 		auto &catalog =
 		    ClickhouseCatalog::GetAttachedDatabase(context.client, statement.catalog_name, statement.description);
 		auto connection = catalog.StartWrite(context.client);
-		for (auto &block : connection->Query(statement.count_sql)) {
+		// the count runs with the same semantic settings as the statement, so both select the same rows
+		for (auto &block : connection->Query(statement.count_sql, ClickhouseDml::SemanticSettings())) {
 			if (block.GetRowCount() == 0) {
 				continue;
 			}

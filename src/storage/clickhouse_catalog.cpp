@@ -217,10 +217,21 @@ PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &context, Physical
 	return planner.Make<ClickhouseDmlOperator>(op, ClickhouseDml::PlanDelete(op));
 }
 
+//! DuckDB v1.5.4 calls the overloads taking an already planned child only from the default implementations of the
+//! logical-level PlanDelete/PlanUpdate, which ClickhouseCatalog overrides: never expected. A planned child cannot be
+//! translated into ClickHouse SQL, so the statement is refused (not an InternalException, which would invalidate
+//! the database instance)
+[[noreturn]] static void ThrowPlannedChild(const string &statement) {
+	throw NotImplementedException("%s on ClickHouse tables is translated from its logical plan only, and this plan "
+	                              "reached the extension already planned; run the statement with clickhouse_execute() "
+	                              "instead",
+	                              statement);
+}
+
 PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &,
                                                 PhysicalOperator &) {
 	ThrowIfReadOnly();
-	ClickhouseUtils::ThrowUnsupportedWrite("DELETE");
+	ThrowPlannedChild("DELETE");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -232,7 +243,7 @@ PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &context, Physical
 PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenerator &, LogicalUpdate &,
                                                 PhysicalOperator &) {
 	ThrowIfReadOnly();
-	ClickhouseUtils::ThrowUnsupportedWrite("UPDATE");
+	ThrowPlannedChild("UPDATE");
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanMergeInto(ClientContext &, PhysicalPlanGenerator &, LogicalMergeInto &,

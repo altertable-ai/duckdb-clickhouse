@@ -134,29 +134,29 @@ INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, range * 1.0, 'b' FRO
 statement error
 DELETE FROM ch.w_dml.t WHERE md5(name) = 'x';
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
 
 statement error
 DELETE FROM ch.w_dml.t WHERE id IN (SELECT 1);
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
 
 statement error
 DELETE FROM ch.w_dml.t USING (SELECT 1 AS k) s WHERE t.id = s.k;
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
 
 # an untranslatable branch of an OR must not be dropped (that would widen the DELETE)
 statement error
 DELETE FROM ch.w_dml.t WHERE id = 0 OR md5(name) = 'x';
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
 
 # NOT IN with a NULL differs between DuckDB and ClickHouse: rejected
 statement error
 DELETE FROM ch.w_dml.t WHERE id NOT IN (1, NULL);
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+DELETE on ClickHouse table "w_dml"."t" must filter only the modified table with translatable expressions
 
 statement error
 DELETE FROM ch.w_dml.t WHERE id = 0 RETURNING id;
@@ -297,7 +297,7 @@ cast from TIMESTAMP WITH TIME ZONE to DATE depends on the time zone
 statement error
 DELETE FROM ch.w_dml.x WHERE rowid = 0;
 ----
-DELETE on ClickHouse tables must filter only the modified table with translatable expressions (filter on a virtual column)
+DELETE on ClickHouse table "w_dml"."x" must filter only the modified table with translatable expressions (filter on a virtual column)
 
 # an always-false predicate: nothing to do
 query I
@@ -503,6 +503,109 @@ DELETE FROM ch.w_dml.fl WHERE -f < -0.15;
 
 query I
 SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.fl');
+----
+0
+
+# ---------------------------------------------------------------------------
+# the ATTACH's settings= does not change which rows match: transform_null_in is pinned to 0
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.nn (id Int32, n Nullable(Int32)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.nn VALUES (1, 1), (2, NULL), (3, 7), (4, NULL), (5, 3), (6, 9);
+
+# 5 or more values (the IN list rewritten into a join): DuckDB keeps the NULL rows
+query I
+SELECT count(*) FROM ch.w_dml.nn WHERE n NOT IN (1, 2, 3, 4, 5);
+----
+2
+
+query I
+DELETE FROM ch.w_dml.nn WHERE n NOT IN (1, 2, 3, 4, 5);
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.nn ORDER BY id)');
+----
+[1, 2, 4, 5]
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=transform_null_in=1' AS ch_tn (TYPE clickhouse);
+
+# with transform_null_in = 1, ClickHouse itself would count (and delete) the NULL rows too
+query I
+SELECT * FROM clickhouse_query('ch_tn', 'SELECT count() FROM w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8)');
+----
+3
+
+statement ok
+INSERT INTO ch_tn.w_dml.nn VALUES (3, 7), (6, 9);
+
+query I
+SELECT count(*) FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8);
+----
+2
+
+query I
+DELETE FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8);
+----
+2
+
+query I
+UPDATE ch_tn.w_dml.nn SET id = id WHERE n NOT IN (1, 2);
+----
+1
+
+query I
+DELETE FROM ch_tn.w_dml.nn WHERE n NOT IN (1, 2);
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.nn ORDER BY id)');
+----
+[1, 2, 4]
+
+statement ok
+DETACH ch_tn;
+
+# ---------------------------------------------------------------------------
+# DELETE without WHERE / TRUNCATE only where TRUNCATE TABLE removes the rows
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.local_t (id Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml.local_t VALUES (1), (2)');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.dist (id Int32) ENGINE = Distributed(''default'', ''w_dml'', ''local_t'')');
+
+statement error
+DELETE FROM ch.w_dml.dist;
+----
+DELETE without WHERE (or TRUNCATE) on ClickHouse table "w_dml"."dist" would run TRUNCATE TABLE, which does not remove the rows of a table with engine Distributed
+
+statement error
+TRUNCATE ch.w_dml.dist;
+----
+with engine Distributed
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.local_t');
+----
+2
+
+# Memory (and the MergeTree family, above) are truncated
+query I
+TRUNCATE ch.w_dml.mem;
+----
+2
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.mem');
 ----
 0
 

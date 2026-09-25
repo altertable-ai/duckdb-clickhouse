@@ -19,7 +19,8 @@ struct ClickhouseDmlStatement {
 	string count_sql;
 	//! Empty when there is nothing to run
 	string sql;
-	//! Query-level settings sent with `sql`, e.g. lightweight_deletes_sync or mutations_sync
+	//! Query-level settings sent with `sql`: ClickhouseDml::SemanticSettings(), plus lightweight_deletes_sync or
+	//! mutations_sync
 	vector<std::pair<string, string>> settings;
 	//! The plan holds prepared-statement parameters without values (PREPARE): nothing was translated and running it
 	//! throws. EXECUTE binds the statement again with the values as constants and plans it anew (the catalog reports
@@ -49,8 +50,8 @@ class ClickhouseDml {
 public:
 	//! Checks the plan below a LogicalDelete/LogicalUpdate: [LogicalProjection | LogicalFilter | IN-list MARK join]*
 	//! ending at a ClickHouse scan of `table` (or at a LogicalEmptyResult: matches_nothing). Collects the exact
-	//! predicate. Throws NotImplementedException ("<statement> on ClickHouse tables must filter only the modified table
-	//! with translatable expressions (…); …") otherwise.
+	//! predicate. Throws NotImplementedException ("<statement> on ClickHouse table "db"."t" must filter only the
+	//! modified table with translatable expressions (…); …") otherwise.
 	//!
 	//! An IN-list MARK join is what DuckDB's InClauseRewriter makes of `x [NOT] IN (<5 or more constants>)`: a MARK
 	//! join of the input with a LogicalColumnDataGet of the constants on `x = <constant column>`, whose mark column a
@@ -65,8 +66,14 @@ public:
 	//! ALTER TABLE `db`.`t` UPDATE c = CAST(e AS <c's ClickHouse type>), … WHERE p (WHERE 1 without a filter), sent
 	//! with mutations_sync = ch_mutations_sync
 	static ClickhouseDmlStatement PlanUpdate(ClientContext &context, LogicalUpdate &op);
-	//! Throws the "must filter only the modified table" error for `statement`, with `reason`
-	[[noreturn]] static void ThrowUnsupportedShape(const string &statement, const string &reason);
+	//! Throws the "<statement> on ClickHouse table "db"."t" must filter only the modified table" error, with `reason`
+	[[noreturn]] static void ThrowUnsupportedShape(const string &statement, const TableCatalogEntry &table,
+	                                               const string &reason);
+	//! "db"."t", for errors
+	static string DisplayName(const TableCatalogEntry &table);
+	//! Query settings the count and the statement both run with, whatever the ATTACH's settings= holds: the ClickHouse
+	//! behaviour the translation relies on (transform_null_in = 0)
+	static vector<std::pair<string, string>> SemanticSettings();
 };
 
 //! Runs a ClickhouseDmlStatement once: the count, then the statement, on one write connection. Emits the count

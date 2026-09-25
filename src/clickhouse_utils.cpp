@@ -84,12 +84,6 @@ string ClickhouseUtils::StripTrailingSemicolons(string sql) {
 	return sql;
 }
 
-void ClickhouseUtils::ThrowUnsupportedWrite(const string &statement) {
-	throw NotImplementedException("%s is not supported on attached ClickHouse databases yet; run it in ClickHouse "
-	                              "with clickhouse_execute() instead",
-	                              statement);
-}
-
 void ClickhouseUtils::ThrowReadOnly(const string &database_name) {
 	throw PermissionException("Cannot write to ClickHouse database \"%s\": it is attached in read-only mode",
 	                          database_name);
