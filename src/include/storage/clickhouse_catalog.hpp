@@ -108,6 +108,8 @@ public:
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
+	//! CREATE SCHEMA / DROP SCHEMA refuse "main", which stands for config.database
+	void ThrowIfDefaultSchema(const string &schema_name) const;
 
 	ClickhouseConnectionConfig config;
 	ClickhouseAttachOptions options;

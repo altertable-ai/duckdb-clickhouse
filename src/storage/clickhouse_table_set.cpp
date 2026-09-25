@@ -2,6 +2,7 @@
 
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
@@ -61,11 +62,25 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 
 	for (auto &table : tables) {
 		CreateTableInfo info(schema, table.name);
-		for (idx_t i = 0; i < table.columns.size(); i++) {
-			auto &column = table.columns[i];
+		// ClickHouse column names are case-sensitive, DuckDB's are not: ColumnList::AddColumn() throws for a second
+		// column whose name differs from an earlier one only in case, and throwing here would make every table of
+		// this database unreachable. Only the first of such columns is listed, and the table entry refuses scans and
+		// INSERTs (ClickhouseTableEntry::ThrowIfColumnsCollide())
+		case_insensitive_map_t<string> seen;
+		string column_collision;
+		for (auto &column : table.columns) {
+			auto previous = seen.find(column.name);
+			if (previous != seen.end()) {
+				if (column_collision.empty()) {
+					column_collision = "\"" + previous->second + "\" and \"" + column.name + "\"";
+				}
+				continue;
+			}
+			seen.emplace(column.name, column.name);
+			auto index = info.columns.LogicalColumnCount();
 			info.columns.AddColumn(ColumnDefinition(column.name, column.type));
 			if (!ClickhouseTypes::IsNullable(column.type_node)) {
-				info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
+				info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(index)));
 			}
 		}
 		optional_idx approx_rows;
@@ -74,7 +89,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 			approx_rows = row_count->second;
 		}
 		CreateEntry(make_uniq<ClickhouseTableEntry>(catalog, schema, info, std::move(table.columns), approx_rows,
-		                                            engines[table.name]));
+		                                            engines[table.name], std::move(column_collision)));
 	}
 }
 

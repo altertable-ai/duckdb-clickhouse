@@ -292,7 +292,7 @@ CREATE TABLE ch.w_ddl.t (id INTEGER);
 statement error
 CREATE TABLE ch.w_ddl.t (id INTEGER);
 ----
-TABLE_ALREADY_EXISTS
+Table "t" already exists in ClickHouse database "w_ddl"
 
 statement ok
 CREATE TABLE IF NOT EXISTS ch.w_ddl.t (other VARCHAR);

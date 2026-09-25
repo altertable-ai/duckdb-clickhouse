@@ -7,6 +7,7 @@ namespace duckdb {
 class ClientContext;
 class ClickhouseCatalog;
 class ClickhouseTableEntry;
+struct ClickhouseColumnInfo;
 class ColumnDefinition;
 struct AlterTableInfo;
 struct CreateTableInfo;
@@ -41,9 +42,17 @@ public:
 	static ClickhouseTableEntry &CreateTable(ClientContext &context, ClickhouseCatalog &catalog,
 	                                         const string &database, CreateTableInfo &info);
 	//! ALTER TABLE ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] / RENAME COLUMN, or RENAME TABLE; anything
-	//! else throws NotImplementedException
-	static string AlterTableSql(ClientContext &context, const string &database, const string &table,
+	//! else throws NotImplementedException. Column names are resolved against the table's ClickHouse columns the
+	//! way DuckDB resolves identifiers, case-insensitively (see ResolveColumn()), and the statement uses the real
+	//! ClickHouse name. Returns an empty string when there is nothing to send: ADD COLUMN IF NOT EXISTS of a column
+	//! that exists, DROP COLUMN IF EXISTS of one that does not
+	static string AlterTableSql(ClientContext &context, const string &database, const ClickhouseTableEntry &table,
 	                            AlterTableInfo &info);
+	//! The ClickHouse column of `table` that the DuckDB identifier `name` refers to: the exact (case-sensitive) match,
+	//! else the only case-insensitive one. Null if there is none; CatalogException if several columns match only
+	//! case-insensitively
+	static optional_ptr<const ClickhouseColumnInfo> ResolveColumn(const ClickhouseTableEntry &table,
+	                                                              const string &name);
 };
 
 } // namespace duckdb

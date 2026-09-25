@@ -5,6 +5,7 @@
 #include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -63,8 +64,22 @@ shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &na
 	return schemas.GetEntryOwner(name);
 }
 
+//! "main" is not a ClickHouse database name here: LookupSchema() maps it to the connection's database, so DROP SCHEMA
+//! ch.main would drop that database (and then trip DuckDB's own PhysicalDrop assertion that "main" is never dropped),
+//! and CREATE SCHEMA ch.main would create a real `main` database that silently takes over what ch.main means from
+//! then on (any case: LookupSchema() also finds a `MAIN` database case-insensitively)
+void ClickhouseCatalog::ThrowIfDefaultSchema(const string &schema_name) const {
+	if (StringUtil::CIEquals(schema_name, DEFAULT_SCHEMA)) {
+		throw CatalogException("Cannot create or drop schema \"%s\": in an attached ClickHouse database it stands for "
+		                       "the connection's database (\"%s\"); use clickhouse_execute() to manage a ClickHouse "
+		                       "database with that name",
+		                       schema_name, config.database);
+	}
+}
+
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	auto &context = transaction.GetContext();
+	ThrowIfDefaultSchema(info.schema);
 	string sql = "CREATE DATABASE ";
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		sql += "IF NOT EXISTS ";
@@ -78,6 +93,7 @@ optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction tr
 }
 
 void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+	ThrowIfDefaultSchema(info.name);
 	auto transaction = GetCatalogTransaction(context);
 	auto schema = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.name),
 	                           OnEntryNotFound::RETURN_NULL);

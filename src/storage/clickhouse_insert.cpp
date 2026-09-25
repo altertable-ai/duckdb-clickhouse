@@ -32,6 +32,8 @@ ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator 
 vector<ClickhouseInsertColumn>
 ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
                                    const physical_index_vector_t<idx_t> &column_index_map) {
+	// column_index_map is indexed by DuckDB column, which lines up with clickhouse_columns only without a collision
+	table.ThrowIfColumnsCollide();
 	auto &clickhouse_columns = table.GetClickhouseColumns();
 	vector<ClickhouseInsertColumn> result;
 	for (idx_t i = 0; i < clickhouse_columns.size(); i++) {

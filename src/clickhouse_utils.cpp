@@ -23,6 +23,10 @@ string ClickhouseUtils::QuoteIdentifier(const string &identifier) {
 	return QuoteWith(identifier, '`');
 }
 
+string ClickhouseUtils::QualifiedName(const string &database, const string &table) {
+	return QuoteIdentifier(database) + "." + QuoteIdentifier(table);
+}
+
 string ClickhouseUtils::QuoteLiteral(const string &literal) {
 	return QuoteWith(literal, '\'');
 }

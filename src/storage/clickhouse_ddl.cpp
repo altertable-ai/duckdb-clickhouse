@@ -270,30 +270,89 @@ ClickhouseTableEntry &ClickhouseDdl::CreateTable(ClientContext &context, Clickho
 	return *entry;
 }
 
-string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &database, const string &table,
+optional_ptr<const ClickhouseColumnInfo> ClickhouseDdl::ResolveColumn(const ClickhouseTableEntry &table,
+                                                                      const string &name) {
+	optional_ptr<const ClickhouseColumnInfo> result;
+	idx_t case_insensitive_matches = 0;
+	for (auto &column : table.GetClickhouseColumns()) {
+		if (column.name == name) {
+			return &column;
+		}
+		if (StringUtil::CIEquals(column.name, name)) {
+			result = &column;
+			case_insensitive_matches++;
+		}
+	}
+	if (case_insensitive_matches > 1) {
+		throw CatalogException("Column name \"%s\" is ambiguous in ClickHouse table \"%s\": several columns match it "
+		                       "case-insensitively; quote the exact ClickHouse column name",
+		                       name, table.name);
+	}
+	return result;
+}
+
+//! " (ClickHouse column \"ID\")" when `column` is spelled differently from the name the statement used
+static string SpelledAs(const ClickhouseColumnInfo &column, const string &name) {
+	return column.name == name ? string() : " (ClickHouse column \"" + column.name + "\")";
+}
+
+string ClickhouseDdl::AlterTableSql(ClientContext &context, const string &database, const ClickhouseTableEntry &table,
                                     AlterTableInfo &info) {
-	auto qualified = ClickhouseUtils::QuoteIdentifier(database) + "." + ClickhouseUtils::QuoteIdentifier(table);
+	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
 	switch (info.alter_table_type) {
 	case AlterTableType::ADD_COLUMN: {
 		auto &add = info.Cast<AddColumnInfo>();
-		// added columns are always Nullable: DuckDB's ADD COLUMN carries no NOT NULL constraint
+		auto &new_name = add.new_column.Name();
+		// case-insensitively: ClickHouse would accept "ID" next to "id", and the next metadata load could not list both
+		for (auto &column : table.GetClickhouseColumns()) {
+			if (StringUtil::CIEquals(column.name, new_name)) {
+				if (add.if_column_not_exists) {
+					return string();
+				}
+				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s", new_name,
+				                       table.name, SpelledAs(column, new_name));
+			}
+		}
+		// scalar columns are added Nullable (Array/Tuple/Map/JSON never are): DuckDB's ADD COLUMN carries no NOT
+		// NULL constraint
+		// IF NOT EXISTS still sent: the cached column list may be stale
 		return "ALTER TABLE " + qualified + " ADD COLUMN " + (add.if_column_not_exists ? "IF NOT EXISTS " : "") +
 		       ColumnSql(context, add.new_column, true);
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &remove = info.Cast<RemoveColumnInfo>();
+		auto column = ResolveColumn(table, remove.removed_column);
+		if (!column) {
+			if (remove.if_column_exists) {
+				return string();
+			}
+			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"",
+			                       remove.removed_column, table.name);
+		}
+		// IF EXISTS still sent: the cached column list may be stale
 		return "ALTER TABLE " + qualified + " DROP COLUMN " + (remove.if_column_exists ? "IF EXISTS " : "") +
-		       ClickhouseUtils::QuoteIdentifier(remove.removed_column);
+		       ClickhouseUtils::QuoteIdentifier(column->name);
 	}
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename = info.Cast<RenameColumnInfo>();
-		return "ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(rename.old_name) +
+		auto column = ResolveColumn(table, rename.old_name);
+		if (!column) {
+			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"", rename.old_name,
+			                       table.name);
+		}
+		// renaming a column to another spelling of its own name (id -> ID) is fine; to any other column's is not
+		for (auto &other : table.GetClickhouseColumns()) {
+			if (&other != column.get() && StringUtil::CIEquals(other.name, rename.new_name)) {
+				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s",
+				                       rename.new_name, table.name, SpelledAs(other, rename.new_name));
+			}
+		}
+		return "ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(column->name) +
 		       " TO " + ClickhouseUtils::QuoteIdentifier(rename.new_name);
 	}
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename = info.Cast<RenameTableInfo>();
-		return "RENAME TABLE " + qualified + " TO " + ClickhouseUtils::QuoteIdentifier(database) + "." +
-		       ClickhouseUtils::QuoteIdentifier(rename.new_table_name);
+		return "RENAME TABLE " + qualified + " TO " + ClickhouseUtils::QualifiedName(database, rename.new_table_name);
 	}
 	default:
 		throw NotImplementedException("This ALTER TABLE operation is not supported for ClickHouse tables (only ADD "

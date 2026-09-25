@@ -9,9 +9,19 @@ namespace duckdb {
 
 ClickhouseTableEntry::ClickhouseTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                            vector<ClickhouseColumnInfo> columns, optional_idx approx_rows,
-                                           string engine)
+                                           string engine, string column_collision)
     : TableCatalogEntry(catalog, schema, info), clickhouse_columns(std::move(columns)), approx_rows(approx_rows),
-      engine(std::move(engine)) {
+      engine(std::move(engine)), column_collision(std::move(column_collision)) {
+}
+
+void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
+	if (column_collision.empty()) {
+		return;
+	}
+	throw InvalidInputException("ClickHouse table \"%s\".\"%s\" has columns whose names differ only in case (%s), "
+	                            "which DuckDB cannot tell apart; rename one of them (ALTER TABLE … RENAME COLUMN), or "
+	                            "read the table with clickhouse_query()",
+	                            schema.name, name, column_collision);
 }
 
 unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -19,6 +29,8 @@ unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &co
 }
 
 TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	// the scan maps DuckDB column ids onto clickhouse_columns, which only line up without a collision
+	ThrowIfColumnsCollide();
 	auto result = make_uniq<ClickhouseScanBindData>();
 	auto &clickhouse_catalog = catalog.Cast<ClickhouseCatalog>();
 	result->pool = clickhouse_catalog.GetConnectionPoolPtr();

@@ -37,10 +37,27 @@ ClickhouseSchemaEntry::ClickhouseSchemaEntry(Catalog &catalog, CreateSchemaInfo 
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                                BoundCreateTableInfo &info) {
 	auto &context = transaction.GetContext();
+	auto &base = info.Base();
+	if (base.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+		// respect the planner's view of the table. PhysicalPlanGenerator::CreatePlan(LogicalCreateTable) routes a
+		// CREATE TABLE … AS SELECT here -- dropping its SELECT -- whenever this cache already has the table (and
+		// only reaches PlanCreateTableAs otherwise). If the table was dropped on the server behind this cache's back,
+		// sending a plain CREATE TABLE would succeed and silently leave an empty table instead of the query's rows
+		auto existing = tables.GetEntry(context, base.table);
+		if (existing) {
+			if (base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+				return existing;
+			}
+			throw CatalogException("Table \"%s\" already exists in ClickHouse database \"%s\" (if it was dropped "
+			                       "outside DuckDB, run CALL clickhouse_clear_cache())",
+			                       base.table, name);
+		}
+	}
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
-	// ClickhouseDdl clears the catalog cache, which frees cached schema entries -- including this one
+	// ClickhouseDdl clears the catalog cache, which retires this schema entry; retirement keeps it alive until this
+	// transaction ends (see ClickhouseTransactionManager), and keep_alive does too (belt-and-braces)
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
-	return &ClickhouseDdl::CreateTable(context, ch_catalog, name, info.Base());
+	return &ClickhouseDdl::CreateTable(context, ch_catalog, name, base);
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
 	ThrowNotSupported("Functions and macros");
@@ -93,8 +110,12 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		    "clickhouse_execute() instead",
 		    table.name, ViewLikeKind(table.GetEngine()), table.GetEngine());
 	}
-	// build the SQL before Execute() clears the cache and frees `entry`
-	auto sql = ClickhouseDdl::AlterTableSql(context, name, table.name, alter);
+	// built before Execute() clears the cache and retires `entry`
+	auto sql = ClickhouseDdl::AlterTableSql(context, name, table, alter);
+	if (sql.empty()) {
+		// ADD COLUMN IF NOT EXISTS of an existing column, DROP COLUMN IF EXISTS of a missing one
+		return;
+	}
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
 	ClickhouseDdl::Execute(context, ch_catalog, sql);

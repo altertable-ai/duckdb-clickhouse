@@ -67,7 +67,7 @@ c	Nullable(Int32)	7
 statement error
 ALTER TABLE ch.w_ddl2.t ADD COLUMN c INTEGER;
 ----
-ClickHouse error
+Column with name "c" already exists in ClickHouse table "t"
 
 statement ok
 ALTER TABLE ch.w_ddl2.t ADD COLUMN IF NOT EXISTS c INTEGER;
@@ -133,6 +133,166 @@ query I
 SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.tables WHERE database = ''w_ddl2'' AND name = ''v''');
 ----
 v
+
+# ---------------------------------------------------------------------------
+# column names resolve case-insensitively, as DuckDB identifiers do, and the statement uses the real ClickHouse name
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ch.w_ddl2.ci (id INTEGER PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO ch.w_ddl2.ci VALUES (1, 'x');
+
+# ClickHouse would accept "ID" next to "id", and the next metadata load could not list both
+statement error
+ALTER TABLE ch.w_ddl2.ci ADD COLUMN "ID" INTEGER;
+----
+Column with name "ID" already exists in ClickHouse table "ci" (ClickHouse column "id")
+
+statement ok
+ALTER TABLE ch.w_ddl2.ci ADD COLUMN IF NOT EXISTS "ID" INTEGER;
+
+statement error
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN val TO "ID";
+----
+Column with name "ID" already exists in ClickHouse table "ci" (ClickHouse column "id")
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+val
+
+# a case-mismatched old name renames the real column
+statement ok
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN "VAL" TO v;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+v
+
+# renaming a column to another spelling of its own name is fine
+statement ok
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN v TO "V";
+
+query II
+SELECT id, "V" FROM ch.w_ddl2.ci;
+----
+1	x
+
+statement error
+ALTER TABLE ch.w_ddl2.ci RENAME COLUMN nope TO other;
+----
+Column with name "nope" does not exist in ClickHouse table "ci"
+
+# DROP COLUMN IF EXISTS with a case-mismatched name drops the real column
+statement ok
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN IF EXISTS v;
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.columns WHERE database = ''w_ddl2'' AND table = ''ci'' ORDER BY position');
+----
+id
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' AND table_name = 'ci';
+----
+id
+
+statement ok
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN IF EXISTS nope;
+
+statement error
+ALTER TABLE ch.w_ddl2.ci DROP COLUMN nope;
+----
+Column with name "nope" does not exist in ClickHouse table "ci"
+
+# a table whose columns collide case-insensitively (created outside DuckDB) does not make its siblings unreachable;
+# it is listed with the first of the colliding columns, and using it fails with a clear error
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_ddl2.dup (id Int32, ID String, other Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_ddl2.dup VALUES (1, ''one'', 10)');
+
+query I
+SELECT id FROM ch.w_ddl2.ci;
+----
+1
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' ORDER BY table_name;
+----
+ci
+dup
+u
+v
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'ch' AND schema_name = 'w_ddl2' AND table_name = 'dup' ORDER BY column_index;
+----
+id
+other
+
+statement error
+SELECT * FROM ch.w_ddl2.dup;
+----
+ClickHouse table "w_ddl2"."dup" has columns whose names differ only in case ("id" and "ID")
+
+statement error
+INSERT INTO ch.w_ddl2.dup (id) VALUES (2);
+----
+has columns whose names differ only in case
+
+# a name matching several of its columns only case-insensitively is ambiguous
+statement error
+ALTER TABLE ch.w_ddl2.dup DROP COLUMN "Id";
+----
+is ambiguous
+
+# ALTER TABLE still works on it, with the exact name: renaming one of the columns makes it usable
+statement ok
+ALTER TABLE ch.w_ddl2.dup RENAME COLUMN "ID" TO label;
+
+query III
+SELECT * FROM ch.w_ddl2.dup;
+----
+1	one	10
+
+# ---------------------------------------------------------------------------
+# "main" stands for the connection's database (test_db): CREATE SCHEMA and DROP SCHEMA refuse it
+# ---------------------------------------------------------------------------
+statement error
+DROP SCHEMA ch.main CASCADE;
+----
+Cannot create or drop schema "main": in an attached ClickHouse database it stands for the connection's database ("test_db")
+
+statement error
+DROP SCHEMA IF EXISTS ch.main;
+----
+Cannot create or drop schema "main"
+
+statement error
+CREATE SCHEMA ch.main;
+----
+Cannot create or drop schema "main"
+
+statement error
+CREATE SCHEMA IF NOT EXISTS ch.main;
+----
+Cannot create or drop schema "main"
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT name FROM system.databases WHERE name IN (''test_db'', ''main'') ORDER BY name');
+----
+test_db
+
+query I
+SELECT count(*) FROM ch.main.t1;
+----
+3
 
 # ---------------------------------------------------------------------------
 # DROP SCHEMA

@@ -8,6 +8,8 @@ class ClickhouseUtils {
 public:
 	//! Quotes an identifier with backticks, escaping backslashes and backticks
 	static string QuoteIdentifier(const string &identifier);
+	//! `database`.`table`, both quoted with QuoteIdentifier()
+	static string QualifiedName(const string &database, const string &table);
 	//! Quotes a string literal with single quotes, escaping backslashes and single quotes
 	static string QuoteLiteral(const string &literal);
 	//! Returns true if the byte range is well-formed UTF-8
