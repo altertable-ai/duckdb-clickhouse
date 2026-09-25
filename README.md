@@ -186,8 +186,6 @@ make smoke SMOKE_BUILD=debug               # test the debug build instead
 CLICKHOUSE_TEST_KEEP=1 make smoke          # keep the containers afterwards, for debugging
 ```
 
-The design and the exact rules for translating `UPDATE` and `DELETE` are in
-[docs/superpowers/specs/2026-09-24-clickhouse-writes-design.md](docs/superpowers/specs/2026-09-24-clickhouse-writes-design.md).
 The clickhouse-cpp vcpkg port is adapted from [pixonic/duckdb-clickhouse](https://github.com/pixonic/duckdb-clickhouse)
 (MIT). The design follows [duckdb/duckdb-postgres](https://github.com/duckdb/duckdb-postgres).
 

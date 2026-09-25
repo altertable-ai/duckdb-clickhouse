@@ -285,6 +285,18 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ch.test_db.t1 WHERE id >= 2 AND va
 ----
 analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT [^"]*FROM `test_db`.`t1` WHERE `id` >= 2".*
 
+# a selective filter on the 10-million-row table is pushed, so ClickHouse counts it and DuckDB does not
+# read every row. 100 <= n < 100100 is 100000 values.
+query I
+SELECT count(*) FROM ch.test_db.big WHERE n >= 100 AND n < 100100;
+----
+100000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ch.test_db.big WHERE n >= 100 AND n < 100100;
+----
+analyzed_plan	<REGEX>:.*"ClickHouse Query": "SELECT `n` FROM `test_db`.`big` WHERE \(`n` >= 100 AND `n` < 100100\)".*
+
 # the setting turns pushdown off
 statement ok
 SET ch_filter_pushdown = false;

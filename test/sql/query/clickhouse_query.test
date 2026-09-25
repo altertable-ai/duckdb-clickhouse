@@ -100,3 +100,18 @@ statement error
 SELECT * FROM clickhouse_query('ch', NULL);
 ----
 Parameters to clickhouse_query cannot be NULL
+
+statement error
+SELECT * FROM clickhouse_query('ch', '');
+----
+clickhouse_query: the query cannot be empty
+
+statement error
+SELECT * FROM clickhouse_query('ch', ';;;');
+----
+clickhouse_query: the query cannot be empty
+
+# a query that returns a column and no rows is an empty result, not an error
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT number AS n FROM numbers(0)');
+----
