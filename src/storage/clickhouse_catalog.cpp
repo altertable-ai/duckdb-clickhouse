@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "storage/clickhouse_ddl.hpp"
@@ -220,6 +221,12 @@ PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &, PhysicalPlanGen
                                                 PhysicalOperator &) {
 	ThrowIfReadOnly();
 	ClickhouseUtils::ThrowUnsupportedWrite("DELETE");
+}
+
+PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                LogicalUpdate &op) {
+	ThrowIfReadOnly();
+	return planner.Make<ClickhouseDmlOperator>(op, ClickhouseDml::PlanUpdate(context, op));
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenerator &, LogicalUpdate &,

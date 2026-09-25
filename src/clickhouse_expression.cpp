@@ -119,6 +119,10 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 		auto keyword = StringUtil::EndsWith(name, "*") ? "ILIKE" : "LIKE";
 		return "(" + arg(0) + (negated ? " NOT " : " ") + keyword + " " + LikePattern(*children[1]) + ")";
 	}
+	if (children.size() == 2 && name == "||" && is_string(0) && is_string(1)) {
+		// NULL if either side is NULL, in both (unlike DuckDB's concat(), which skips NULLs)
+		return "concat(" + arg(0) + ", " + arg(1) + ")";
+	}
 	if (children.size() == 2 && (name == "starts_with" || name == "prefix")) {
 		return "startsWith(" + arg(0) + ", " + arg(1) + ")";
 	}

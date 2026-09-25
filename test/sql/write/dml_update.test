@@ -1,0 +1,277 @@
+# name: test/sql/write/dml_update.test
+# description: UPDATE on attached ClickHouse tables, translated into ALTER TABLE … UPDATE
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_dml2');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_dml2');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.u (id Int32, name String, n Nullable(Int64), ip IPv4, e Enum8(''x'' = 1, ''y'' = 2)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.u SELECT range::INTEGER, 'name' || range, range, '10.0.0.' || range, 'x' FROM range(5);
+
+# several columns, expressions over the row, affected-row count
+query I
+UPDATE ch.w_dml2.u SET name = upper(name), n = n * 10 WHERE id >= 3;
+----
+2
+
+query III
+SELECT id, name, n FROM ch.w_dml2.u ORDER BY id;
+----
+0	name0	0
+1	name1	1
+2	name2	2
+3	NAME3	30
+4	NAME4	40
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w_dml2.u ORDER BY id)');
+----
+[0, 1, 2, 30, 40]
+
+# NULL, coalesce, no WHERE
+query I
+UPDATE ch.w_dml2.u SET n = NULL WHERE id = 1;
+----
+1
+
+query I
+UPDATE ch.w_dml2.u SET n = coalesce(n, 0) + 1;
+----
+5
+
+query I
+SELECT list(n ORDER BY id) FROM ch.w_dml2.u;
+----
+[1, 1, 3, 31, 41]
+
+# enums, server-converted types, CASE
+query I
+UPDATE ch.w_dml2.u SET e = 'y', ip = '192.168.1.' || id::VARCHAR WHERE e = 'x' AND id < 2;
+----
+2
+
+query I
+UPDATE ch.w_dml2.u SET name = CASE WHEN id % 2 = 0 THEN 'even' ELSE 'odd' END;
+----
+5
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, name, toString(e), toString(ip) FROM w_dml2.u WHERE id <= 2 ORDER BY id');
+----
+0	even	y	192.168.1.0
+1	odd	y	192.168.1.1
+2	even	x	10.0.0.2
+
+# no row can match (DuckDB folds the plan to an empty result): nothing is updated, never every row
+query I
+UPDATE ch.w_dml2.u SET name = 'z' WHERE 1 = 0;
+----
+0
+
+query I
+SELECT count(*) FROM ch.w_dml2.u WHERE name = 'z';
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml2.u WHERE name = ''z''');
+----
+0
+
+# prepared statements: every EXECUTE plans the UPDATE again with the parameter values
+statement ok
+PREPARE pu AS UPDATE ch.w_dml2.u SET n = n + 100 WHERE id = $1;
+
+query I
+EXECUTE pu(2);
+----
+1
+
+query I
+EXECUTE pu(3);
+----
+1
+
+query II
+SELECT id, n FROM ch.w_dml2.u ORDER BY id;
+----
+0	1
+1	1
+2	103
+3	131
+4	41
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(n) FROM (SELECT n FROM w_dml2.u ORDER BY id)');
+----
+[1, 1, 103, 131, 41]
+
+# a parameter in SET
+statement ok
+PREPARE pn AS UPDATE ch.w_dml2.u SET name = $2 WHERE id = $1;
+
+query I
+EXECUTE pn(4, 'four');
+----
+1
+
+query II
+SELECT id, name FROM ch.w_dml2.u ORDER BY id;
+----
+0	even
+1	odd
+2	even
+3	odd
+4	four
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, name FROM w_dml2.u ORDER BY id');
+----
+0	even
+1	odd
+2	even
+3	odd
+4	four
+
+# ClickHouse refuses to update a sorting-key column; the error is ClickHouse's
+statement error
+UPDATE ch.w_dml2.u SET id = 99 WHERE id = 1;
+----
+ClickHouse error
+
+# rejected before anything runs
+statement error
+UPDATE ch.w_dml2.u SET name = md5(name);
+----
+UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.u SET name = 'z' FROM (SELECT 1 AS k) s WHERE u.id = s.k;
+----
+UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.u SET name = 'z' WHERE id = 1 RETURNING id;
+----
+RETURNING is not supported for ClickHouse tables
+
+statement error
+UPDATE ch.w_dml2.u SET n = DEFAULT;
+----
+UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+
+query I
+SELECT count(*) FROM ch.w_dml2.u WHERE name = 'z';
+----
+0
+
+# ch_mutations_sync
+statement error
+SET ch_mutations_sync = 3;
+----
+ch_mutations_sync must be 0, 1 or 2
+
+statement ok
+SET ch_mutations_sync = 1;
+
+query I
+UPDATE ch.w_dml2.u SET name = 'synced' WHERE id = 4;
+----
+1
+
+statement ok
+RESET ch_mutations_sync;
+
+query I
+SELECT name FROM ch.w_dml2.u WHERE id = 4;
+----
+synced
+
+# an UPDATE of an array column is a DELETE + INSERT for DuckDB, which adds col = col for every other column: those
+# are dropped (the sorting key, and columns an expression may not read, included)
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.a (id Int32, arr Array(Int32), arr2 Array(Int32), fs FixedString(2), d DateTime64(9)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.a VALUES (1, [1], [10, 11], ''ab'', ''2020-01-01 00:00:00.123456789''), (2, [2], [20], ''cd'', ''2021-01-01 00:00:00'')');
+
+query I
+UPDATE ch.w_dml2.a SET arr = arr2 WHERE id = 1;
+----
+1
+
+query II
+SELECT id, arr FROM ch.w_dml2.a ORDER BY id;
+----
+1	[10, 11]
+2	[2]
+
+query IIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(arr), fs, toString(d) FROM w_dml2.a ORDER BY id');
+----
+1	[10,11]	ab	2020-01-01 00:00:00.123456789
+2	[2]	cd	2021-01-01 00:00:00.000000000
+
+# FixedString and DateTime64(9) columns can be written (CAST to their own type)...
+query I
+UPDATE ch.w_dml2.a SET fs = 'zz', d = TIMESTAMP_NS '2022-02-02 02:02:02' WHERE id = 2;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT fs, toString(d) FROM w_dml2.a WHERE id = 2');
+----
+zz	2022-02-02 02:02:02.000000000
+
+# ...but not read: DuckDB and ClickHouse do not compare them the same way
+statement error
+UPDATE ch.w_dml2.a SET arr = [] WHERE d > TIMESTAMPTZ '2000-01-01 00:00:00+00';
+----
+UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+UPDATE ch.w_dml2.a SET fs = upper(fs) WHERE id = 1;
+----
+UPDATE on ClickHouse tables must filter only the modified table with translatable expressions
+
+# a hand-written col = col changes nothing: only the count runs
+query I
+UPDATE ch.w_dml2.a SET id = id WHERE id = 2;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml2.a ORDER BY id)');
+----
+[1, 2]
+
+# views are refused
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_dml2.v AS SELECT 1 AS one');
+
+statement error
+UPDATE ch.w_dml2.v SET one = 2;
+----
+is a ClickHouse view
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

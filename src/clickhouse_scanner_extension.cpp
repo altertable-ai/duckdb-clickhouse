@@ -39,6 +39,12 @@ static void SetClickhouseInsertBlockSize(ClientContext &context, SetScope scope,
 	}
 }
 
+static void SetClickhouseMutationsSync(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull() || UBigIntValue::Get(parameter) > 2) {
+		throw InvalidInputException("ch_mutations_sync must be 0, 1 or 2");
+	}
+}
+
 static void SetClickhouseDefaultTableEngine(ClientContext &context, SetScope scope, Value &parameter) {
 	if (parameter.IsNull()) {
 		throw InvalidInputException("ch_default_table_engine cannot be NULL");
@@ -96,6 +102,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Table engine for CREATE TABLE in attached ClickHouse databases, e.g. MergeTree or "
 	                          "ReplicatedMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}')",
 	                          LogicalType::VARCHAR, Value("MergeTree"), SetClickhouseDefaultTableEngine);
+	config.AddExtensionOption("ch_mutations_sync",
+	                          "mutations_sync sent with UPDATE: 0 = do not wait, 1 = wait on this replica, 2 = wait on "
+	                          "all replicas",
+	                          LogicalType::UBIGINT, Value::UBIGINT(2), SetClickhouseMutationsSync);
 	OptimizerExtension clickhouse_optimizer;
 	clickhouse_optimizer.optimize_function = ClickhouseOptimizer::Optimize;
 	OptimizerExtension::Register(config, std::move(clickhouse_optimizer));

@@ -63,6 +63,7 @@ On Windows there is no system CA bundle that OpenSSL can read, so pass `ca_cert`
 | `ch_order_pushdown` | `true` | Push `LIMIT` and `ORDER BY … LIMIT` into ClickHouse queries |
 | `ch_insert_block_size` | `65536` | Minimum rows per block sent to ClickHouse during `INSERT` (rounded up to whole chunks) |
 | `ch_default_table_engine` | `MergeTree` | Table engine used by `CREATE TABLE` |
+| `ch_mutations_sync` | `2` | `mutations_sync` for `UPDATE`: 0 = do not wait, 1 = this replica, 2 = all replicas |
 | `ch_connect_timeout_ms` | `10000` | Connection timeout |
 | `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
 | `ch_pool_max_connections` | depends on CPU count | Connection pool size per attached database (new ATTACHes) |
@@ -184,22 +185,24 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
   and `ORDER BY tuple()` for MergeTree engines), then streams the rows in like an `INSERT`. It is not atomic: if the
   `INSERT` part fails, the table stays, possibly with some rows.
 
-`DELETE` and `TRUNCATE` are translated into one ClickHouse statement each: `DELETE FROM … WHERE …` (a synchronous
+`UPDATE`, `DELETE` and `TRUNCATE` are translated into one ClickHouse statement each: `ALTER TABLE … UPDATE … WHERE …`
+(a mutation; `ch_mutations_sync`, default `2`, decides whether it waits), `DELETE FROM … WHERE …` (a synchronous
 lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
 `SELECT count()` run just before the statement, so it can be off if other clients write at the same time.
 
 - The `WHERE` clause must only use the modified table's columns, constants, prepared-statement parameters (`?`,
   `$1`), comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN` lists of constants without `NULL`, `BETWEEN`,
-  arithmetic, `LIKE`/`ILIKE`, `starts_with`, `ends_with`, `contains`, `lower`, `upper`, `length`, `coalesce`, `CASE`
-  and `CAST`. Anything else — other functions, subqueries, `USING`, `RETURNING` — is rejected before anything runs;
-  use `clickhouse_execute`. An `IN` list of 5 or more values must be a condition of its own (e.g. not inside an
-  `OR`).
+  arithmetic, `||` on strings, `LIKE`/`ILIKE`, `starts_with`, `ends_with`, `contains`, `lower`, `upper`, `length`,
+  `coalesce`, `CASE` and `CAST`. Anything else — other functions, subqueries, `USING`, `UPDATE … FROM`, `RETURNING`,
+  `SET … = DEFAULT` — is rejected before anything runs; use `clickhouse_execute`. An `IN` list of 5 or more values
+  must be a condition of its own (e.g. not inside an `OR`). `SET` values follow the same rules as `WHERE`, and are
+  converted to the column's ClickHouse type with `CAST`. ClickHouse does not update sorting-key columns.
 - Also rejected, because ClickHouse would not pick the same rows as DuckDB:
-  - conditions on `DateTime64` columns with a precision above 6 (DuckDB reads them truncated to microseconds) and on
-    `FixedString` columns (DuckDB sees their padding);
+  - conditions and `SET` values reading `DateTime64` columns with a precision above 6 (DuckDB reads them truncated
+    to microseconds) or `FixedString` columns (DuckDB sees their padding); such columns can still be assigned;
   - casts between `TIMESTAMP WITH TIME ZONE` and `DATE`, `TIMESTAMP`, `VARCHAR` or `TIME`, which DuckDB converts in
     its `TimeZone` setting and ClickHouse in the column's or server's time zone.
-- A condition DuckDB proves always false (e.g. `WHERE 1 = 0`) deletes nothing and sends nothing.
+- A condition DuckDB proves always false (e.g. `WHERE 1 = 0`) updates or deletes nothing and sends nothing.
 - The translated statement follows ClickHouse semantics where they differ from DuckDB's (e.g. `NaN` comparisons,
   `UUID` ordering, integer division and division by zero, and explicit `CAST`s).
 
@@ -227,8 +230,7 @@ single-threaded scan.
 
 ## Limitations
 
-- `UPDATE` is not supported yet; run it with `clickhouse_execute()`.
-  `MERGE INTO`, indexes and `CREATE VIEW` are not supported.
+- `MERGE INTO`, indexes and `CREATE VIEW` are not supported.
 - Attach with `(TYPE clickhouse, READ_ONLY)` to reject every write.
 - ClickHouse has no multi-statement transactions. Two scans in one DuckDB transaction may see different data.
 - Not available in DuckDB-WASM (the native protocol needs TCP).

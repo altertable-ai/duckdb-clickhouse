@@ -16,6 +16,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
@@ -370,6 +371,135 @@ ClickhouseDmlStatement ClickhouseDml::PlanDelete(LogicalDelete &op) {
 	return result;
 }
 
+//! The table column id that output column `index` of `op` passes through unchanged from the ClickHouse scan
+//! (plain references through projections, filters and an IN-list MARK join's input); invalid for anything else.
+//! Structural, so it does not depend on the SQL ResolveOutput would produce for the column (a read expression, or
+//! a rejection for a column that is not compared exactly)
+static optional_idx UnchangedScanColumn(const LogicalOperator &op, idx_t index) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		auto &column_ids = get.GetColumnIds();
+		idx_t position = index;
+		if (!get.projection_ids.empty()) {
+			if (index >= get.projection_ids.size()) {
+				return optional_idx();
+			}
+			position = get.projection_ids[index];
+		}
+		if (position >= column_ids.size() || column_ids[position].HasChildren() ||
+		    IsVirtualColumn(column_ids[position].GetPrimaryIndex())) {
+			return optional_idx();
+		}
+		return column_ids[position].GetPrimaryIndex();
+	}
+	case LogicalOperatorType::LOGICAL_FILTER: {
+		auto &filter = op.Cast<LogicalFilter>();
+		if (!filter.projection_map.empty()) {
+			if (index >= filter.projection_map.size()) {
+				return optional_idx();
+			}
+			index = filter.projection_map[index];
+		}
+		return UnchangedScanColumn(*op.children[0], index);
+	}
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		if (index >= op.expressions.size() ||
+		    op.expressions[index]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+			return optional_idx();
+		}
+		return UnchangedScanColumn(*op.children[0], op.expressions[index]->Cast<BoundReferenceExpression>().index);
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+		if (!IsInListJoinCandidate(op)) {
+			return optional_idx();
+		}
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		auto left_count = MarkJoinLeftCount(join);
+		if (index >= left_count) {
+			return optional_idx();
+		}
+		auto left_index = join.left_projection_map.empty() ? index : join.left_projection_map[index];
+		return UnchangedScanColumn(*op.children[0], left_index);
+	}
+	default:
+		return optional_idx();
+	}
+}
+
+ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, LogicalUpdate &op) {
+	if (op.return_chunk) {
+		throw NotImplementedException("RETURNING is not supported for ClickHouse tables");
+	}
+	auto target = AnalyzeTarget("UPDATE", op.table, *op.children[0]);
+	// the DuckDB and ClickHouse column lists match one to one (GetScanFunction already refused a table where they
+	// do not)
+	target.table.ThrowIfColumnsCollide();
+	auto &columns = target.table.GetClickhouseColumns();
+	if (op.columns.size() != op.expressions.size()) {
+		ThrowUnsupportedShape("UPDATE", "SET list does not match its columns");
+	}
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		if (op.columns[i].index >= columns.size()) {
+			ThrowUnsupportedShape("UPDATE", "SET of an unknown column");
+		}
+		if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
+			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE; checked before the WHERE is even looked at
+			ThrowUnsupportedShape("UPDATE", "SET " + columns[op.columns[i].index].name + " = DEFAULT");
+		}
+	}
+	ClickhouseDmlStatement result;
+	result.catalog_name = op.table.catalog.GetName();
+	result.description = "ALTER TABLE " + target.qualified_name + " UPDATE";
+	// both flags come with an empty predicate, which must never become WHERE 1 (every row)
+	if (target.unbound_parameters) {
+		result.unbound_parameters = true;
+		return result;
+	}
+	if (target.matches_nothing) {
+		// no count, no statement, no connection
+		return result;
+	}
+	auto &child = *op.children[0];
+	vector<string> assignments;
+	try {
+		for (idx_t i = 0; i < op.columns.size(); i++) {
+			auto column_id = op.columns[i].index;
+			auto &column = columns[column_id];
+			auto &expr = *op.expressions[i];
+			if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+				auto source = UnchangedScanColumn(child, expr.Cast<BoundReferenceExpression>().index);
+				if (source.IsValid() && source.GetIndex() == column_id) {
+					// col = col: DuckDB adds every column like this to some UPDATEs (e.g. of an array column, which
+					// it turns into DELETE + INSERT); sending them would fail on key columns
+					continue;
+				}
+			}
+			auto value =
+			    ClickhouseExpression::Translate(expr, [&](idx_t index) { return ResolveOutput(child, index); });
+			assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = CAST(" + value + " AS " +
+			                      column.clickhouse_type + ")");
+		}
+	} catch (NotImplementedException &ex) {
+		ErrorData error(ex);
+		ThrowUnsupportedShape("UPDATE", error.RawMessage());
+	}
+	auto where = target.predicate.empty() ? string("1") : target.predicate;
+	result.count_sql = "SELECT count() FROM " + target.qualified_name + " WHERE " + where;
+	if (assignments.empty()) {
+		// nothing changes: count only
+		return result;
+	}
+	result.sql = result.description + " " + StringUtil::Join(assignments, ", ") + " WHERE " + where;
+	Value mutations_sync;
+	string sync = "2";
+	if (context.TryGetCurrentSetting("ch_mutations_sync", mutations_sync) && !mutations_sync.IsNull()) {
+		sync = mutations_sync.ToString();
+	}
+	result.settings.emplace_back("mutations_sync", sync);
+	return result;
+}
+
 ClickhouseDmlOperator::ClickhouseDmlOperator(PhysicalPlan &physical_plan, LogicalOperator &op,
                                              ClickhouseDmlStatement statement_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
@@ -417,8 +547,10 @@ InsertionOrderPreservingMap<string> ClickhouseDmlOperator::ParamsToString() cons
 	InsertionOrderPreservingMap<string> result;
 	if (statement.unbound_parameters) {
 		result["Statement"] = statement.description + " (planned again with the parameter values on EXECUTE)";
-	} else if (statement.sql.empty()) {
+	} else if (statement.count_sql.empty()) {
 		result["Statement"] = statement.description + " (nothing to run: no row matches)";
+	} else if (statement.sql.empty()) {
+		result["Statement"] = statement.count_sql + " (count only: nothing changes)";
 	} else {
 		result["Statement"] = statement.sql;
 	}

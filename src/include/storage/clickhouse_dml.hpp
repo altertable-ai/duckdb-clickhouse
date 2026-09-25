@@ -5,6 +5,7 @@
 namespace duckdb {
 class ClickhouseTableEntry;
 class LogicalDelete;
+class LogicalUpdate;
 class TableCatalogEntry;
 
 //! A DELETE / TRUNCATE / UPDATE translated into ClickHouse SQL
@@ -18,7 +19,7 @@ struct ClickhouseDmlStatement {
 	string count_sql;
 	//! Empty when there is nothing to run
 	string sql;
-	//! Query-level settings sent with `sql`, e.g. lightweight_deletes_sync
+	//! Query-level settings sent with `sql`, e.g. lightweight_deletes_sync or mutations_sync
 	vector<std::pair<string, string>> settings;
 	//! The plan holds prepared-statement parameters without values (PREPARE): nothing was translated and running it
 	//! throws. EXECUTE binds the statement again with the values as constants and plans it anew (the catalog reports
@@ -61,6 +62,9 @@ public:
 	//! MARK join, whose mark column itself is only accepted where AnalyzeTarget translates it)
 	static string ResolveOutput(const LogicalOperator &op, idx_t index);
 	static ClickhouseDmlStatement PlanDelete(LogicalDelete &op);
+	//! ALTER TABLE `db`.`t` UPDATE c = CAST(e AS <c's ClickHouse type>), … WHERE p (WHERE 1 without a filter), sent
+	//! with mutations_sync = ch_mutations_sync
+	static ClickhouseDmlStatement PlanUpdate(ClientContext &context, LogicalUpdate &op);
 	//! Throws the "must filter only the modified table" error for `statement`, with `reason`
 	[[noreturn]] static void ThrowUnsupportedShape(const string &statement, const string &reason);
 };
