@@ -548,9 +548,8 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 	case ExpressionClass::BOUND_BETWEEN: {
 		auto &between = expr.Cast<BoundBetweenExpression>();
 		auto input = Translate(*between.input, resolve);
-		return "(" + input + (between.lower_inclusive ? " >= " : " > ") + Translate(*between.lower, resolve) +
-		       " AND " + input + (between.upper_inclusive ? " <= " : " < ") + Translate(*between.upper, resolve) +
-		       ")";
+		return "(" + input + (between.lower_inclusive ? " >= " : " > ") + Translate(*between.lower, resolve) + " AND " +
+		       input + (between.upper_inclusive ? " <= " : " < ") + Translate(*between.upper, resolve) + ")";
 	}
 	case ExpressionClass::BOUND_FUNCTION:
 		return TranslateFunction(expr.Cast<BoundFunctionExpression>(), resolve);

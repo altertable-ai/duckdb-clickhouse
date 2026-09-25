@@ -63,8 +63,7 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		result.push_back(ClickhouseInsertColumn {column, source_index});
 	}
 	if (result.empty()) {
-		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column",
-		                              table.name);
+		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column", table.name);
 	}
 	return result;
 }

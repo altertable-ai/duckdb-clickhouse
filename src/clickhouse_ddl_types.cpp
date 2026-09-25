@@ -135,8 +135,8 @@ string ClickhouseDdlTypes::ToClickhouse(const LogicalType &type, bool nullable) 
 		return "Tuple(" + StringUtil::Join(fields, ", ") + ")";
 	}
 	case LogicalTypeId::MAP:
-		return "Map(" + ToClickhouse(MapType::KeyType(type), false) + ", " + ToClickhouse(MapType::ValueType(type), true) +
-		       ")";
+		return "Map(" + ToClickhouse(MapType::KeyType(type), false) + ", " +
+		       ToClickhouse(MapType::ValueType(type), true) + ")";
 	default:
 		throw NotImplementedException("DuckDB type %s has no ClickHouse equivalent; create the table with "
 		                              "clickhouse_execute() instead",

@@ -28,11 +28,10 @@
 namespace duckdb {
 
 ClickhouseCatalog &ClickhouseCatalog::GetAttachedDatabase(ClientContext &context, const string &database_name,
-                                                           const string &function_name) {
+                                                          const string &function_name) {
 	auto database = DatabaseManager::Get(context).GetDatabase(context, database_name);
 	if (!database) {
-		throw BinderException("Failed to find attached database \"%s\" referenced in %s", database_name,
-		                      function_name);
+		throw BinderException("Failed to find attached database \"%s\" referenced in %s", database_name, function_name);
 	}
 	auto &catalog = database->GetCatalog();
 	if (catalog.GetCatalogType() != CATALOG_TYPE) {
@@ -143,8 +142,8 @@ optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction tr
 void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	ThrowIfDefaultSchema(info.name);
 	auto transaction = GetCatalogTransaction(context);
-	auto schema = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.name),
-	                           OnEntryNotFound::RETURN_NULL);
+	auto schema =
+	    LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.name), OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;

@@ -67,8 +67,12 @@ string ClickhouseDdl::ColumnSql(ClientContext &context, const ColumnDefinition &
 
 void ClickhouseDdl::ValidateEngine(const string &engine) {
 	idx_t position = 0;
-	auto is_identifier_start = [](char c) { return StringUtil::CharacterIsAlpha(c) || c == '_'; };
-	auto is_identifier_char = [](char c) { return StringUtil::CharacterIsAlphaNumeric(c) || c == '_'; };
+	auto is_identifier_start = [](char c) {
+		return StringUtil::CharacterIsAlpha(c) || c == '_';
+	};
+	auto is_identifier_char = [](char c) {
+		return StringUtil::CharacterIsAlphaNumeric(c) || c == '_';
+	};
 	bool valid = !engine.empty() && is_identifier_start(engine[0]);
 	while (valid && position < engine.size() && is_identifier_char(engine[position])) {
 		position++;

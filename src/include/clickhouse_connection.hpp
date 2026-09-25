@@ -65,7 +65,8 @@ public:
 	void AbortInsert();
 	bool IsInserting() const;
 
-	//! Usable for a new query: not broken, not mid-query or mid-insert, and answers a ping when it has been idle for 30s
+	//! Usable for a new query: not broken, not mid-query or mid-insert, and answers a ping when it has been idle for
+	//! 30s
 	bool IsHealthy();
 	//! True after a network or protocol error. Broken connections are never reused
 	bool IsBroken() const;
@@ -80,8 +81,7 @@ public:
 	static vector<std::pair<string, string>> ExtensionQuerySettings();
 
 private:
-	clickhouse::Query MakeQuery(const string &sql,
-	                            const vector<std::pair<string, string>> &query_settings = {}) const;
+	clickhouse::Query MakeQuery(const string &sql, const vector<std::pair<string, string>> &query_settings = {}) const;
 	//! Translates the in-flight exception into a DuckDB exception
 	[[noreturn]] void RethrowAsDuckDBException(const string &sql);
 

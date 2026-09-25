@@ -36,12 +36,12 @@ namespace ch = clickhouse;
 //===--------------------------------------------------------------------===//
 ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &node) {
 	static const unordered_set<string> NATIVE_TYPES = {
-	    "Bool",   "Int8",   "Int16",       "Int32", "Int64",  "UInt8",    "UInt16",     "UInt32", "UInt64",
-	    "Int128", "UInt128", "Float32",    "Float64", "String", "FixedString", "Date",   "Date32", "DateTime",
-	    "DateTime64", "Time", "Time64",   "UUID",  "Enum8",  "Enum16"};
+	    "Bool",   "Int8",     "Int16",      "Int32",   "Int64",   "UInt8",  "UInt16",      "UInt32",
+	    "UInt64", "Int128",   "UInt128",    "Float32", "Float64", "String", "FixedString", "Date",
+	    "Date32", "DateTime", "DateTime64", "Time",    "Time64",  "UUID",   "Enum8",       "Enum16"};
 	static const unordered_set<string> CONVERTED_TYPES = {
-	    "IPv4", "IPv6", "Int256", "UInt256", "BFloat16", "JSON", "Point", "Ring", "LineString", "MultiLineString",
-	    "Polygon", "MultiPolygon"};
+	    "IPv4",  "IPv6", "Int256",     "UInt256",         "BFloat16", "JSON",
+	    "Point", "Ring", "LineString", "MultiLineString", "Polygon",  "MultiPolygon"};
 	auto &type = ClickhouseTypeWrappers::Of(node).base;
 	auto &name = type.name;
 	if (StringUtil::StartsWith(name, "Decimal")) {
@@ -77,9 +77,9 @@ string ClickhouseWriter::ServerInputType(const ClickhouseTypeNode &node) {
 string ClickhouseWriter::ParseText(const ClickhouseTypeNode &type, const string &expr) {
 	// geo types are read as WKT (wkt()); CAST cannot parse WKT, the readWKT* functions can
 	static const unordered_map<string, string> WKT_READERS = {
-	    {"Point", "readWKTPoint"},           {"Ring", "readWKTRing"},       {"LineString", "readWKTLineString"},
-	    {"MultiLineString", "readWKTMultiLineString"}, {"Polygon", "readWKTPolygon"},
-	    {"MultiPolygon", "readWKTMultiPolygon"}};
+	    {"Point", "readWKTPoint"},           {"Ring", "readWKTRing"},
+	    {"LineString", "readWKTLineString"}, {"MultiLineString", "readWKTMultiLineString"},
+	    {"Polygon", "readWKTPolygon"},       {"MultiPolygon", "readWKTMultiPolygon"}};
 	auto reader = WKT_READERS.find(type.name);
 	if (reader != WKT_READERS.end()) {
 		return reader->second + "(" + expr + ")";
@@ -142,8 +142,7 @@ string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const 
 	                          column_name, target->Type()->GetName());
 }
 
-[[noreturn]] static void ThrowOutOfRange(const string &value, const ch::ColumnRef &target,
-                                         const string &column_name) {
+[[noreturn]] static void ThrowOutOfRange(const string &value, const ch::ColumnRef &target, const string &column_name) {
 	throw ConversionException(
 	    "Cannot insert %s into ClickHouse column \"%s\": it is outside the range of ClickHouse type %s", value,
 	    column_name, target->Type()->GetName());
@@ -364,7 +363,7 @@ static bool TryRescaleTicks(int64_t ticks, idx_t from, idx_t to, int64_t &result
 		return true;
 	}
 	return TryMultiplyOperator::Operation<int64_t, int64_t, int64_t>(ticks, ClickhouseUtils::PowerOfTen(to - from),
-	                                                                  result);
+	                                                                 result);
 }
 
 //! The value, for errors; infinities and values beyond int64 microseconds have no timestamp text
@@ -472,8 +471,8 @@ static void AppendEnumValues(const AppendInput &input, const ch::ColumnRef &targ
 		    auto label = EnumType::GetString(source_type, index).GetString();
 		    if (!enum_type->HasEnumName(label)) {
 			    throw ConversionException(
-			        "Cannot insert \"%s\" into ClickHouse column \"%s\": it is not a label of ClickHouse type %s", label,
-			        input.column_name, target->Type()->GetName());
+			        "Cannot insert \"%s\" into ClickHouse column \"%s\": it is not a label of ClickHouse type %s",
+			        label, input.column_name, target->Type()->GetName());
 		    }
 		    typed.Append(label);
 	    },
@@ -544,8 +543,12 @@ static void AppendListRows(const AppendInput &input, const ch::ColumnRef &target
 				element_sel.set_index(position++, element);
 			}
 		}
-		AppendInput elements {ListVector::GetEntry(input.source), ListVector::GetListSize(input.source),
-		                      element_sel, total, false, input.column_name};
+		AppendInput elements {ListVector::GetEntry(input.source),
+		                      ListVector::GetListSize(input.source),
+		                      element_sel,
+		                      total,
+		                      false,
+		                      input.column_name};
 		AppendRows(elements, data);
 	}
 	// ColumnArray offsets are absolute end positions in its data column; a NULL placeholder row is empty
@@ -599,8 +602,7 @@ static void AppendStruct(const AppendInput &input, const ch::ColumnRef &target) 
 		}
 	}
 	for (idx_t c = 0; c < children.size(); c++) {
-		AppendInput child {*children[c], input.size, input.sel, input.count, input.nulls_as_default,
-		                   input.column_name};
+		AppendInput child {*children[c], input.size, input.sel, input.count, input.nulls_as_default, input.column_name};
 		AppendRows(child, tuple->At(c));
 	}
 }

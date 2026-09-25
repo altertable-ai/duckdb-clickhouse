@@ -68,8 +68,7 @@ public:
 	//! join of the input with a LogicalColumnDataGet of the constants on `x = <constant column>`, whose mark column a
 	//! LogicalFilter above uses as its whole expression (IN) or under a NOT (NOT IN). It translates through
 	//! ClickhouseExpression::InList; any deviation from exactly that shape rejects the statement
-	static ClickhouseDmlTarget AnalyzeTarget(const string &statement, TableCatalogEntry &table,
-	                                         LogicalOperator &child);
+	static ClickhouseDmlTarget AnalyzeTarget(const string &statement, TableCatalogEntry &table, LogicalOperator &child);
 	//! ClickHouse SQL for output column `index` of `op` (a LogicalGet, LogicalFilter, LogicalProjection or an IN-list
 	//! MARK join, whose mark column itself is only accepted where AnalyzeTarget translates it)
 	static string ResolveOutput(const LogicalOperator &op, idx_t index);

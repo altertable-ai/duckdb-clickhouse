@@ -399,8 +399,8 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 					conditions.push_back(in_list);
 					continue;
 				}
-				conditions.push_back(ClickhouseExpression::Translate(
-				    *expr, [&](idx_t i) { return ResolveOutput(filter_child, i); }));
+				conditions.push_back(
+				    ClickhouseExpression::Translate(*expr, [&](idx_t i) { return ResolveOutput(filter_child, i); }));
 			}
 		}
 	} catch (NotImplementedException &ex) {
@@ -435,7 +435,8 @@ ClickhouseDmlStatement ClickhouseDml::PlanDelete(LogicalDelete &op) {
 		if (!TruncateRemovesRows(engine)) {
 			throw NotImplementedException(
 			    "DELETE without WHERE (or TRUNCATE) on ClickHouse table %s would run TRUNCATE TABLE, which does not "
-			    "remove the rows of a table with engine %s; run the statement you need with clickhouse_execute() instead",
+			    "remove the rows of a table with engine %s; run the statement you need with clickhouse_execute() "
+			    "instead",
 			    DisplayName(op.table), engine.empty() ? string("(unknown)") : engine);
 		}
 		result.description = "TRUNCATE TABLE " + target.qualified_name;
@@ -796,8 +797,7 @@ std::pair<string, string> ClickhouseDml::MutationsSyncSetting(ClientContext &con
 
 ClickhouseDmlOperator::ClickhouseDmlOperator(PhysicalPlan &physical_plan, LogicalOperator &op,
                                              ClickhouseDmlStatement statement_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
-      statement(std::move(statement_p)) {
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), statement(std::move(statement_p)) {
 }
 
 SourceResultType ClickhouseDmlOperator::GetDataInternal(ExecutionContext &context, DataChunk &chunk,

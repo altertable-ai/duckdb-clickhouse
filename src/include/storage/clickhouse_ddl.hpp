@@ -48,8 +48,8 @@ public:
 	                                                      const string &database, const string &table);
 	//! Creates the table (CreateTableSql + Execute) and returns its freshly loaded entry. With IF NOT EXISTS and
 	//! an existing table, returns the existing table's entry
-	static ClickhouseTableEntry &CreateTable(ClientContext &context, ClickhouseCatalog &catalog,
-	                                         const string &database, CreateTableInfo &info);
+	static ClickhouseTableEntry &CreateTable(ClientContext &context, ClickhouseCatalog &catalog, const string &database,
+	                                         CreateTableInfo &info);
 	//! ALTER TABLE ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] / RENAME COLUMN, RENAME TABLE, or ALTER
 	//! COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL and TYPE (MODIFY COLUMN); anything else throws
 	//! NotImplementedException. Column names are resolved against the table's ClickHouse columns the way DuckDB

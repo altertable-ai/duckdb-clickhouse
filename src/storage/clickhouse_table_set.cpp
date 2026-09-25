@@ -56,8 +56,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 			if (tables.empty() || tables.back().name != table_name) {
 				tables.push_back(ClickhouseTableDefinition {table_name, {}});
 			}
-			auto column =
-			    ClickhouseColumnInfo::Create(string(column_names->At(row)), string(column_types->At(row)));
+			auto column = ClickhouseColumnInfo::Create(string(column_names->At(row)), string(column_types->At(row)));
 			column.default_kind = string(column_kinds->At(row));
 			tables.back().columns.push_back(std::move(column));
 		}

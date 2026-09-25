@@ -24,7 +24,7 @@ ClickhouseSchemaEntry::ClickhouseSchemaEntry(Catalog &catalog, CreateSchemaInfo 
 }
 
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTable(CatalogTransaction transaction,
-                                                               BoundCreateTableInfo &info) {
+                                                              BoundCreateTableInfo &info) {
 	auto &context = transaction.GetContext();
 	auto &base = info.Base();
 	if (base.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
