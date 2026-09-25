@@ -18,6 +18,12 @@ public:
 	static string Translate(const Expression &expr, const std::function<string(idx_t)> &resolve_reference);
 	//! A constant as a ClickHouse literal. Throws NotImplementedException for types without one
 	static string Literal(const Value &value);
+	//! `sql` (ClickHouse SQL for a value of DuckDB type `source`) converted to `clickhouse_type` (ClickHouse's form
+	//! of DuckDB type `target`) with DuckDB's result, e.g. CAST(roundBankers(x) AS Int32) for DOUBLE to INTEGER,
+	//! where ClickHouse's CAST alone truncates. Throws NotImplementedException for a cast without an exact
+	//! translation (e.g. DOUBLE or VARCHAR to DECIMAL, time-zone-dependent casts, most casts to VARCHAR)
+	static string Cast(const string &sql, const LogicalType &source, const LogicalType &target,
+	                   const string &clickhouse_type);
 	//! A filter DuckDB pushed into a scan (LogicalGet::table_filters) on `column` (ClickHouse SQL for a column of
 	//! DuckDB type `column_type`), translated exactly through Translate(). Never narrows a predicate by dropping a
 	//! part: returns "" only for an OPTIONAL_FILTER (a hint: DuckDB keeps its exact predicate in a LogicalFilter

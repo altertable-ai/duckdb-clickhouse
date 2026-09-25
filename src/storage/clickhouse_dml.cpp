@@ -1,5 +1,6 @@
 #include "storage/clickhouse_dml.hpp"
 
+#include "clickhouse_ddl_types.hpp"
 #include "clickhouse_expression.hpp"
 #include "clickhouse_scanner.hpp"
 #include "clickhouse_utils.hpp"
@@ -482,6 +483,14 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			}
 			auto value =
 			    ClickhouseExpression::Translate(expr, [&](idx_t index) { return ResolveOutput(child, index); });
+			// DuckDB's binder casts every SET value to the column's DuckDB type, and that cast is part of `expr`
+			// (translated, and rounded where DuckDB rounds, above). The CAST to the ClickHouse type below then
+			// converts the column's DuckDB type into its ClickHouse type: the same conversion an INSERT makes. Should
+			// the value's type ever differ from the column's, that first cast is checked (and rounded) here
+			if (expr.return_type != column.type) {
+				value = ClickhouseExpression::Cast(value, expr.return_type, column.type,
+				                                   ClickhouseDdlTypes::ToClickhouse(column.type, true));
+			}
 			assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = CAST(" + value + " AS " +
 			                      column.clickhouse_type + ")");
 		}

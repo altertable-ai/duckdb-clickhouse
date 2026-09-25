@@ -4,6 +4,7 @@
 #include "clickhouse_filter_pushdown.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/list.hpp"
@@ -117,6 +118,219 @@ static bool HasSameTextForm(const LogicalType &type) {
 		return true;
 	default:
 		return false;
+	}
+}
+
+//! How a cast whose ClickHouse CAST would not match DuckDB's result must round its input first
+enum class CastRounding : uint8_t {
+	//! A plain CAST gives DuckDB's result
+	NONE,
+	//! roundBankers(x): DuckDB converts FLOAT/DOUBLE to integers with std::nearbyint (half to even), ClickHouse's
+	//! CAST truncates
+	HALF_TO_EVEN,
+	//! round(x, <target scale>): DuckDB rounds DECIMAL to integers and to DECIMALs with a smaller scale half away
+	//! from zero, ClickHouse's CAST truncates; ClickHouse's round() on a Decimal rounds half away from zero
+	HALF_AWAY_FROM_ZERO
+};
+
+static bool IsTimestamp(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_NS:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! Decimal digits of a second a (naive) timestamp type holds
+static idx_t TimestampDigits(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+		return 0;
+	case LogicalTypeId::TIMESTAMP_MS:
+		return 3;
+	case LogicalTypeId::TIMESTAMP_NS:
+		return 9;
+	default:
+		return 6;
+	}
+}
+
+[[noreturn]] static void ThrowInexactCast(const LogicalType &source, const LogicalType &target, const string &why) {
+	throw NotImplementedException("cast from %s to %s %s", source.ToString(), target.ToString(), why);
+}
+
+//! Whether (and how) a cast from `source` to `target` translates into a ClickHouse CAST with DuckDB's result.
+//! Throws NotImplementedException for every cast that does not (see the "as built" list in the design spec, §6):
+//! only casts listed here translate; a VARCHAR source follows ClickHouse's parse rules, where ClickHouse fails
+//! instead of rounding (e.g. CAST('2.5' AS Int32))
+static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &target) {
+	if (source == target || source.id() == LogicalTypeId::SQLNULL) {
+		return CastRounding::NONE;
+	}
+	if (IsTimeZoneDependent(source) || IsTimeZoneDependent(target)) {
+		// DuckDB converts with the session's TimeZone setting, ClickHouse with the column's or the server's
+		// time zone
+		ThrowInexactCast(source, target, "depends on the time zone");
+	}
+	if (target.IsJSONType()) {
+		// ClickHouse parses the text into its JSON object type
+		ThrowInexactCast(source, target, "has no exact ClickHouse translation");
+	}
+	if (target.id() == LogicalTypeId::VARCHAR) {
+		// a JSON value is its text in both (a JSON column is read through toJSONString())
+		if (!HasSameTextForm(source)) {
+			throw NotImplementedException("cast from %s to VARCHAR, which ClickHouse formats differently",
+			                              source.ToString());
+		}
+		return CastRounding::NONE;
+	}
+	if (source.IsJSONType()) {
+		ThrowInexactCast(source, target, "has no exact ClickHouse translation");
+	}
+	auto source_id = source.id();
+	auto is_varchar = source_id == LogicalTypeId::VARCHAR;
+	switch (target.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+		if (source.IsIntegral() || source_id == LogicalTypeId::BOOLEAN || is_varchar) {
+			return CastRounding::NONE;
+		}
+		if (source.IsFloating()) {
+			return CastRounding::HALF_TO_EVEN;
+		}
+		if (source_id == LogicalTypeId::DECIMAL) {
+			return CastRounding::HALF_AWAY_FROM_ZERO;
+		}
+		break;
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+		if (source.IsFloating() || is_varchar) {
+			// both round to nearest (the C++ conversion, a correctly rounded parse)
+			return CastRounding::NONE;
+		}
+		if (source.IsIntegral() && source_id != LogicalTypeId::HUGEINT && source_id != LogicalTypeId::UHUGEINT) {
+			// a single conversion in both; DuckDB converts 128-bit integers in two steps
+			return CastRounding::NONE;
+		}
+		if (source_id == LogicalTypeId::DECIMAL &&
+		    DecimalType::GetWidth(source) <= (target.id() == LogicalTypeId::FLOAT ? 7 : 15)) {
+			// unscaled value / 10^scale in both, in the target type, while the unscaled value converts exactly
+			// (below 2^24 / 2^53); DuckDB computes wider values differently (TryCastDecimalToFloatingPoint)
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::DECIMAL:
+		if (source.IsIntegral()) {
+			return CastRounding::NONE;
+		}
+		if (source_id == LogicalTypeId::DECIMAL) {
+			return DecimalType::GetScale(source) > DecimalType::GetScale(target) ? CastRounding::HALF_AWAY_FROM_ZERO
+			                                                                     : CastRounding::NONE;
+		}
+		// FLOAT/DOUBLE and VARCHAR: DuckDB rounds to the scale, ClickHouse truncates
+		break;
+	case LogicalTypeId::BOOLEAN:
+		if (source.IsIntegral() || is_varchar) {
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::DATE:
+		if (is_varchar || IsTimestamp(source)) {
+			// both floor a timestamp to its day
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_NS:
+		if (source_id == LogicalTypeId::DATE ||
+		    (IsTimestamp(source) && TimestampDigits(source) <= TimestampDigits(target))) {
+			return CastRounding::NONE;
+		}
+		if (is_varchar && (target.id() == LogicalTypeId::TIMESTAMP || target.id() == LogicalTypeId::TIMESTAMP_SEC)) {
+			// both truncate extra digits of a microsecond timestamp; ClickHouse refuses any fraction for seconds
+			return CastRounding::NONE;
+		}
+		// fewer digits: DuckDB rounds (truncates from nanoseconds), ClickHouse truncates toward zero
+		break;
+	case LogicalTypeId::TIME_NS:
+		if (source_id == LogicalTypeId::TIME) {
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::UUID:
+		if (is_varchar) {
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::ENUM:
+		if (is_varchar || source_id == LogicalTypeId::ENUM) {
+			// by label in both
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::LIST:
+		if (source_id == LogicalTypeId::LIST &&
+		    ClassifyCast(ListType::GetChildType(source), ListType::GetChildType(target)) == CastRounding::NONE) {
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::MAP:
+		if (source_id == LogicalTypeId::MAP &&
+		    ClassifyCast(MapType::KeyType(source), MapType::KeyType(target)) == CastRounding::NONE &&
+		    ClassifyCast(MapType::ValueType(source), MapType::ValueType(target)) == CastRounding::NONE) {
+			return CastRounding::NONE;
+		}
+		break;
+	case LogicalTypeId::STRUCT: {
+		if (source_id != LogicalTypeId::STRUCT) {
+			break;
+		}
+		auto &source_children = StructType::GetChildTypes(source);
+		auto &target_children = StructType::GetChildTypes(target);
+		if (source_children.size() != target_children.size()) {
+			break;
+		}
+		bool exact = true;
+		for (idx_t i = 0; i < source_children.size() && exact; i++) {
+			exact = source_children[i].first == target_children[i].first &&
+			        ClassifyCast(source_children[i].second, target_children[i].second) == CastRounding::NONE;
+		}
+		if (exact) {
+			return CastRounding::NONE;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	ThrowInexactCast(source, target, "has no exact ClickHouse translation");
+}
+
+string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, const LogicalType &target,
+                                  const string &clickhouse_type) {
+	switch (ClassifyCast(source, target)) {
+	case CastRounding::HALF_TO_EVEN:
+		return "CAST(roundBankers(" + sql + ") AS " + clickhouse_type + ")";
+	case CastRounding::HALF_AWAY_FROM_ZERO: {
+		auto scale = target.id() == LogicalTypeId::DECIMAL ? DecimalType::GetScale(target) : 0;
+		return "CAST(round(" + sql + ", " + to_string(scale) + ") AS " + clickhouse_type + ")";
+	}
+	default:
+		return "CAST(" + sql + " AS " + clickhouse_type + ")";
 	}
 }
 
@@ -285,17 +499,10 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		if (cast.try_cast) {
 			ThrowUntranslatable(expr);
 		}
-		auto &source_type = cast.child->return_type;
-		if (source_type != cast.return_type &&
-		    (IsTimeZoneDependent(source_type) || IsTimeZoneDependent(cast.return_type))) {
-			// DuckDB converts with the session's TimeZone setting, ClickHouse with the column's or the server's
-			// time zone
-			throw NotImplementedException("cast from %s to %s depends on the time zone: %s", source_type.ToString(),
-			                              cast.return_type.ToString(), expr.ToString());
-		}
-		if (cast.return_type.id() == LogicalTypeId::VARCHAR && !HasSameTextForm(source_type)) {
-			throw NotImplementedException("cast from %s to VARCHAR, which ClickHouse formats differently: %s",
-			                              source_type.ToString(), expr.ToString());
+		try {
+			ClassifyCast(cast.child->return_type, cast.return_type);
+		} catch (NotImplementedException &ex) {
+			throw NotImplementedException("%s: %s", ErrorData(ex).RawMessage(), expr.ToString());
 		}
 		string type;
 		try {
@@ -303,7 +510,7 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		} catch (NotImplementedException &) {
 			ThrowUntranslatable(expr);
 		}
-		return "CAST(" + Translate(*cast.child, resolve) + " AS " + type + ")";
+		return Cast(Translate(*cast.child, resolve), cast.child->return_type, cast.return_type, type);
 	}
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
