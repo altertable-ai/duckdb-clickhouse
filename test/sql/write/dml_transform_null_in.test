@@ -138,12 +138,13 @@ SELECT * FROM clickhouse_query('tn', 'SELECT id FROM w_tn.t ORDER BY id');
 2
 5
 
-# the statements carry the guard (GROUP BY: query_log keeps the statements of earlier runs on a kept server)
+# the statements carry the guard. A debug build's plan wraps some column references in extra parentheses, removed
+# here; GROUP BY: query_log keeps the statements of earlier runs on a kept server
 statement ok
 CALL clickhouse_execute('tn', 'SYSTEM FLUSH LOGS');
 
 query I
-SELECT * FROM clickhouse_query('tn', 'SELECT query FROM system.query_log WHERE type = ''QueryFinish'' AND (query LIKE ''ALTER TABLE `w_tn`.`t` UPDATE `u` = CAST((9)%'' OR query LIKE ''DELETE FROM `w_tn`.`t` WHERE%'') GROUP BY query ORDER BY min(event_time_microseconds)');
+SELECT * FROM clickhouse_query('tn', 'SELECT replaceRegexpAll(query, ''\\(\\((`\\w+`)\\)\\)'', ''\\1'') AS q FROM system.query_log WHERE type = ''QueryFinish'' AND (query LIKE ''ALTER TABLE `w_tn`.`t` UPDATE `u` = CAST((9)%'' OR query LIKE ''DELETE FROM `w_tn`.`t` WHERE%'') GROUP BY q ORDER BY min(event_time_microseconds)');
 ----
 ALTER TABLE `w_tn`.`t` UPDATE `u` = CAST((9) AS Int32) WHERE if(isNull(`n`), NULL, (`n` NOT IN (1, 5, 6, 8, 10)))
 DELETE FROM `w_tn`.`t` WHERE if(isNull(`m`), NULL, (`m` NOT IN (2, 6, 10, 11, 12))) AND if(isNull(`n`), NULL, (`n` NOT IN (1, 6, 8, 10, 11)))
