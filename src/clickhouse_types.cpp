@@ -158,13 +158,18 @@ ClickhouseTypeNode ClickhouseTypeParser::Parse(const string &type_text) {
 //===--------------------------------------------------------------------===//
 //! Strips wrappers that do not change how values are decoded
 static const ClickhouseTypeNode &Unwrap(const ClickhouseTypeNode &node) {
-	if ((node.name == "Nullable" || node.name == "LowCardinality") && node.children.size() == 1) {
-		return Unwrap(node.children[0]);
+	const ClickhouseTypeNode *current = &node;
+	while (true) {
+		if ((current->name == "Nullable" || current->name == "LowCardinality") && current->children.size() == 1) {
+			current = &current->children[0];
+			continue;
+		}
+		if (current->name == "SimpleAggregateFunction" && !current->children.empty()) {
+			current = &current->children.back();
+			continue;
+		}
+		return *current;
 	}
-	if (node.name == "SimpleAggregateFunction" && !node.children.empty()) {
-		return Unwrap(node.children.back());
-	}
-	return node;
 }
 
 static int64_t ParseIntegerLiteral(const ClickhouseTypeNode &node, idx_t index, int64_t default_value) {

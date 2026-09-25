@@ -67,7 +67,7 @@ static string ResolveSchemaOption(ClickhousePoolConnection &connection, const st
 
 ClickhouseCatalog::ClickhouseCatalog(AttachedDatabase &db, ClickhouseConnectionConfig config_p,
                                      ClickhouseAttachOptions options_p, ClientContext &context)
-    : Catalog(db), config(std::move(config_p)), options(options_p),
+    : Catalog(db), config(std::move(config_p)), options(std::move(options_p)),
       connection_pool(make_shared_ptr<ClickhouseConnectionPool>(
           config, ClickhouseTimeouts::FromContext(context), ClickhouseConnectionPool::PoolConfigFromContext(context))),
       schemas(*this) {
