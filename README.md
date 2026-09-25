@@ -188,10 +188,11 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
 `UPDATE`, `DELETE` and `TRUNCATE` are translated into one ClickHouse statement each: `ALTER TABLE … UPDATE … WHERE …`
 (a mutation; `ch_mutations_sync`, default `2`, decides whether it waits), `DELETE FROM … WHERE …` (a synchronous
 lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
-`SELECT count()` run just before the statement, so it can be off if other clients write at the same time. Both run
-with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `NOT IN` never matches `NULL`s. (The
-setting matters for the count: on ClickHouse 25.8 the `DELETE` and the mutation ignore `transform_null_in`, whether it
-comes from the query or from the server's default profile.)
+`SELECT count()` run just before the statement, so it can be off if other clients write at the same time. `IN` and
+`NOT IN` are translated as `if(isNull(x), NULL, x [NOT] IN (…))`, so `NOT IN` never matches `NULL`s whatever
+`transform_null_in` says. That matters because the `DELETE` and the mutation take `transform_null_in` from the
+server's default profile as loaded at startup, and no query setting overrides it there. The count also runs with
+`transform_null_in = 0`, whatever the `settings` of the `ATTACH` say.
 
 - The `WHERE` clause must only use the modified table's columns, constants, prepared-statement parameters (`?`,
   `$1`), comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN` lists of constants without `NULL`, `BETWEEN`,
@@ -238,7 +239,8 @@ comes from the query or from the server's default profile.)
   - arithmetic overflow and out-of-range casts, which wrap or saturate in ClickHouse, or exceed a `DECIMAL`
     column's declared precision, instead of raising an error, in `WHERE` as well as in `SET` (e.g. `SET u = u - 1`
     on a `UInt32` holding 0 writes 4294967295, `SET d = e` from a `Decimal(3, 2)` holding 9.95 into a `Decimal(2, 1)` stores 10,
-    and `WHERE b + 1 < 0` matches a `BIGINT` holding its maximum, where DuckDB raises an error);
+    a timestamp outside a `DateTime`'s 1970–2106 range wraps (1969-12-31 23:59:59 is written as 2106-02-07
+    06:28:15) where an `INSERT` raises an error, and `WHERE b + 1 < 0` matches a `BIGINT` holding its maximum, where DuckDB raises an error);
   - `LIKE`/`ILIKE` collation (bytes in ClickHouse);
   - `lower`/`upper`, run as `lowerUTF8`/`upperUTF8`, which differ from DuckDB for a few characters (e.g.
     `upper('ß')` is `ẞ` in DuckDB and `SS` in ClickHouse);
@@ -290,10 +292,10 @@ git submodule update --init --recursive
 export VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja
 make release
 make test                                  # tests that need no server
-make smoke                                 # all tests against a throw-away ClickHouse 25.8 container (Docker)
+make smoke                                 # all tests against throw-away ClickHouse 25.8 containers (Docker)
 make smoke ARGS=test/sql/scan/scalars.test # a single test file or glob
 make smoke SMOKE_BUILD=debug               # build and test the debug binary instead
-CLICKHOUSE_TEST_KEEP=1 make smoke          # keep the container running afterwards, for debugging
+CLICKHOUSE_TEST_KEEP=1 make smoke          # keep the containers running afterwards, for debugging
 ```
 
 The clickhouse-cpp vcpkg port is adapted from [pixonic/duckdb-clickhouse](https://github.com/pixonic/duckdb-clickhouse)
