@@ -59,6 +59,8 @@ public:
 	static bool IsNullable(const ClickhouseTypeNode &node);
 	//! Digits of a second of a DateTime (0) or DateTime64 (Nullable/LowCardinality unwrapped); invalid otherwise
 	static optional_idx DateTimePrecision(const ClickhouseTypeNode &node);
+	//! Scale of a Decimal, Decimal32/64/128/256 type (not unwrapped); invalid for any other type
+	static optional_idx DecimalScale(const ClickhouseTypeNode &node);
 };
 
 //! A column of a ClickHouse table or query result

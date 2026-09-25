@@ -30,8 +30,8 @@ struct ClickhouseDmlStatement {
 	vector<string> null_check_columns;
 	//! The table's own name, for the NOT NULL error
 	string table_name;
-	//! Query-level settings sent with `sql`: ClickhouseDml::SemanticSettings(), plus lightweight_deletes_sync or
-	//! mutations_sync
+	//! Query-level settings sent with `sql`: ClickhouseConnection::ExtensionQuerySettings(), plus
+	//! lightweight_deletes_sync or mutations_sync
 	vector<std::pair<string, string>> settings;
 	//! The plan holds prepared-statement parameters without values (PREPARE): nothing was translated and running it
 	//! throws. EXECUTE binds the statement again with the values as constants and plans it anew (the catalog reports
@@ -82,11 +82,6 @@ public:
 	                                               const string &reason);
 	//! "db"."t", for errors
 	static string DisplayName(const TableCatalogEntry &table);
-	//! Query settings every query the extension issues itself runs with (the catalog's reads of system.databases,
-	//! system.tables and system.columns, the counts and checks before a statement, the statement, an INSERT's
-	//! conversions), whatever the ATTACH's settings= holds: transform_null_in = 0, no FINAL, no filter, limit or
-	//! partial result, strict IP parsing. The translated predicate does not depend on them (see InList)
-	static vector<std::pair<string, string>> SemanticSettings();
 	//! {"mutations_sync", <ch_mutations_sync>}: sent with every mutation (UPDATE, ALTER TABLE … ALTER COLUMN)
 	static std::pair<string, string> MutationsSyncSetting(ClientContext &context);
 };

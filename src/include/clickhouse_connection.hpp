@@ -72,6 +72,13 @@ public:
 
 	static void SetDebugPrintQueries(bool print);
 
+	//! Query settings every query the extension issues itself runs with (the catalog's reads of system.databases,
+	//! system.tables and system.columns, the counts and checks before a statement, the statement, an INSERT's
+	//! conversions), whatever the ATTACH's settings= holds: transform_null_in = 0, no FINAL, no deleted rows, no
+	//! filter, limit or partial result, strict parsing. A caller appends a setting after them to override one (see
+	//! MakeQuery). The translated DML predicate does not depend on them (see ClickhouseExpression::InList)
+	static vector<std::pair<string, string>> ExtensionQuerySettings();
+
 private:
 	clickhouse::Query MakeQuery(const string &sql,
 	                            const vector<std::pair<string, string>> &query_settings = {}) const;

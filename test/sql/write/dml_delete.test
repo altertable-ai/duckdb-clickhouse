@@ -637,6 +637,50 @@ SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM
 statement ok
 DETACH ch_tn;
 
+# the affected-row counts leave out deleted rows whatever apply_deleted_mask the ATTACH's settings= say
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.adm (id Int32, v Int32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.adm VALUES (1, 1), (2, 2), (3, 3);
+
+query I
+DELETE FROM ch.w_dml.adm WHERE id = 1;
+----
+1
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=apply_deleted_mask=0' AS ch_adm (TYPE clickhouse);
+
+# ClickHouse itself shows the deleted row with that setting
+query I
+SELECT * FROM clickhouse_query('ch_adm', 'SELECT count() FROM w_dml.adm');
+----
+3
+
+query I
+UPDATE ch_adm.w_dml.adm SET v = 9 WHERE id >= 1;
+----
+2
+
+query I
+DELETE FROM ch_adm.w_dml.adm WHERE id = 1;
+----
+0
+
+query I
+DELETE FROM ch_adm.w_dml.adm WHERE id <= 2;
+----
+1
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id), groupArray(v) FROM (SELECT id, v FROM w_dml.adm ORDER BY id)');
+----
+[3]	[9]
+
+statement ok
+DETACH ch_adm;
+
 # ---------------------------------------------------------------------------
 # DELETE without WHERE / TRUNCATE only where TRUNCATE TABLE removes the rows
 # ---------------------------------------------------------------------------

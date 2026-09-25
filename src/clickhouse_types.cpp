@@ -522,6 +522,12 @@ optional_idx ClickhouseTypes::DateTimePrecision(const ClickhouseTypeNode &node) 
 	return optional_idx();
 }
 
+optional_idx ClickhouseTypes::DecimalScale(const ClickhouseTypeNode &node) {
+	idx_t width;
+	idx_t scale;
+	return GetDecimalInfo(node, width, scale) ? optional_idx(scale) : optional_idx();
+}
+
 ClickhouseColumnInfo ClickhouseColumnInfo::Create(const string &name, const string &clickhouse_type) {
 	ClickhouseColumnInfo result;
 	result.name = name;

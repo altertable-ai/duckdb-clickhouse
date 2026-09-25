@@ -1,12 +1,12 @@
 #include "storage/clickhouse_table_set.hpp"
 
+#include "clickhouse_connection.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
-#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -28,7 +28,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 	unordered_map<string, idx_t> row_counts;
 	unordered_map<string, string> engines;
 	// an ATTACH's settings= (offset, limit, additional_result_filter, …) would hide tables and columns
-	auto settings = ClickhouseDml::SemanticSettings();
+	auto settings = ClickhouseConnection::ExtensionQuerySettings();
 	auto tables_query = "SELECT name, total_rows, engine FROM system.tables WHERE database = " + database;
 	for (auto &block : connection->Query(tables_query, settings)) {
 		auto names = block[0]->As<clickhouse::ColumnString>();

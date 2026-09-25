@@ -35,7 +35,8 @@ public:
 	//! column's own type. Text that does not convert fails the INSERT, in a Nullable column too
 	static string ServerConversion(const ClickhouseTypeNode &node, const string &expr);
 	//! The ClickHouse expression parsing `expr`, the text DuckDB reads a value of `type` (no Nullable/LowCardinality
-	//! wrapper) as, into `type`: readWKT*() for the geo types, a CAST otherwise. Fails on text that does not parse
+	//! wrapper) as, into `type`: readWKT*() for the geo types, a CAST otherwise. Fails on text that does not parse,
+	//! and, for (U)Int256 and Decimal(P > 38), on text the CAST would not convert exactly
 	static string ParseText(const ClickhouseTypeNode &type, const string &expr);
 };
 

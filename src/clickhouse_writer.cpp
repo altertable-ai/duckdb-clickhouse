@@ -84,7 +84,29 @@ string ClickhouseWriter::ParseText(const ClickhouseTypeNode &type, const string 
 	if (reader != WKT_READERS.end()) {
 		return reader->second + "(" + expr + ")";
 	}
-	return "CAST(" + expr + " AS " + type.text + ")";
+	auto cast = "CAST(" + expr + " AS " + type.text + ")";
+	string valid;
+	string expected;
+	if (type.name == "Int256" || type.name == "UInt256") {
+		// CAST wraps text outside the range around (2^256 is 0 as a UInt256): the value must print back as the text
+		// without its + sign and leading zeros
+		auto canonical =
+		    "if(match(" + expr + R"(, '^[+-]?0+$'), '0', replaceRegexpOne()" + expr + R"(, '^\\+?(-?)0*', '\\1')))";
+		valid = "match(" + expr + R"(, '^[+-]?[0-9]+$') AND toString()" + cast + ") = " + canonical;
+		expected = "an optionally signed integer within its range";
+	} else if (ClickhouseTypes::DecimalScale(type).IsValid()) {
+		// CAST truncates the digits beyond the scale ('1.009' is 1.00 in a Decimal(76, 2)) and fails on too many
+		// before the point
+		auto scale = to_string(ClickhouseTypes::DecimalScale(type).GetIndex());
+		valid = "match(" + expr + R"(, '^[+-]?([0-9]+\\.?|[0-9]*\\.[0-9]+)$') AND NOT match()" + expr +
+		        R"(, '\\.[0-9]{)" + scale + R"(}[0-9]*[1-9]'))";
+		expected = "a number in plain decimal notation with at most " + scale + " digit(s) after the point";
+	} else {
+		return cast;
+	}
+	auto message = "Cannot convert text to " + type.text + " exactly: expected " + expected;
+	return "tupleElement(tuple(throwIf(NOT (" + valid + "), " + ClickhouseUtils::QuoteLiteral(message) + "), " + cast +
+	       "), 2)";
 }
 
 string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const string &expr) {
@@ -97,8 +119,8 @@ string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const 
 		return ParseText(wrappers.base, expr);
 	}
 	// CAST(Nullable(String) AS Nullable(IPv4)) turns text that does not parse into NULL: only the NULLs skip the
-	// conversion (short_circuit_function_evaluation, see ClickhouseDml::SemanticSettings, keeps it from running on
-	// the empty string under a NULL)
+	// conversion (short_circuit_function_evaluation, see ClickhouseConnection::ExtensionQuerySettings, keeps it from
+	// running on the empty string under a NULL)
 	return "if(isNull(" + expr + "), NULL, " + ParseText(wrappers.base, "assumeNotNull(" + expr + ")") + ")";
 }
 

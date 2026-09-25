@@ -172,6 +172,38 @@ void ClickhouseConnection::SetDebugPrintQueries(bool print) {
 	debug_print_queries = print;
 }
 
+vector<std::pair<string, string>> ClickhouseConnection::ExtensionQuerySettings() {
+	// transform_null_in = 1 would make a bare x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept).
+	// ClickhouseExpression::InList guards every IN / NOT IN against it, in the count and the statement alike. The pins
+	// reach only ordinary queries: DELETE and ALTER TABLE … UPDATE run with the server's default profile as loaded at
+	// startup, whatever the query's settings say.
+	// The rest make a count read every stored row a mutation rewrites, and read all of its result: FINAL would hide
+	// replaced rows, apply_deleted_mask = 0 would count deleted ones, the overflow modes set to 'break' and the result
+	// limits would return a partial count or listing, and the filters, limit and offset would drop rows or the result
+	// row itself. A cached result may be stale. CAST must not turn an IP that does not parse into 0.0.0.0, nor keep
+	// the first of a JSON object's duplicated paths, and if(isNull(x), NULL, CAST(…)) must not convert the NULLs
+	return {{"transform_null_in", "0"},
+	        {"final", "0"},
+	        {"apply_deleted_mask", "1"},
+	        {"read_overflow_mode", "throw"},
+	        {"read_overflow_mode_leaf", "throw"},
+	        {"timeout_overflow_mode", "throw"},
+	        {"timeout_overflow_mode_leaf", "throw"},
+	        {"set_overflow_mode", "throw"},
+	        {"group_by_overflow_mode", "throw"},
+	        {"result_overflow_mode", "throw"},
+	        {"max_result_rows", "0"},
+	        {"max_result_bytes", "0"},
+	        {"additional_table_filters", "{}"},
+	        {"additional_result_filter", ""},
+	        {"limit", "0"},
+	        {"offset", "0"},
+	        {"use_query_cache", "0"},
+	        {"cast_ipv4_ipv6_default_on_conversion_error", "0"},
+	        {"type_json_skip_duplicated_paths", "0"},
+	        {"short_circuit_function_evaluation", "enable"}};
+}
+
 clickhouse::Query ClickhouseConnection::MakeQuery(const string &sql,
                                                   const vector<std::pair<string, string>> &query_settings) const {
 	clickhouse::Query query(sql);

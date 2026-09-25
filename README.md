@@ -25,18 +25,18 @@ ATTACH '<connection>' AS ch (TYPE clickhouse [, SECRET name] [, SETTINGS 'k=v,�
 (`clickhouse://user:password@host:9000/database`, or `clickhouses://…` for TLS). It can be empty when a secret
 provides everything. Values in the connection string override the secret's.
 
-| Option        | Default                     | Description                                          |
-|---------------|-----------------------------|------------------------------------------------------|
-| `host`        | `localhost`                 | Server host name                                     |
-| `port`        | `9000`, or `9440` with TLS  | Native protocol port                                 |
-| `user`        | `default`                   | User name                                            |
-| `password`    |                             | Password (never shown in errors)                     |
-| `database`    | `default`                   | Default schema of the attached database              |
-| `secure`      | `true` when port is 9440    | Use TLS                                              |
-| `ca_cert`     | system CA bundle            | PEM file with the CA certificates to trust (required for TLS on Windows) |
-| `skip_verify` | `false`                     | Do not verify the server certificate (testing only)  |
-| `compression` | `lz4`                       | `lz4`, `zstd` or `none`                              |
-| `settings`    |                             | ClickHouse settings sent with every query: `k1=v1,k2=v2` |
+| Option        | Default                    | Description                                                              |
+| ------------- | -------------------------- | ------------------------------------------------------------------------ |
+| `host`        | `localhost`                | Server host name                                                         |
+| `port`        | `9000`, or `9440` with TLS | Native protocol port                                                     |
+| `user`        | `default`                  | User name                                                                |
+| `password`    |                            | Password (never shown in errors)                                         |
+| `database`    | `default`                  | Default schema of the attached database                                  |
+| `secure`      | `true` when port is 9440   | Use TLS                                                                  |
+| `ca_cert`     | system CA bundle           | PEM file with the CA certificates to trust (required for TLS on Windows) |
+| `skip_verify` | `false`                    | Do not verify the server certificate (testing only)                      |
+| `compression` | `lz4`                      | `lz4`, `zstd` or `none`                                                  |
+| `settings`    |                            | ClickHouse settings sent with every query: `k1=v1,k2=v2`                 |
 
 Each ClickHouse database appears as a DuckDB schema; the system databases are hidden unless you pass
 `SHOW_SYSTEM true`. `SCHEMA 'analytics'` shows only that database, so `ch.events` means `ch.analytics.events`
@@ -92,15 +92,19 @@ Things to know:
   that fails part-way may leave the rows sent so far. A DuckDB transaction can only write to one attached database,
   so write to local tables and to ClickHouse in separate transactions.
 - **Inserts** fill the columns you leave out with their ClickHouse `DEFAULT`. Values a column cannot hold (a date out
-  of range, `NULL` in a non-`Nullable` column, text that is not an IP address) are rejected, never clamped.
+  of range, `NULL` in a non-`Nullable` column, text that is not an IP address, an `Int256` out of range, a
+  `Decimal(76, 2)` with three decimals) are rejected, never clamped. One exception: ClickHouse converts a value under a
+  typed `JSON` path (`JSON(a Int32)`) by its own rules, e.g. `1.9` becomes `1`.
 - **New tables** use the `MergeTree` engine by default (see `ch_default_table_engine`), ordered by the `PRIMARY KEY`.
   `CREATE TABLE` runs on the node you are connected to only; for a cluster, use `clickhouse_execute` with
   `ON CLUSTER`.
 - **`UPDATE` and `DELETE`** become one ClickHouse statement each: an `ALTER TABLE … UPDATE` mutation, or a
   lightweight `DELETE` (MergeTree tables). The `WHERE` and `SET` clauses can use the table's own columns,
   constants, comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, arithmetic, `LIKE`, `CASE`, `coalesce`, casts and common
-  string functions; columns read as text but stored as another type (`IPv4`, `FixedString`, …) can only be set to
-  constants. Joins, subqueries, `UPDATE … FROM` and other functions are rejected before anything runs. The
+  string functions. `IPv4`, `IPv6` and `FixedString` columns can only be set to constants, and the other types
+  ClickHouse converts on the server (`Int256`, wide `Decimal`, `BFloat16`, `JSON`, `Variant`, geo types, …) only to
+  `NULL`: use `clickhouse_execute` for those. `SET c = NULL` on a non-`Nullable` column is refused, even when no row
+  matches. Joins, subqueries, `UPDATE … FROM` and other functions are rejected before anything runs. The
   result is the one DuckDB would compute, with a few exceptions where ClickHouse's own rules apply: `NaN`
   comparisons, integer overflow (it wraps instead of raising an error), division by zero (an error in ClickHouse)
   and byte-wise `LIKE`.
@@ -113,48 +117,48 @@ Things to know:
 
 ## Functions
 
-| Function | Description |
-|---|---|
-| `clickhouse_query(database, sql)` | Runs a ClickHouse query and returns its rows. |
-| `clickhouse_execute(database, sql)` | Runs a ClickHouse statement that returns no rows (DDL, `OPTIMIZE`, `SYSTEM …`), then refreshes the cached table list. |
-| `clickhouse_scan(connection, database, table [, secret := name])` | Reads one table without `ATTACH`. |
-| `clickhouse_clear_cache()` | Forgets the cached databases, tables and columns. |
-| `clickhouse_type_mapping(type)` | Shows which DuckDB type a ClickHouse type is read as. |
+| Function                                                          | Description                                                                                                           |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `clickhouse_query(database, sql)`                                 | Runs a ClickHouse query and returns its rows.                                                                         |
+| `clickhouse_execute(database, sql)`                               | Runs a ClickHouse statement that returns no rows (DDL, `OPTIMIZE`, `SYSTEM …`), then refreshes the cached table list. |
+| `clickhouse_scan(connection, database, table [, secret := name])` | Reads one table without `ATTACH`.                                                                                     |
+| `clickhouse_clear_cache()`                                        | Forgets the cached databases, tables and columns.                                                                     |
+| `clickhouse_type_mapping(type)`                                   | Shows which DuckDB type a ClickHouse type is read as.                                                                 |
 
 ## Settings
 
-| Setting | Default | Description |
-|---|---|---|
-| `ch_filter_pushdown` | `true` | Send filters to ClickHouse |
-| `ch_order_pushdown` | `true` | Send `LIMIT` and `ORDER BY … LIMIT` to ClickHouse |
-| `ch_insert_block_size` | `65536` | Rows per block sent during `INSERT` |
-| `ch_default_table_engine` | `MergeTree` | Engine used by `CREATE TABLE` |
-| `ch_mutations_sync` | `2` | Whether `UPDATE` and `ALTER COLUMN` changes wait: 0 = no, 1 = for this replica, 2 = for all replicas |
-| `ch_connect_timeout_ms` | `10000` | Connection timeout |
-| `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
-| `ch_pool_max_connections` | depends on CPU count | Connections kept per attached database |
-| `ch_pool_acquire_mode` | `force` | `force`, `wait` or `try` when all connections are busy |
-| `ch_pool_wait_timeout_millis` | `30000` | How long `wait` mode waits |
-| `ch_pool_idle_timeout_millis` | `60000` | Idle connections are closed after this long |
-| `ch_debug_show_queries` | `false` | Print every query sent to ClickHouse |
+| Setting                       | Default              | Description                                                                                          |
+| ----------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `ch_filter_pushdown`          | `true`               | Send filters to ClickHouse                                                                           |
+| `ch_order_pushdown`           | `true`               | Send `LIMIT` and `ORDER BY … LIMIT` to ClickHouse                                                    |
+| `ch_insert_block_size`        | `65536`              | Rows per block sent during `INSERT`                                                                  |
+| `ch_default_table_engine`     | `MergeTree`          | Engine used by `CREATE TABLE`                                                                        |
+| `ch_mutations_sync`           | `2`                  | Whether `UPDATE` and `ALTER COLUMN` changes wait: 0 = no, 1 = for this replica, 2 = for all replicas |
+| `ch_connect_timeout_ms`       | `10000`              | Connection timeout                                                                                   |
+| `ch_receive_timeout_ms`       | `300000`             | Socket receive timeout                                                                               |
+| `ch_pool_max_connections`     | depends on CPU count | Connections kept per attached database                                                               |
+| `ch_pool_acquire_mode`        | `force`              | `force`, `wait` or `try` when all connections are busy                                               |
+| `ch_pool_wait_timeout_millis` | `30000`              | How long `wait` mode waits                                                                           |
+| `ch_pool_idle_timeout_millis` | `60000`              | Idle connections are closed after this long                                                          |
+| `ch_debug_show_queries`       | `false`              | Print every query sent to ClickHouse                                                                 |
 
 ## Types
 
-| ClickHouse | DuckDB |
-|---|---|
-| `Bool`, `(U)Int8…128`, `Float32/64`, `BFloat16` | the matching integer, `HUGEINT`/`UHUGEINT`, `FLOAT`/`DOUBLE` |
-| `Decimal(P ≤ 38, S)` | `DECIMAL(P, S)` |
-| `String`, `FixedString` | `VARCHAR` |
-| `Date`, `Date32` | `DATE` |
-| `DateTime`, `DateTime64` | `TIMESTAMP WITH TIME ZONE` (microsecond precision) |
-| `Time`, `Time64` | `TIME` (`TIME_NS` above microsecond precision) |
-| `UUID` | `UUID` |
-| `Enum8/16` | `ENUM` |
-| `Array`, `Tuple`, `Map` | `LIST`, `STRUCT`, `MAP` |
-| `JSON`, `Variant`, `Dynamic` | `JSON` |
-| `Nullable(T)`, `LowCardinality(T)` | `T` |
-| `IPv4/6`, `(U)Int256`, `Decimal256`, geo types, others | `VARCHAR` |
-| `AggregateFunction` | not readable; use `clickhouse_query` with `finalizeAggregation` |
+| ClickHouse                                             | DuckDB                                                          |
+| ------------------------------------------------------ | --------------------------------------------------------------- |
+| `Bool`, `(U)Int8…128`, `Float32/64`, `BFloat16`        | the matching integer, `HUGEINT`/`UHUGEINT`, `FLOAT`/`DOUBLE`    |
+| `Decimal(P ≤ 38, S)`                                   | `DECIMAL(P, S)`                                                 |
+| `String`, `FixedString`                                | `VARCHAR`                                                       |
+| `Date`, `Date32`                                       | `DATE`                                                          |
+| `DateTime`, `DateTime64`                               | `TIMESTAMP WITH TIME ZONE` (microsecond precision)              |
+| `Time`, `Time64`                                       | `TIME` (`TIME_NS` above microsecond precision)                  |
+| `UUID`                                                 | `UUID`                                                          |
+| `Enum8/16`                                             | `ENUM`                                                          |
+| `Array`, `Tuple`, `Map`                                | `LIST`, `STRUCT`, `MAP`                                         |
+| `JSON`, `Variant`, `Dynamic`                           | `JSON`                                                          |
+| `Nullable(T)`, `LowCardinality(T)`                     | `T`                                                             |
+| `IPv4/6`, `(U)Int256`, `Decimal256`, geo types, others | `VARCHAR`                                                       |
+| `AggregateFunction`                                    | not readable; use `clickhouse_query` with `finalizeAggregation` |
 
 `String` values must be valid UTF-8; read binary data with `clickhouse_query` and `hex()` or `base64Encode()`.
 `CREATE TABLE` maps DuckDB types back the other way (`VARCHAR` → `String`, `TIMESTAMP` → `DateTime64(6, 'UTC')`,

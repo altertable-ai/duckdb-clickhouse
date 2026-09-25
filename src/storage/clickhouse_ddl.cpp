@@ -295,7 +295,7 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection,
 	           "is_in_sampling_key FROM system.columns WHERE database = " +
 	           ClickhouseUtils::QuoteLiteral(database) + " AND table = " + ClickhouseUtils::QuoteLiteral(table.name) +
 	           " AND name = " + ClickhouseUtils::QuoteLiteral(column);
-	for (auto &block : connection.Query(sql, ClickhouseDml::SemanticSettings())) {
+	for (auto &block : connection.Query(sql, ClickhouseConnection::ExtensionQuerySettings())) {
 		if (block.GetRowCount() == 0) {
 			continue;
 		}
@@ -310,11 +310,11 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection,
 	                       column, table.name);
 }
 
-//! Runs with ClickhouseDml::SemanticSettings() plus `extra_settings`: the count reads every stored row, whatever the
-//! ATTACH's settings= say
+//! Runs with ClickhouseConnection::ExtensionQuerySettings() plus `extra_settings`: the count reads every stored row
+//! that is not deleted, whatever the ATTACH's settings= say
 static uint64_t QueryCount(ClickhouseConnection &connection, const string &sql,
                            const vector<std::pair<string, string>> &extra_settings = {}) {
-	auto settings = ClickhouseDml::SemanticSettings();
+	auto settings = ClickhouseConnection::ExtensionQuerySettings();
 	settings.insert(settings.end(), extra_settings.begin(), extra_settings.end());
 	uint64_t count = 0;
 	for (auto &block : connection.Query(sql, settings)) {
@@ -394,9 +394,10 @@ static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog,
 	auto &name = column.info.name;
 	auto sync = ClickhouseDml::MutationsSyncSetting(context);
 	// the default would change while the mutation still waits to run: anywhere with 0, and on the other replicas of a
-	// Replicated table with 1, which waits for this replica only (the default change is not ordered after the
-	// mutation there)
-	auto replicated = StringUtil::StartsWith(table.GetEngine(), "Replicated");
+	// Replicated (or ClickHouse Cloud's Shared) table with 1, which waits for this replica only (the default change is
+	// not ordered after the mutation there)
+	auto &engine = table.GetEngine();
+	auto replicated = StringUtil::StartsWith(engine, "Replicated") || StringUtil::StartsWith(engine, "Shared");
 	if (sync.second == "0" || (replicated && sync.second != "2")) {
 		throw NotImplementedException(
 		    "Cannot change the default of column \"%s\" of ClickHouse table \"%s\": %d part(s) do not store the column "

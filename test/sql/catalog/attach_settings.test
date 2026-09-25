@@ -47,9 +47,12 @@ statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=additional_table_filters={''system.tables'':''0''}' AS ch_tables_filter (TYPE clickhouse);
 
 statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=max_result_rows=1,result_overflow_mode=break,max_block_size=1' AS ch_result_break (TYPE clickhouse);
+
+statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=offset=1' AS ch_offset_schema (TYPE clickhouse, SCHEMA 'C_Settings');
 
-foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter
+foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter ch_result_break
 
 query I
 SELECT schema_name FROM duckdb_schemas() WHERE database_name = '${db}' AND schema_name IN ('c_settings', 'test_db', 'other_db', 'default') ORDER BY ALL;
@@ -134,7 +137,7 @@ SELECT count(*) FROM clickhouse_query('ch_columns_filter', 'SELECT name FROM sys
 ----
 0
 
-foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter ch_offset_schema
+foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter ch_result_break ch_offset_schema
 
 statement ok
 DETACH ${db};

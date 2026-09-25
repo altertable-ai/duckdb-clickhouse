@@ -48,7 +48,7 @@ static string ResolveSchemaOption(ClickhousePoolConnection &connection, const st
 	string match;
 	for (auto &block : connection->Query("SELECT name FROM system.databases WHERE lower(name) = lower(" +
 	                                         ClickhouseUtils::QuoteLiteral(name) + ") ORDER BY name",
-	                                     ClickhouseDml::SemanticSettings())) {
+	                                     ClickhouseConnection::ExtensionQuerySettings())) {
 		auto names = block[0]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {
 			string candidate(names->At(row));
@@ -160,7 +160,7 @@ void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 			auto connection = connection_pool->GetConnection();
 			for (auto &block : connection->Query("SELECT count() FROM system.tables WHERE database = " +
 			                                         ClickhouseUtils::QuoteLiteral(database),
-			                                     ClickhouseDml::SemanticSettings())) {
+			                                     ClickhouseConnection::ExtensionQuerySettings())) {
 				if (block.GetRowCount() > 0) {
 					table_count = block[0]->As<clickhouse::ColumnUInt64>()->At(0);
 				}

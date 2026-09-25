@@ -1,5 +1,6 @@
 #include "storage/clickhouse_insert.hpp"
 
+#include "clickhouse_connection.hpp"
 #include "clickhouse_utils.hpp"
 #include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
@@ -10,7 +11,6 @@
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_ddl.hpp"
-#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -237,7 +237,7 @@ void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGloba
 	// Time/Time64 columns need this setting (ClickHouse 25.x); servers that do not know it ignore it. Tables
 	// DuckDB creates map TIME to Time64 (see ClickhouseDdlTypes), so every INSERT needs it, not just DDL. The
 	// server-side conversions must neither turn text into a default nor lose rows to a limit
-	auto settings = ClickhouseDml::SemanticSettings();
+	auto settings = ClickhouseConnection::ExtensionQuerySettings();
 	settings.emplace_back("enable_time_time64_type", "1");
 	gstate.header = gstate.connection->BeginInsert(gstate.insert_sql, settings);
 	if (gstate.header.GetColumnCount() != gstate.columns.size()) {
