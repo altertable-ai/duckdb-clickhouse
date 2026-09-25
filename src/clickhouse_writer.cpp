@@ -34,13 +34,6 @@ namespace ch = clickhouse;
 //===--------------------------------------------------------------------===//
 // Write modes
 //===--------------------------------------------------------------------===//
-static const ClickhouseTypeNode &UnwrapNullable(const ClickhouseTypeNode &node) {
-	if ((node.name == "Nullable" || node.name == "LowCardinality") && node.children.size() == 1) {
-		return UnwrapNullable(node.children[0]);
-	}
-	return node;
-}
-
 ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &node) {
 	static const unordered_set<string> NATIVE_TYPES = {
 	    "Bool",   "Int8",   "Int16",       "Int32", "Int64",  "UInt8",    "UInt16",     "UInt32", "UInt64",
@@ -49,7 +42,7 @@ ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &nod
 	static const unordered_set<string> CONVERTED_TYPES = {
 	    "IPv4", "IPv6", "Int256", "UInt256", "BFloat16", "JSON", "Point", "Ring", "LineString", "MultiLineString",
 	    "Polygon", "MultiPolygon"};
-	auto &type = UnwrapNullable(node);
+	auto &type = ClickhouseTypeWrappers::Of(node).base;
 	auto &name = type.name;
 	if (StringUtil::StartsWith(name, "Decimal")) {
 		// Decimal(P <= 38) is read, and written, as a DuckDB DECIMAL; wider ones go through text
@@ -77,7 +70,7 @@ ClickhouseWriteMode ClickhouseWriter::GetWriteMode(const ClickhouseTypeNode &nod
 }
 
 string ClickhouseWriter::ServerInputType(const ClickhouseTypeNode &node) {
-	auto base = UnwrapNullable(node).name == "BFloat16" ? "Float32" : "String";
+	auto base = ClickhouseTypeWrappers::Of(node).base.name == "BFloat16" ? "Float32" : "String";
 	return ClickhouseTypes::IsNullable(node) ? "Nullable(" + string(base) + ")" : string(base);
 }
 
@@ -87,7 +80,7 @@ string ClickhouseWriter::ServerConversion(const ClickhouseTypeNode &node, const 
 	    {"Point", "readWKTPoint"},           {"Ring", "readWKTRing"},       {"LineString", "readWKTLineString"},
 	    {"MultiLineString", "readWKTMultiLineString"}, {"Polygon", "readWKTPolygon"},
 	    {"MultiPolygon", "readWKTMultiPolygon"}};
-	auto reader = WKT_READERS.find(UnwrapNullable(node).name);
+	auto reader = WKT_READERS.find(ClickhouseTypeWrappers::Of(node).base.name);
 	if (reader != WKT_READERS.end()) {
 		return reader->second + "(" + expr + ")";
 	}

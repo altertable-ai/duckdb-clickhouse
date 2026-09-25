@@ -605,5 +605,68 @@ SELECT * FROM clickhouse_query('ch', 'SELECT countIf(empty(arr)), countIf(tup.a 
 ----
 6	6	6
 
+# ---------------------------------------------------------------------------
+# a cast from VARCHAR to another type on a column is rejected: ClickHouse turns a string it cannot parse into NULL
+# (or fails the mutation, which then stays stuck), where DuckDB fails the statement. Constants are folded by DuckDB
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.vs (id Int32, s String, i Nullable(Int32), j Int32, b Nullable(Bool), d Nullable(Date32), e Nullable(Enum8(''x'' = 1, ''y'' = 2)), u Nullable(UUID)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml2.vs (id, s, j) VALUES (1, '1', 0), (2, 'abc', 0), (3, '3000000000', 0);
+
+foreach set i=s j=s i=s::INTEGER+1 b=s d=s e=s u=s i=(s||'1')::INTEGER j=coalesce(s::INTEGER,0)
+
+statement error
+UPDATE ch.w_dml2.vs SET {set};
+----
+<REGEX>:.*cast from VARCHAR to (INTEGER|BOOLEAN|DATE|ENUM.*|UUID) has no exact ClickHouse translation.*
+
+endloop
+
+statement error
+UPDATE ch.w_dml2.vs SET j = 1 WHERE s::INTEGER <> 4;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+query IIIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, s, i, j, b, d, e FROM w_dml2.vs ORDER BY id');
+----
+1	1	NULL	0	NULL	NULL	NULL
+2	abc	NULL	0	NULL	NULL	NULL
+3	3000000000	NULL	0	NULL	NULL	NULL
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''vs''');
+----
+0
+
+# string constants: folded into literals of the column's type by DuckDB
+query I
+UPDATE ch.w_dml2.vs SET i = '5', b = 'true', d = '2024-02-29', e = 'y', u = '00000000-0000-0000-0000-000000000001' WHERE id = 1;
+----
+1
+
+query I
+UPDATE ch.w_dml2.vs SET j = 7 WHERE i = '5' AND d = '2024-02-29' AND e = 'y' AND b = 'true';
+----
+1
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT i, j, b, toString(d), toString(e), toString(u) FROM w_dml2.vs WHERE id = 1');
+----
+5	7	true	2024-02-29	y	00000000-0000-0000-0000-000000000001
+
+# a string constant DuckDB cannot convert stays a cast, rejected like the others: nothing is written
+statement error
+UPDATE ch.w_dml2.vs SET i = 'abc';
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation: CAST('abc' AS INTEGER)
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(i) FROM (SELECT i FROM w_dml2.vs ORDER BY id)');
+----
+[5]
+
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

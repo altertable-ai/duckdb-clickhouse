@@ -178,9 +178,7 @@ static idx_t TimestampDigits(const LogicalType &type) {
 
 //! Whether (and how) a cast from `source` to `target` translates into a ClickHouse CAST with DuckDB's result.
 //! Throws NotImplementedException for every cast that does not (see the "as built" list in the design spec, §6):
-//! only casts listed here translate. A VARCHAR source follows ClickHouse's parse rules, which accept and refuse
-//! other strings than DuckDB's (ClickHouse fails on CAST('2.5' AS Int32) instead of rounding), but only for
-//! targets whose parse does not round
+//! only casts listed here translate
 static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &target) {
 	if (source == target || source.id() == LogicalTypeId::SQLNULL) {
 		return CastRounding::NONE;
@@ -202,11 +200,13 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 		}
 		return CastRounding::NONE;
 	}
-	if (source.IsJSONType()) {
+	if (source.id() == LogicalTypeId::VARCHAR) {
+		// ClickHouse's CAST(s AS Nullable(T)) is NULL for a string it cannot parse (a non-Nullable one fails the
+		// mutation, which then stays stuck), where DuckDB fails the statement. JSON is VARCHAR too. DuckDB folds
+		// string constants into literals of the target type before this runs
 		ThrowInexactCast(source, target, "has no exact ClickHouse translation");
 	}
 	auto source_id = source.id();
-	auto is_varchar = source_id == LogicalTypeId::VARCHAR;
 	switch (target.id()) {
 	case LogicalTypeId::TINYINT:
 	case LogicalTypeId::SMALLINT:
@@ -218,7 +218,7 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 	case LogicalTypeId::UINTEGER:
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::UHUGEINT:
-		if (source.IsIntegral() || source_id == LogicalTypeId::BOOLEAN || is_varchar) {
+		if (source.IsIntegral() || source_id == LogicalTypeId::BOOLEAN) {
 			return CastRounding::NONE;
 		}
 		if (source.IsFloating()) {
@@ -244,8 +244,6 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 			// (below 2^24 / 2^53); DuckDB computes wider values differently (TryCastDecimalToFloatingPoint)
 			return CastRounding::NONE;
 		}
-		// VARCHAR: ClickHouse's parse is not correctly rounded (CAST('1.7091' AS Float64) = 1.7090999999999998),
-		// and precise_float_parsing does not reach a mutation
 		break;
 	case LogicalTypeId::DECIMAL:
 		if (source.IsIntegral()) {
@@ -255,15 +253,15 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 			return DecimalType::GetScale(source) > DecimalType::GetScale(target) ? CastRounding::HALF_AWAY_FROM_ZERO
 			                                                                     : CastRounding::NONE;
 		}
-		// FLOAT/DOUBLE and VARCHAR: DuckDB rounds to the scale, ClickHouse truncates
+		// FLOAT/DOUBLE: DuckDB rounds to the scale, ClickHouse truncates
 		break;
 	case LogicalTypeId::BOOLEAN:
-		if (source.IsIntegral() || is_varchar) {
+		if (source.IsIntegral()) {
 			return CastRounding::NONE;
 		}
 		break;
 	case LogicalTypeId::DATE:
-		if (is_varchar || IsTimestamp(source)) {
+		if (IsTimestamp(source)) {
 			// both floor a timestamp to its day
 			return CastRounding::NONE;
 		}
@@ -276,10 +274,6 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 		    (IsTimestamp(source) && TimestampDigits(source) <= TimestampDigits(target))) {
 			return CastRounding::NONE;
 		}
-		if (is_varchar && (target.id() == LogicalTypeId::TIMESTAMP || target.id() == LogicalTypeId::TIMESTAMP_SEC)) {
-			// both truncate extra digits of a microsecond timestamp; ClickHouse refuses any fraction for seconds
-			return CastRounding::NONE;
-		}
 		// fewer digits: DuckDB rounds (truncates from nanoseconds), ClickHouse truncates toward zero
 		break;
 	case LogicalTypeId::TIME_NS:
@@ -287,13 +281,8 @@ static CastRounding ClassifyCast(const LogicalType &source, const LogicalType &t
 			return CastRounding::NONE;
 		}
 		break;
-	case LogicalTypeId::UUID:
-		if (is_varchar) {
-			return CastRounding::NONE;
-		}
-		break;
 	case LogicalTypeId::ENUM:
-		if (is_varchar || source_id == LogicalTypeId::ENUM) {
+		if (source_id == LogicalTypeId::ENUM) {
 			// by label in both
 			return CastRounding::NONE;
 		}
@@ -353,12 +342,6 @@ static string CastSql(CastRounding rounding, const string &sql, const LogicalTyp
 string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, const LogicalType &target,
                                   const string &clickhouse_type) {
 	return CastSql(ClassifyCast(source, target), sql, target, clickhouse_type);
-}
-
-void ClickhouseExpression::CheckPlainCast(const LogicalType &source, const LogicalType &target) {
-	if (ClassifyCast(source, target) != CastRounding::NONE) {
-		throw NotImplementedException("DuckDB rounds this cast, ClickHouse's CAST truncates");
-	}
 }
 
 //! DuckDB computes FLOAT arithmetic in single precision, ClickHouse promotes Float32 to Float64: rounding the

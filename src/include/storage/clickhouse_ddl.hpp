@@ -54,11 +54,13 @@ public:
 	//! COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL and TYPE (MODIFY COLUMN); anything else throws
 	//! NotImplementedException. Column names are resolved against the table's ClickHouse columns the way DuckDB
 	//! resolves identifiers, case-insensitively (see ResolveColumn()), and the statement uses the real ClickHouse
-	//! name. The ALTER COLUMN forms read the column's current type, default and key membership from the server and,
-	//! for SET NOT NULL and TYPE, check every existing value first, so a mutation that would fail -- and leave the
-	//! table unreadable behind a stuck mutation -- is never sent. The statement is empty when there is nothing to
-	//! send: ADD COLUMN IF NOT EXISTS of a column that exists, DROP COLUMN IF EXISTS of one that does not, DROP
-	//! DEFAULT without a default, a NOT NULL change or TYPE that the column already matches
+	//! name. The ALTER COLUMN forms read the column's current type, default and key membership from the server. SET
+	//! NOT NULL counts the NULLs first, so a mutation that would fail -- and leave the table unreadable behind a
+	//! stuck mutation -- is never sent; TYPE accepts only conversions that keep every value. SET/DROP DEFAULT first
+	//! runs a mutation storing the column in every part of a MergeTree table that lacks it (ClickHouse computes it
+	//! there from the current default). The statement is empty when there is nothing to send: ADD COLUMN IF NOT
+	//! EXISTS of a column that exists, DROP COLUMN IF EXISTS of one that does not, DROP DEFAULT without a default, a
+	//! NOT NULL change or TYPE that the column already matches
 	static ClickhouseAlterStatement AlterTable(ClientContext &context, ClickhouseCatalog &catalog,
 	                                           const string &database, const ClickhouseTableEntry &table,
 	                                           AlterTableInfo &info);

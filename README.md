@@ -79,7 +79,7 @@ DELETE FROM ch.analytics.events WHERE ts < DATE '2025-01-01';
 
 Supported: `INSERT` and `COPY … FROM`; `CREATE TABLE` (including `AS SELECT`), `DROP TABLE`; `CREATE SCHEMA` /
 `DROP SCHEMA` (ClickHouse databases); `ALTER TABLE … ADD`, `DROP` and `RENAME COLUMN`, `RENAME TO`, and
-`ALTER COLUMN … SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL` and `TYPE` (when every value converts exactly); `UPDATE`,
+`ALTER COLUMN … SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL` and `TYPE` (widening conversions only); `UPDATE`,
 `DELETE` and `TRUNCATE`. For anything else, run ClickHouse SQL with `clickhouse_execute`:
 
 ```sql
@@ -101,9 +101,9 @@ Things to know:
   constants, comparisons, `AND`/`OR`/`NOT`, `IN`, `BETWEEN`, arithmetic, `LIKE`, `CASE`, `coalesce`, casts and common
   string functions. Joins, subqueries, `UPDATE … FROM` and other functions are rejected before anything runs. The
   result is the one DuckDB would compute, with a few exceptions where ClickHouse's own rules apply: `NaN`
-  comparisons, integer overflow (it wraps instead of raising an error), division by zero (an error in ClickHouse),
-  byte-wise `LIKE`, and how strings are parsed into numbers and dates.
-- **Mutations run in the background on the server.** `UPDATE`, and `ALTER COLUMN … TYPE` or `… NOT NULL`, wait for
+  comparisons, integer overflow (it wraps instead of raising an error), division by zero (an error in ClickHouse)
+  and byte-wise `LIKE`.
+- **Mutations run in the background on the server.** `UPDATE`, and `ALTER COLUMN` when it rewrites data, wait for
   it to finish (see `ch_mutations_sync`). If it
   times out it keeps running, so check `system.mutations` before retrying. A mutation that fails can block later
   ones on the same table until you remove it with `KILL MUTATION`.
@@ -128,7 +128,7 @@ Things to know:
 | `ch_order_pushdown` | `true` | Send `LIMIT` and `ORDER BY … LIMIT` to ClickHouse |
 | `ch_insert_block_size` | `65536` | Rows per block sent during `INSERT` |
 | `ch_default_table_engine` | `MergeTree` | Engine used by `CREATE TABLE` |
-| `ch_mutations_sync` | `2` | Whether `UPDATE` and `ALTER COLUMN` type changes wait: 0 = no, 1 = for this replica, 2 = for all replicas |
+| `ch_mutations_sync` | `2` | Whether `UPDATE` and `ALTER COLUMN` changes wait: 0 = no, 1 = for this replica, 2 = for all replicas |
 | `ch_connect_timeout_ms` | `10000` | Connection timeout |
 | `ch_receive_timeout_ms` | `300000` | Socket receive timeout |
 | `ch_pool_max_connections` | depends on CPU count | Connections kept per attached database |

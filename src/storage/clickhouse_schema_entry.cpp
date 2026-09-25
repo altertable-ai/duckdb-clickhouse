@@ -102,6 +102,8 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	// the ALTER COLUMN checks read the server before anything is written: refuse a READ_ONLY attach first
 	ch_catalog.ThrowIfReadOnly();
+	// SET/DROP DEFAULT can run a mutation (and clear the cache) while the statement is built
+	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
 	// built before Execute() clears the cache and retires `entry`
 	auto statement = ClickhouseDdl::AlterTable(context, ch_catalog, name, table, alter);
 	if (statement.sql.empty()) {
@@ -112,7 +114,6 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	if (statement.mutation) {
 		settings.push_back(ClickhouseDml::MutationsSyncSetting(context));
 	}
-	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
 	// the cleared cache makes the new type or nullability visible at once
 	ClickhouseDdl::Execute(context, ch_catalog, statement.sql, settings);
 }

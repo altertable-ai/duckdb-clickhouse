@@ -20,6 +20,18 @@ struct ClickhouseTypeNode {
 	string text;
 };
 
+//! A column type's LowCardinality and Nullable wrappers and the type inside them: LowCardinality(Nullable(String))
+//! is {low_cardinality, nullable, String}
+struct ClickhouseTypeWrappers {
+	bool low_cardinality = false;
+	bool nullable = false;
+	const ClickhouseTypeNode &base;
+
+	static ClickhouseTypeWrappers Of(const ClickhouseTypeNode &node);
+	//! `type` in the same wrappers
+	string Wrap(const string &type) const;
+};
+
 class ClickhouseTypeParser {
 public:
 	static ClickhouseTypeNode Parse(const string &type_text);

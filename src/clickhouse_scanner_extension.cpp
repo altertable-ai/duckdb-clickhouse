@@ -104,7 +104,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value("MergeTree"), SetClickhouseDefaultTableEngine);
 	config.AddExtensionOption(
 	    "ch_mutations_sync",
-	    "mutations_sync sent with UPDATE and ALTER COLUMN type changes: 0 = do not wait, 1 = wait on this replica, "
+	    "mutations_sync sent with UPDATE and ALTER COLUMN mutations: 0 = do not wait, 1 = wait on this replica, "
 	    "2 = wait on all replicas",
 	    LogicalType::UBIGINT, Value::UBIGINT(2), SetClickhouseMutationsSync);
 	OptimizerExtension clickhouse_optimizer;

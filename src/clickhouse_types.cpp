@@ -488,6 +488,18 @@ bool ClickhouseTypes::IsComparedExactly(const ClickhouseTypeNode &node) {
 	return true;
 }
 
+ClickhouseTypeWrappers ClickhouseTypeWrappers::Of(const ClickhouseTypeNode &node) {
+	auto low_cardinality = node.name == "LowCardinality" && node.children.size() == 1;
+	auto &inner = low_cardinality ? node.children[0] : node;
+	auto nullable = inner.name == "Nullable" && inner.children.size() == 1;
+	return {low_cardinality, nullable, nullable ? inner.children[0] : inner};
+}
+
+string ClickhouseTypeWrappers::Wrap(const string &type) const {
+	auto result = nullable ? "Nullable(" + type + ")" : type;
+	return low_cardinality ? "LowCardinality(" + result + ")" : result;
+}
+
 bool ClickhouseTypes::IsNullable(const ClickhouseTypeNode &node) {
 	if (node.name == "Nullable") {
 		return true;

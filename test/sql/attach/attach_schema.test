@@ -161,10 +161,55 @@ ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHO
 ----
 SCHEMA must name a ClickHouse database
 
+statement error
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_null (TYPE clickhouse, SCHEMA NULL);
+----
+NULL is not supported as a valid option for ATTACH option "schema"
+
 query I
-SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ch_missing', 'ch_empty');
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ch_missing', 'ch_empty', 'ch_null');
 ----
 0
+
+# ---------------------------------------------------------------------------
+# SCHEMA with READ_ONLY: the one database is readable, and nothing can be written
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_ro (TYPE clickhouse, SCHEMA 'w_schema', READ_ONLY);
+
+query II
+SELECT * FROM ch_ro.t ORDER BY id;
+----
+1	a
+2	b
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'ch_ro';
+----
+w_schema
+
+statement error
+INSERT INTO ch_ro.t VALUES (3, 'c');
+----
+it is attached in read-only mode
+
+statement error
+ALTER TABLE ch_ro.t ALTER COLUMN v SET DEFAULT 'x';
+----
+read-only mode
+
+statement error
+CREATE SCHEMA ch_ro.w_schema_other;
+----
+read-only
+
+query I
+SELECT * FROM clickhouse_query('ch_ro', 'SELECT count() FROM w_schema.t');
+----
+2
+
+statement ok
+DETACH ch_ro;
 
 # ---------------------------------------------------------------------------
 # CREATE SCHEMA / DROP SCHEMA

@@ -5,7 +5,6 @@
 #include "clickhouse_types.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -18,6 +17,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "storage/clickhouse_catalog.hpp"
+#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -289,14 +289,13 @@ struct ClickhouseServerColumn {
 	bool in_key = false;
 };
 
-static ClickhouseServerColumn LoadServerColumn(ClickhouseCatalog &catalog, const string &database,
+static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection, const string &database,
                                                const ClickhouseTableEntry &table, const string &column) {
-	auto connection = catalog.GetConnectionPool().GetConnection();
 	auto sql = "SELECT type, default_kind, is_in_sorting_key OR is_in_primary_key OR is_in_partition_key OR "
 	           "is_in_sampling_key FROM system.columns WHERE database = " +
 	           ClickhouseUtils::QuoteLiteral(database) + " AND table = " + ClickhouseUtils::QuoteLiteral(table.name) +
 	           " AND name = " + ClickhouseUtils::QuoteLiteral(column);
-	for (auto &block : connection->Query(sql)) {
+	for (auto &block : connection.Query(sql)) {
 		if (block.GetRowCount() == 0) {
 			continue;
 		}
@@ -311,19 +310,35 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseCatalog &catalog, const
 	                       column, table.name);
 }
 
-//! How many rows of `qualified` satisfy `condition`, counting the rows a lightweight DELETE only masked: a mutation
-//! still rewrites (and converts) them. countIf, not WHERE: ClickHouse 25.8 answers WHERE n IS NULL with 0 for masked
-//! rows even with apply_deleted_mask = 0
-static uint64_t CountStoredRows(ClickhouseCatalog &catalog, const string &qualified, const string &condition) {
-	auto connection = catalog.GetConnectionPool().GetConnection();
+static uint64_t QueryCount(ClickhouseConnection &connection, const string &sql,
+                           const vector<std::pair<string, string>> &settings = {}) {
 	uint64_t count = 0;
-	for (auto &block :
-	     connection->Query("SELECT countIf(" + condition + ") FROM " + qualified, {{"apply_deleted_mask", "0"}})) {
+	for (auto &block : connection.Query(sql, settings)) {
 		if (block.GetRowCount() > 0) {
 			count = block[0]->As<clickhouse::ColumnUInt64>()->At(0);
 		}
 	}
 	return count;
+}
+
+//! How many rows of `qualified` satisfy `condition`, counting the rows a lightweight DELETE only masked: a mutation
+//! still rewrites (and converts) them. countIf, not WHERE: ClickHouse 25.8 answers WHERE n IS NULL with 0 for masked
+//! rows even with apply_deleted_mask = 0. Pinned like the UPDATE/DELETE count (ClickhouseDml::SemanticSettings)
+static uint64_t CountStoredRows(ClickhouseConnection &connection, const string &qualified, const string &condition) {
+	auto settings = ClickhouseDml::SemanticSettings();
+	settings.emplace_back("apply_deleted_mask", "0");
+	return QueryCount(connection, "SELECT countIf(" + condition + ") FROM " + qualified, settings);
+}
+
+//! Active parts of a MergeTree-family table that do not store `column` (written before it was added, and not merged
+//! or mutated since)
+static uint64_t CountPartsWithout(ClickhouseConnection &connection, const string &database,
+                                  const ClickhouseTableEntry &table, const string &column) {
+	return QueryCount(connection, "SELECT countIf(NOT has(columns, " + ClickhouseUtils::QuoteLiteral(column) +
+	                                  ")) FROM (SELECT groupArray(column) AS columns FROM system.parts_columns WHERE "
+	                                  "database = " +
+	                                  ClickhouseUtils::QuoteLiteral(database) + " AND table = " +
+	                                  ClickhouseUtils::QuoteLiteral(table.name) + " AND active GROUP BY name)");
 }
 
 //! Type and NOT NULL changes rewrite the column: ClickHouse refuses them on key columns (ALTER_OF_COLUMN_IS_FORBIDDEN),
@@ -368,10 +383,61 @@ static string ModifyColumn(const string &qualified, const ClickhouseColumnInfo &
 	return "ALTER TABLE " + qualified + " MODIFY COLUMN " + ClickhouseUtils::QuoteIdentifier(column.name) + " " + rest;
 }
 
+//! ClickHouse computes a column that a part does not store (one added after the part was written) from the column's
+//! current default, so changing the default would change those rows, where DuckDB's SET/DROP DEFAULT never changes a
+//! stored value. Stores the column in every part first, with the value it reads as now
+static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog, const string &database,
+                             const ClickhouseTableEntry &table, const ClickhouseServerColumn &column,
+                             uint64_t missing_parts) {
+	auto &name = column.info.name;
+	auto sync = ClickhouseDml::MutationsSyncSetting(context);
+	if (sync.second == "0") {
+		// the default would change while the mutation still waits to run
+		throw NotImplementedException(
+		    "Cannot change the default of column \"%s\" of ClickHouse table \"%s\": %d part(s) do not store the column "
+		    "yet, and ClickHouse computes it there from the current default, so it has to be materialized first, which "
+		    "ch_mutations_sync = 0 would leave running in the background; SET ch_mutations_sync = 2, or use "
+		    "clickhouse_execute() instead",
+		    name, table.name, missing_parts);
+	}
+	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
+	auto quoted = ClickhouseUtils::QuoteIdentifier(name);
+	// MATERIALIZE COLUMN refuses a column without a default (BAD_ARGUMENTS); rewriting it with itself stores the value
+	// it reads as
+	auto sql = column.default_kind.empty()
+	               ? "ALTER TABLE " + qualified + " UPDATE " + quoted + " = " + quoted + " WHERE 1"
+	               : "ALTER TABLE " + qualified + " MATERIALIZE COLUMN " + quoted;
+	ClickhouseDdl::Execute(context, catalog, sql, {sync});
+	auto connection = catalog.GetConnectionPool().GetConnection();
+	missing_parts = CountPartsWithout(connection.GetConnection(), database, table, name);
+	if (missing_parts > 0) {
+		throw InvalidInputException("Cannot change the default of column \"%s\" of ClickHouse table \"%s\": %d part(s) "
+		                            "still do not store the column after `%s`; the default was not changed",
+		                            name, table.name, missing_parts, sql);
+	}
+}
+
 static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCatalog &catalog, const string &database,
                                            const ClickhouseTableEntry &table, SetDefaultInfo &info) {
 	auto &cached = RequireColumn(table, info.column_name);
-	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	auto &engine = table.GetEngine();
+	auto merge_tree = StringUtil::EndsWith(engine, "MergeTree");
+	// Memory stores an added column for the rows it already holds
+	if (!merge_tree && engine != "Memory") {
+		throw NotImplementedException("Cannot change the default of column \"%s\" of ClickHouse table \"%s\" (engine "
+		                              "%s): only MergeTree-family and Memory tables are supported; use "
+		                              "clickhouse_execute() instead",
+		                              cached.name, table.name, engine);
+	}
+	ClickhouseServerColumn column;
+	uint64_t missing_parts = 0;
+	{
+		auto connection = catalog.GetConnectionPool().GetConnection();
+		column = LoadServerColumn(connection.GetConnection(), database, table, cached.name);
+		if (merge_tree) {
+			missing_parts = CountPartsWithout(connection.GetConnection(), database, table, column.info.name);
+		}
+	}
 	if (column.default_kind == "MATERIALIZED" || column.default_kind == "ALIAS") {
 		// MODIFY COLUMN … DEFAULT would silently turn it into a DEFAULT column
 		throw NotImplementedException("Column \"%s\" of ClickHouse table \"%s\" is %s, not a column with a DEFAULT; "
@@ -379,48 +445,53 @@ static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCat
 		                              column.info.name, table.name, column.default_kind);
 	}
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
+	string sql;
 	if (!info.expression) {
 		// DROP DEFAULT: ClickHouse refuses REMOVE DEFAULT for a column without one
 		if (column.default_kind.empty()) {
 			return {};
 		}
-		return {ModifyColumn(qualified, column.info, "REMOVE DEFAULT")};
+		sql = ModifyColumn(qualified, column.info, "REMOVE DEFAULT");
+	} else {
+		// ClickHouse keeps the column's type: only the default is replaced
+		ColumnDefinition definition(column.info.name, column.info.type);
+		definition.SetDefaultValue(info.expression->Copy());
+		sql = ModifyColumn(qualified, column.info, ClickhouseDdl::DefaultValueSql(context, definition).substr(1));
 	}
-	// ClickHouse keeps the column's type: only the default is replaced
-	ColumnDefinition definition(column.info.name, column.info.type);
-	definition.SetDefaultValue(info.expression->Copy());
-	return {ModifyColumn(qualified, column.info, ClickhouseDdl::DefaultValueSql(context, definition).substr(1))};
+	if (missing_parts > 0) {
+		StoreInEveryPart(context, catalog, database, table, column, missing_parts);
+	}
+	return {sql};
 }
 
 static ClickhouseAlterStatement ChangeNullability(ClickhouseCatalog &catalog, const string &database,
                                                   const ClickhouseTableEntry &table, const string &name,
                                                   bool nullable) {
 	auto &cached = RequireColumn(table, name);
-	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	auto connection = catalog.GetConnectionPool().GetConnection();
+	auto column = LoadServerColumn(connection.GetConnection(), database, table, cached.name);
 	auto &node = column.info.type_node;
 	if (ClickhouseTypes::IsNullable(node) == nullable) {
 		return {};
 	}
 	ThrowIfNotRewritable(column, table);
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
-	auto low_cardinality = node.name == "LowCardinality" && node.children.size() == 1;
-	auto &inner = low_cardinality ? node.children[0] : node;
-	string type;
+	auto wrappers = ClickhouseTypeWrappers::Of(node);
 	if (nullable) {
-		if (!CanBeNullable(inner)) {
+		if (!CanBeNullable(wrappers.base)) {
 			throw NotImplementedException("Column \"%s\" (%s) cannot be Nullable in ClickHouse", column.info.name,
 			                              column.info.clickhouse_type);
 		}
-		type = "Nullable(" + inner.text + ")";
 	} else {
-		if (inner.name != "Nullable" || inner.children.size() != 1) {
+		if (!wrappers.nullable) {
+			// Nullable inside another wrapper, e.g. SimpleAggregateFunction(any, Nullable(Int32))
 			throw NotImplementedException("Column \"%s\" (%s) cannot be made NOT NULL through ALTER TABLE; change it "
 			                              "with clickhouse_execute() instead",
 			                              column.info.name, column.info.clickhouse_type);
 		}
 		// converting a NULL to a non-Nullable type fails the mutation, which then blocks the table
-		auto nulls =
-		    CountStoredRows(catalog, qualified, ClickhouseUtils::QuoteIdentifier(column.info.name) + " IS NULL");
+		auto nulls = CountStoredRows(connection.GetConnection(), qualified,
+		                             ClickhouseUtils::QuoteIdentifier(column.info.name) + " IS NULL");
 		if (nulls > 0) {
 			throw ConstraintException(
 			    "NOT NULL constraint failed: %s.%s (%d stored row(s) of the ClickHouse table hold "
@@ -428,12 +499,9 @@ static ClickhouseAlterStatement ChangeNullability(ClickhouseCatalog &catalog, co
 			    "purges those); nothing was changed",
 			    table.name, column.info.name, nulls);
 		}
-		type = inner.children[0].text;
 	}
-	if (low_cardinality) {
-		type = "LowCardinality(" + type + ")";
-	}
-	return {ModifyColumn(qualified, column.info, type), true};
+	wrappers.nullable = nullable;
+	return {ModifyColumn(qualified, column.info, wrappers.Wrap(wrappers.base.text)), true};
 }
 
 //! The USING-less form: DuckDB's parser makes it CAST(<column> AS <target type>)
@@ -462,6 +530,93 @@ static bool IsNested(const LogicalType &type) {
 	}
 }
 
+//! Bits and signedness of an integer type; false for any other type
+static bool GetIntegerRange(const LogicalType &type, idx_t &bits, bool &is_signed) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::UTINYINT:
+		bits = 8;
+		break;
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::USMALLINT:
+		bits = 16;
+		break;
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UINTEGER:
+		bits = 32;
+		break;
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UBIGINT:
+		bits = 64;
+		break;
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		bits = 128;
+		break;
+	default:
+		return false;
+	}
+	is_signed = type.IsSigned();
+	return true;
+}
+
+//! Decimal digits of the largest magnitude an integer type holds: 255 or -128, ..., 18446744073709551615
+static idx_t IntegerDigits(idx_t bits, bool is_signed) {
+	switch (bits) {
+	case 8:
+		return 3;
+	case 16:
+		return 5;
+	case 32:
+		return 10;
+	case 64:
+		return is_signed ? 19 : 20;
+	default:
+		return 39;
+	}
+}
+
+//! Whether ClickHouse's MODIFY COLUMN turns every value of `source` into what DuckDB's ALTER makes of it: the same
+//! value, or for VARCHAR the same text. A closed list, each pair checked on ClickHouse 25.8 at the bounds of its
+//! source type and with NULL. Everything else -- narrowing, rounding, parsing strings, time zones -- is refused
+//! whatever the stored values, since ClickHouse converts out-of-range values without an error (3000000000 to Int32,
+//! -1 to UInt32, 12345.67 into Decimal(4, 2), 1900-01-01 to DateTime)
+static bool KeepsEveryValue(const LogicalType &source, const LogicalType &target) {
+	idx_t source_bits = 0;
+	bool source_signed = false;
+	auto integer_source = GetIntegerRange(source, source_bits, source_signed);
+	switch (target.id()) {
+	case LogicalTypeId::VARCHAR:
+		return !target.IsJSONType() &&
+		       (integer_source || source.id() == LogicalTypeId::DATE || source.id() == LogicalTypeId::ENUM);
+	case LogicalTypeId::FLOAT:
+		// every integer below 2^24 is a float
+		return integer_source && source_bits <= 16;
+	case LogicalTypeId::DOUBLE:
+		// every integer below 2^53 is a double
+		return source.id() == LogicalTypeId::FLOAT || (integer_source && source_bits <= 32);
+	case LogicalTypeId::DECIMAL: {
+		auto integer_digits = DecimalType::GetWidth(target) - DecimalType::GetScale(target);
+		if (integer_source) {
+			return integer_digits >= IntegerDigits(source_bits, source_signed);
+		}
+		return source.id() == LogicalTypeId::DECIMAL &&
+		       DecimalType::GetScale(target) >= DecimalType::GetScale(source) &&
+		       integer_digits >= DecimalType::GetWidth(source) - DecimalType::GetScale(source);
+	}
+	case LogicalTypeId::TIMESTAMP:
+		// midnight; DateTime64(6) holds all of Date32's range. Not TIMESTAMPTZ: DuckDB takes midnight in the session's
+		// time zone
+		return source.id() == LogicalTypeId::DATE;
+	default: {
+		idx_t target_bits = 0;
+		bool target_signed = false;
+		return integer_source && GetIntegerRange(target, target_bits, target_signed) && target_bits > source_bits &&
+		       (target_signed || !source_signed);
+	}
+	}
+}
+
 static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const string &database,
                                            const ClickhouseTableEntry &table, ChangeColumnTypeInfo &info) {
 	auto &cached = RequireColumn(table, info.column_name);
@@ -469,7 +624,11 @@ static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const str
 		throw NotImplementedException("ALTER COLUMN … TYPE … USING is not supported for ClickHouse tables; convert "
 		                              "the column with clickhouse_execute() instead");
 	}
-	auto column = LoadServerColumn(catalog, database, table, cached.name);
+	ClickhouseServerColumn column;
+	{
+		auto connection = catalog.GetConnectionPool().GetConnection();
+		column = LoadServerColumn(connection.GetConnection(), database, table, cached.name);
+	}
 	auto &source = column.info.type;
 	auto &target = info.target_type;
 	if (source == target) {
@@ -477,54 +636,35 @@ static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const str
 	}
 	auto &name = column.info.name;
 	if (IsNested(source) || IsNested(target)) {
-		// an element that does not convert becomes NULL (['1', 'x'] to [1, NULL]), which no check here can see
+		// an element that does not convert becomes NULL (['1', 'x'] to [1, NULL])
 		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": only scalar "
 		                              "columns can change type through ALTER TABLE; use clickhouse_execute() instead",
 		                              name, table.name);
 	}
-	// the DuckDB-level cast is only what ClickHouse does if the column holds exactly the type DuckDB reads it as:
-	// not, e.g., FixedString (VARCHAR), BFloat16 (FLOAT) or IPv4 (VARCHAR)
-	auto &node = column.info.type_node;
-	auto low_cardinality = node.name == "LowCardinality" && node.children.size() == 1;
-	auto &unwrapped_once = low_cardinality ? node.children[0] : node;
-	auto &base = unwrapped_once.name == "Nullable" && unwrapped_once.children.size() == 1 ? unwrapped_once.children[0]
-	                                                                                      : unwrapped_once;
-	string canonical;
-	try {
-		canonical = ClickhouseDdlTypes::ToClickhouse(source, false);
-	} catch (NotImplementedException &) {
+	if (!KeepsEveryValue(source, target)) {
+		throw NotImplementedException(
+		    "Cannot change the type of column \"%s\" of ClickHouse table \"%s\" from %s to %s: only conversions that "
+		    "keep every value exactly are supported (to a wider integer, DECIMAL or floating-point type that holds "
+		    "every value, FLOAT to DOUBLE, integers, DATE and ENUM to VARCHAR, DATE to TIMESTAMP); convert the column "
+		    "with clickhouse_execute() instead",
+		    name, table.name, source.ToString(), target.ToString());
 	}
-	if (base.text != canonical && !(source.id() == LogicalTypeId::DATE && base.name == "Date")) {
+	// the DuckDB-level conversion is only what ClickHouse does if the column holds exactly the type DuckDB reads it
+	// as: not, e.g., BFloat16 (FLOAT). An enum converts by label whatever its values
+	auto wrappers = ClickhouseTypeWrappers::Of(column.info.type_node);
+	auto &base = wrappers.base;
+	auto canonical = source.id() == LogicalTypeId::ENUM ? string() : ClickhouseDdlTypes::ToClickhouse(source, false);
+	auto stored_exactly = base.text == canonical || (source.id() == LogicalTypeId::DATE && base.name == "Date") ||
+	                      (source.id() == LogicalTypeId::ENUM && (base.name == "Enum8" || base.name == "Enum16"));
+	if (!stored_exactly) {
 		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": its "
 		                              "ClickHouse type %s is not one DuckDB converts exactly; use clickhouse_execute() "
 		                              "instead",
 		                              name, table.name, column.info.clickhouse_type);
 	}
-	try {
-		ClickhouseExpression::CheckPlainCast(source, target);
-	} catch (NotImplementedException &ex) {
-		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\" from %s to "
-		                              "%s: %s",
-		                              name, table.name, source.ToString(), target.ToString(),
-		                              ErrorData(ex).RawMessage());
-	}
 	ThrowIfNotRewritable(column, table);
-	auto nullable = ClickhouseTypes::IsNullable(node);
-	auto type = ClickhouseDdlTypes::ToClickhouse(target, nullable);
-	// a value that does not convert fails the mutation of a non-Nullable column (and the stuck mutation leaves the
-	// table unreadable), or silently becomes NULL in a Nullable one (CAST('x' AS Nullable(Int32)) is NULL)
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
-	auto quoted = ClickhouseUtils::QuoteIdentifier(name);
-	auto failures = CountStoredRows(catalog, qualified,
-	                                quoted + " IS NOT NULL AND CAST(" + quoted + " AS " +
-	                                    ClickhouseDdlTypes::ToClickhouse(target, true) + ") IS NULL");
-	if (failures > 0) {
-		throw InvalidInputException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\" to %s: %d "
-		                            "stored value(s) do not convert (counting deleted rows not purged yet: ALTER "
-		                            "TABLE … APPLY DELETED MASK purges those); nothing was changed",
-		                            name, table.name, target.ToString(), failures);
-	}
-	return {ModifyColumn(qualified, column.info, type), true};
+	return {ModifyColumn(qualified, column.info, wrappers.Wrap(ClickhouseDdlTypes::ToClickhouse(target, false))), true};
 }
 
 ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, ClickhouseCatalog &catalog,

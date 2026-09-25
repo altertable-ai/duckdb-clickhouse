@@ -675,5 +675,56 @@ SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.mem');
 ----
 0
 
+# ---------------------------------------------------------------------------
+# a cast from VARCHAR to another type on a column is rejected: ClickHouse turns a string it cannot parse into NULL,
+# where DuckDB fails the statement (and would delete nothing). Constants are folded by DuckDB
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.vs (id Int32, s String, i Int32, d Date32) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.vs VALUES (1, '1', 1, '2024-01-01'), (2, 'abc', 2, '2024-01-02'), (3, '2.5', 3, '2024-01-03'), (4, '4', 4, '2024-01-04');
+
+statement error
+SELECT count(*) FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) IS NULL;
+----
+Could not convert string 'abc' to INT32
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) IS NULL;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE CAST(s AS INTEGER) = 1;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE s::DATE = d OR s::BOOLEAN;
+----
+has no exact ClickHouse translation
+
+statement error
+DELETE FROM ch.w_dml.vs WHERE i = s;
+----
+cast from VARCHAR to INTEGER has no exact ClickHouse translation
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vs ORDER BY id)');
+----
+[1, 2, 3, 4]
+
+# string constants: folded into literals of the column's type by DuckDB
+query I
+DELETE FROM ch.w_dml.vs WHERE i = '1' OR d = '2024-01-02' OR i IN ('3', '9');
+----
+3
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.vs ORDER BY id)');
+----
+[4]
+
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml');
