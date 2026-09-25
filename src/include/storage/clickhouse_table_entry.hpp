@@ -34,6 +34,12 @@ public:
 	const string &GetEngine() const {
 		return engine;
 	}
+	//! ClickHouse engines that are not tables (View, MaterializedView, LiveView, WindowView, Dictionary): DROP TABLE,
+	//! ALTER TABLE, UPDATE and DELETE refuse them
+	bool IsViewLike() const;
+	//! "dictionary" for the Dictionary engine, "view" for the other view-like engines -- shared error-message wording
+	//! between DROP TABLE, ALTER TABLE, UPDATE and DELETE
+	string ViewLikeKind() const;
 
 private:
 	vector<ClickhouseColumnInfo> clickhouse_columns;

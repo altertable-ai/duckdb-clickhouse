@@ -13,10 +13,12 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "storage/clickhouse_ddl.hpp"
+#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_insert.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 #include "storage/clickhouse_table_entry.hpp"
@@ -206,6 +208,12 @@ PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &context, Physical
 	auto &insert = planner.Make<ClickhouseInsert>(op, table, std::move(columns));
 	insert.children.push_back(*plan);
 	return insert;
+}
+
+PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                LogicalDelete &op) {
+	ThrowIfReadOnly();
+	return planner.Make<ClickhouseDmlOperator>(op, ClickhouseDml::PlanDelete(op));
 }
 
 PhysicalOperator &ClickhouseCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &, LogicalDelete &,

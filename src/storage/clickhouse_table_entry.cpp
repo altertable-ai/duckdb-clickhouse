@@ -24,6 +24,15 @@ void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
 	                            schema.name, name, column_collision);
 }
 
+bool ClickhouseTableEntry::IsViewLike() const {
+	return engine == "View" || engine == "MaterializedView" || engine == "LiveView" || engine == "WindowView" ||
+	       engine == "Dictionary";
+}
+
+string ClickhouseTableEntry::ViewLikeKind() const {
+	return engine == "Dictionary" ? "dictionary" : "view";
+}
+
 unique_ptr<BaseStatistics> ClickhouseTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
 	return nullptr;
 }

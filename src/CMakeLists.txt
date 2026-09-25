@@ -8,6 +8,7 @@ add_library(
   clickhouse_ddl_types.cpp
   clickhouse_error_codes.cpp
   clickhouse_execute.cpp
+  clickhouse_expression.cpp
   clickhouse_filter_pushdown.cpp
   clickhouse_query.cpp
   clickhouse_scanner.cpp

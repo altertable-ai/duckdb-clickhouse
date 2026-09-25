@@ -21,11 +21,6 @@ UPDATE ch.test_db.t1 SET name = 'x';
 UPDATE is not supported on attached ClickHouse databases yet
 
 statement error
-DELETE FROM ch.test_db.t1;
-----
-DELETE is not supported on attached ClickHouse databases yet
-
-statement error
 ALTER TABLE ch.test_db.t1 ALTER COLUMN name TYPE INTEGER;
 ----
 is not supported for ClickHouse tables

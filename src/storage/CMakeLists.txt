@@ -5,6 +5,7 @@ add_library(
   clickhouse_clear_cache.cpp
   clickhouse_connection_pool.cpp
   clickhouse_ddl.cpp
+  clickhouse_dml.cpp
   clickhouse_insert.cpp
   clickhouse_optimizer.cpp
   clickhouse_schema_entry.cpp

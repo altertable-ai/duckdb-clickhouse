@@ -1,7 +1,7 @@
 #include "storage/clickhouse_ddl.hpp"
 
 #include "clickhouse_ddl_types.hpp"
-#include "clickhouse_filter_pushdown.hpp"
+#include "clickhouse_expression.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
@@ -17,46 +17,6 @@
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
-
-//! A constant DEFAULT value as a ClickHouse literal
-static string LiteralSql(const Value &value, const string &column_name) {
-	if (value.IsNull()) {
-		return "NULL";
-	}
-	// the whole translation -- including the TIMESTAMP family, which itself calls into TransformConstant() and can
-	// throw for an infinite timestamp -- is wrapped in one try/catch, so every unsupported DEFAULT (not just the
-	// default: branch) gets this DEFAULT-specific message instead of TransformConstant's filter-pushdown wording
-	try {
-		switch (value.type().id()) {
-		case LogicalTypeId::FLOAT:
-		case LogicalTypeId::DOUBLE: {
-			auto number = value.GetValue<double>();
-			if (std::isnan(number)) {
-				return "nan";
-			}
-			if (std::isinf(number)) {
-				return number > 0 ? "inf" : "-inf";
-			}
-			return value.ToString();
-		}
-		case LogicalTypeId::UUID:
-			return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_SEC:
-		case LogicalTypeId::TIMESTAMP_MS:
-		case LogicalTypeId::TIMESTAMP_NS:
-			// naive timestamps are stored as UTC (see ClickhouseDdlTypes)
-			return ClickhouseFilterPushdown::TransformConstant(
-			    Value::TIMESTAMPTZ(timestamp_tz_t(value.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>())));
-		default:
-			return ClickhouseFilterPushdown::TransformConstant(value);
-		}
-	} catch (NotImplementedException &) {
-		throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
-		                              "ClickHouse literal; create the table with clickhouse_execute() instead",
-		                              value.ToString(), column_name, value.type().ToString());
-	}
-}
 
 string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefinition &column) {
 	if (!column.HasDefaultValue()) {
@@ -81,7 +41,15 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 		                              column.Name(), column.DefaultValue().ToString());
 	}
 	auto value = ExpressionExecutor::EvaluateScalar(context, *bound);
-	return " DEFAULT " + LiteralSql(value, column.Name());
+	// every unsupported DEFAULT -- including an infinite timestamp, which TransformConstant() refuses -- gets this
+	// DEFAULT-specific message instead of the literal writer's own wording
+	try {
+		return " DEFAULT " + ClickhouseExpression::Literal(value);
+	} catch (NotImplementedException &) {
+		throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
+		                              "ClickHouse literal; create the table with clickhouse_execute() instead",
+		                              value.ToString(), column.Name(), value.type().ToString());
+	}
 }
 
 string ClickhouseDdl::ColumnSql(ClientContext &context, const ColumnDefinition &column, bool nullable) {

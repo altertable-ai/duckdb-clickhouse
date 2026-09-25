@@ -1,0 +1,216 @@
+# name: test/sql/write/dml_delete.test
+# description: DELETE and TRUNCATE on attached ClickHouse tables, translated into single ClickHouse statements
+# group: [write]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS w_dml');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE w_dml');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.t (id Int32, name String, v Nullable(Float64), tag Enum8(''a'' = 1, ''b'' = 2)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, CASE WHEN range % 3 = 0 THEN NULL ELSE range * 1.5 END,
+    CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END FROM range(10);
+
+# ---------------------------------------------------------------------------
+# DELETE … WHERE, with the affected-row count
+# ---------------------------------------------------------------------------
+# a filter pushed into the scan (table_filters)
+query I
+DELETE FROM ch.w_dml.t WHERE id = 3;
+----
+1
+
+# a non-dense IN list becomes an OPTIONAL_FILTER hint plus a LogicalFilter: nothing may be dropped
+query I
+DELETE FROM ch.w_dml.t WHERE id IN (1, 5, 9);
+----
+3
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.t;
+----
+[0, 2, 4, 6, 7, 8]
+
+# a filter on a type the scan does not push (Float64): stays in a LogicalFilter
+query I
+DELETE FROM ch.w_dml.t WHERE v > 10.0;
+----
+2
+
+# functions, LIKE, OR
+query I
+DELETE FROM ch.w_dml.t WHERE lower(name) LIKE 'n2%' OR starts_with(name, 'n6');
+----
+2
+
+# IS NULL, enum comparison, BETWEEN, arithmetic
+query I
+DELETE FROM ch.w_dml.t WHERE v IS NULL AND tag = 'a' AND id + 1 BETWEEN 1 AND 5;
+----
+1
+
+query I
+SELECT list(id ORDER BY id) FROM ch.w_dml.t;
+----
+[4]
+
+# ClickHouse's own view agrees
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM w_dml.t ORDER BY id)');
+----
+[4]
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 100;
+----
+0
+
+# the same with filter pushdown off: the predicate arrives as a LogicalFilter only
+statement ok
+SET ch_filter_pushdown = false;
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 4 AND name = 'n4';
+----
+1
+
+statement ok
+RESET ch_filter_pushdown;
+
+# ---------------------------------------------------------------------------
+# DELETE without WHERE and TRUNCATE -> TRUNCATE TABLE
+# ---------------------------------------------------------------------------
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, NULL, 'a' FROM range(5);
+
+query I
+DELETE FROM ch.w_dml.t;
+----
+5
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.t');
+----
+0
+
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, NULL, 'a' FROM range(3);
+
+query I
+TRUNCATE ch.w_dml.t;
+----
+3
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+0
+
+# ---------------------------------------------------------------------------
+# rejected: nothing runs, nothing changes
+# ---------------------------------------------------------------------------
+statement ok
+INSERT INTO ch.w_dml.t SELECT range::INTEGER, 'n' || range, range * 1.0, 'b' FROM range(4);
+
+statement error
+DELETE FROM ch.w_dml.t WHERE md5(name) = 'x';
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t WHERE id IN (SELECT 1);
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t USING (SELECT 1 AS k) s WHERE t.id = s.k;
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+
+# an untranslatable branch of an OR must not be dropped (that would widen the DELETE)
+statement error
+DELETE FROM ch.w_dml.t WHERE id = 0 OR md5(name) = 'x';
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+
+# NOT IN with a NULL differs between DuckDB and ClickHouse: rejected
+statement error
+DELETE FROM ch.w_dml.t WHERE id NOT IN (1, NULL);
+----
+DELETE on ClickHouse tables must filter only the modified table with translatable expressions
+
+statement error
+DELETE FROM ch.w_dml.t WHERE id = 0 RETURNING id;
+----
+RETURNING is not supported for ClickHouse tables
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+4
+
+# ---------------------------------------------------------------------------
+# views, engines without lightweight DELETE, transactions
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE VIEW w_dml.v AS SELECT 1 AS one');
+
+statement error
+DELETE FROM ch.w_dml.v WHERE one = 1;
+----
+is a ClickHouse view
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.mem (id Int32) ENGINE = Memory');
+
+statement ok
+INSERT INTO ch.w_dml.mem VALUES (1), (2);
+
+statement error
+DELETE FROM ch.w_dml.mem WHERE id = 1;
+----
+ClickHouse error
+
+statement ok
+CALL enable_logging(level = 'warning');
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM ch.w_dml.t WHERE id = 0;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ch.w_dml.t;
+----
+3
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%cannot be rolled back (database "ch")%';
+----
+1
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE w_dml');

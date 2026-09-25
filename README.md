@@ -184,6 +184,18 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
   and `ORDER BY tuple()` for MergeTree engines), then streams the rows in like an `INSERT`. It is not atomic: if the
   `INSERT` part fails, the table stays, possibly with some rows.
 
+`DELETE` and `TRUNCATE` are translated into one ClickHouse statement each: `DELETE FROM … WHERE …` (a synchronous
+lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
+`SELECT count()` run just before the statement, so it can be off if other clients write at the same time.
+
+- The `WHERE` clause must only use the modified table's columns, constants, comparisons, `AND`/`OR`/`NOT`,
+  `IS [NOT] NULL`, `IN`/`NOT IN` lists without `NULL`, `BETWEEN`, arithmetic, `LIKE`/`ILIKE`, `starts_with`,
+  `ends_with`, `contains`, `lower`, `upper`, `length`, `coalesce`, `CASE` and `CAST`. Anything else — other
+  functions, subqueries, `USING`, `RETURNING`, prepared-statement parameters (`?`, `$1`) — is rejected before
+  anything runs; use `clickhouse_execute`.
+- The translated statement follows ClickHouse semantics where they differ from DuckDB's (e.g. `NaN` comparisons,
+  `UUID` ordering, integer division and division by zero).
+
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:
 
@@ -208,7 +220,7 @@ single-threaded scan.
 
 ## Limitations
 
-- `UPDATE` and `DELETE` are not supported yet; run them with `clickhouse_execute()`.
+- `UPDATE` is not supported yet; run it with `clickhouse_execute()`.
   `MERGE INTO`, indexes and `CREATE VIEW` are not supported.
 - Attach with `(TYPE clickhouse, READ_ONLY)` to reject every write.
 - ClickHouse has no multi-statement transactions. Two scans in one DuckDB transaction may see different data.
