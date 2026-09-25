@@ -55,8 +55,8 @@ public:
 	//!
 	//! An IN-list MARK join is what DuckDB's InClauseRewriter makes of `x [NOT] IN (<5 or more constants>)`: a MARK
 	//! join of the input with a LogicalColumnDataGet of the constants on `x = <constant column>`, whose mark column a
-	//! LogicalFilter above uses as its whole expression (IN) or under a NOT (NOT IN). It translates to x [NOT] IN
-	//! (...); any deviation from exactly that shape rejects the statement
+	//! LogicalFilter above uses as its whole expression (IN) or under a NOT (NOT IN). It translates through
+	//! ClickhouseExpression::InList; any deviation from exactly that shape rejects the statement
 	static ClickhouseDmlTarget AnalyzeTarget(const string &statement, TableCatalogEntry &table,
 	                                         LogicalOperator &child);
 	//! ClickHouse SQL for output column `index` of `op` (a LogicalGet, LogicalFilter, LogicalProjection or an IN-list
@@ -71,8 +71,8 @@ public:
 	                                               const string &reason);
 	//! "db"."t", for errors
 	static string DisplayName(const TableCatalogEntry &table);
-	//! Query settings the count and the statement both run with, whatever the ATTACH's settings= holds: the ClickHouse
-	//! behaviour the translation relies on (transform_null_in = 0)
+	//! Query settings the count and the statement both run with, whatever the ATTACH's settings= holds
+	//! (transform_null_in = 0). Only the count depends on them: the translated predicate does not (see InList)
 	static vector<std::pair<string, string>> SemanticSettings();
 };
 

@@ -63,6 +63,11 @@ string ClickhouseExpression::Literal(const Value &value) {
 	}
 }
 
+string ClickhouseExpression::InList(const string &left, const vector<string> &values, bool negated) {
+	return "if(isNull(" + left + "), NULL, (" + left + (negated ? " NOT IN (" : " IN (") +
+	       StringUtil::Join(values, ", ") + ")))";
+}
+
 //! TIMESTAMP WITH TIME ZONE and TIME WITH TIME ZONE: every cast to or from another type (DATE, TIMESTAMP, VARCHAR,
 //! TIME, ...) goes through a time zone
 static bool IsTimeZoneDependent(const LogicalType &type) {
@@ -487,8 +492,7 @@ static string TranslateOperator(const BoundOperatorExpression &op, const std::fu
 			}
 			values.push_back(arg(i));
 		}
-		auto keyword = op.GetExpressionType() == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (";
-		return "(" + arg(0) + keyword + StringUtil::Join(values, ", ") + "))";
+		return ClickhouseExpression::InList(arg(0), values, op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN);
 	}
 	case ExpressionType::OPERATOR_COALESCE: {
 		vector<string> values;

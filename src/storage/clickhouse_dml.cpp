@@ -39,10 +39,10 @@ string ClickhouseDml::DisplayName(const TableCatalogEntry &table) {
 }
 
 vector<std::pair<string, string>> ClickhouseDml::SemanticSettings() {
-	// the translation relies on ClickHouse's defaults for these, whatever the ATTACH's settings= says:
-	// transform_null_in = 1 would make x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept). It is the
-	// count query that needs it: on ClickHouse 25.8, DELETE and ALTER TABLE … UPDATE ignore transform_null_in,
-	// whether it comes from the query's settings or from the server's default profile
+	// transform_null_in = 1 would make a bare x NOT IN (...) true for a NULL x (DuckDB: NULL, the row is kept).
+	// ClickhouseExpression::InList guards every IN / NOT IN against it, in the count and the statement alike. The pin
+	// reaches only the count, an ordinary query: DELETE and ALTER TABLE … UPDATE run with the server's default
+	// profile as loaded at startup, whatever the query's settings say
 	return {{"transform_null_in", "0"}};
 }
 
@@ -245,7 +245,7 @@ static optional_ptr<const LogicalComparisonJoin> FindMarkJoin(const LogicalOpera
 
 //! A LogicalFilter expression over `input` that is exactly an IN-list mark column (IN) or NOT of one (NOT IN), as
 //! `<x> [NOT] IN (<constants>)`; "" for any other expression. The mark is NULL when x is NULL (no NULL constants,
-//! which are rejected), as is ClickHouse's x [NOT] IN (...) with transform_null_in = 0 (see SemanticSettings)
+//! which are rejected), as is ClickhouseExpression::InList
 static string TranslateInListFilter(const Expression &expr, const LogicalOperator &input) {
 	auto inner = &expr;
 	bool negated = false;
@@ -283,7 +283,7 @@ static string TranslateInListFilter(const Expression &expr, const LogicalOperato
 	if (values.empty()) {
 		throw NotImplementedException(IN_LIST_JOIN);
 	}
-	return "(" + left + (negated ? " NOT IN (" : " IN (") + StringUtil::Join(values, ", ") + "))";
+	return ClickhouseExpression::InList(left, values, negated);
 }
 
 //! Whether any expression in the plan is (or holds) a prepared-statement parameter
@@ -603,7 +603,7 @@ SourceResultType ClickhouseDmlOperator::GetDataInternal(ExecutionContext &contex
 		auto &catalog =
 		    ClickhouseCatalog::GetAttachedDatabase(context.client, statement.catalog_name, statement.description);
 		auto connection = catalog.StartWrite(context.client);
-		// the count runs with the same semantic settings as the statement, so both select the same rows
+		// the count is an ordinary query, which an ATTACH's settings= would reach without SemanticSettings
 		for (auto &block : connection->Query(statement.count_sql, ClickhouseDml::SemanticSettings())) {
 			if (block.GetRowCount() == 0) {
 				continue;

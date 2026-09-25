@@ -504,7 +504,7 @@ SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(dec), groupArray(i), gro
 # truncates toward zero: 1969-12-31 23:59:59.999999 would become 1970-01-01 00:00:00.000)
 # ---------------------------------------------------------------------------
 statement ok
-CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts (id Int32, src Nullable(DateTime64(6, ''UTC'')), t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC''), arr Array(DateTime64(3, ''UTC'')), arr2 Array(DateTime64(3, ''UTC''))) ENGINE = MergeTree ORDER BY id');
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.ts (id Int32, src Nullable(DateTime64(6, ''UTC'')), t3 Nullable(DateTime64(3, ''UTC'')), t5 DateTime64(5, ''Asia/Tokyo''), t0 DateTime(''UTC''), arr Array(DateTime64(3, ''UTC'')), arr2 Array(DateTime64(3, ''UTC'')), tup Tuple(a DateTime64(3, ''UTC'')), tup2 Tuple(a DateTime64(3, ''UTC'')), mp Map(String, DateTime(''UTC'')), mp2 Map(String, DateTime(''UTC''))) ENGINE = MergeTree ORDER BY id');
 
 statement ok
 CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.ts (id, src, t3) VALUES (1, ''1969-12-31 23:59:59.9995'', ''2000-01-01 00:00:00''), (2, ''1969-12-31 23:59:59.999999'', ''2000-01-01 00:00:00''), (3, ''1969-12-31 23:59:59.999'', ''2000-01-01 00:00:00''), (4, ''2024-06-01 12:00:00.123999'', ''2000-01-01 00:00:00''), (5, ''2024-06-01 12:00:00.123'', ''2000-01-01 00:00:00''), (6, NULL, ''2000-01-01 00:00:00'')');
@@ -556,16 +556,54 @@ SELECT count(*) FROM ch.w_dml2.ts u JOIN ch.w_dml2.ts_ins i USING (id) WHERE u.t
 ----
 6
 
+# literals (fromUnixTimestamp64Micro) are floored too
+query I
+UPDATE ch.w_dml2.ts SET t3 = NULL WHERE id = 5;
+----
+1
+
+query I
+UPDATE ch.w_dml2.ts SET t3 = TIMESTAMPTZ '1969-12-31 23:59:59.9995+00' WHERE id = 4;
+----
+1
+
+query I
+UPDATE ch.w_dml2.ts SET t0 = TIMESTAMPTZ '2024-01-01 00:00:00.9+00' WHERE id = 4;
+----
+1
+
+query III
+SELECT id, t3, t0 FROM ch.w_dml2.ts WHERE id IN (4, 5) ORDER BY id;
+----
+4	1969-12-31 23:59:59.999+00	2024-01-01 00:00:00+00
+5	NULL	2024-06-01 12:00:00+00
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(t3), toString(t0) FROM w_dml2.ts WHERE id IN (4, 5) ORDER BY id');
+----
+4	1969-12-31 23:59:59.999	2024-01-01 00:00:00
+5	NULL	2024-06-01 12:00:00
+
 # nested in an Array, Tuple or Map, such timestamps are rejected
 statement error
 UPDATE ch.w_dml2.ts SET arr = arr2 WHERE id = 1;
 ----
 whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
 
-query I
-SELECT * FROM clickhouse_query('ch', 'SELECT countIf(empty(arr)) FROM w_dml2.ts');
+statement error
+UPDATE ch.w_dml2.ts SET tup = tup2 WHERE id = 1;
 ----
-6
+SET of column "tup" (Tuple(a DateTime64(3, 'UTC'))), whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+statement error
+UPDATE ch.w_dml2.ts SET mp = mp2 WHERE id = 1;
+----
+SET of column "mp" (Map(String, DateTime('UTC'))), whose DateTime elements ClickHouse's CAST would truncate toward zero where an INSERT floors them
+
+query III
+SELECT * FROM clickhouse_query('ch', 'SELECT countIf(empty(arr)), countIf(tup.a = toDateTime64(0, 3, ''UTC'')), countIf(empty(mp)) FROM w_dml2.ts');
+----
+6	6	6
 
 statement ok
 CALL clickhouse_execute('ch', 'DROP DATABASE w_dml2');

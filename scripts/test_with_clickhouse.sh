@@ -5,6 +5,9 @@
 # exports the CLICKHOUSE_TEST_* variables read by `require-env` in the tests, runs the tests and removes the container
 # on exit, whatever happens. Used unchanged locally and in CI.
 #
+# A second, fixture-less server (CLICKHOUSE_TEST_TN_PORT) runs with transform_null_in = 1 in its default profile,
+# loaded at startup (scripts/clickhouse/transform_null_in.xml): mutations take that setting from the profile only.
+#
 # Usage: scripts/test_with_clickhouse.sh [unittest arguments...]
 #   no arguments  runs every test under test/
 #   arguments     are passed to the unittest binary, e.g. test/sql/scan/scalars.test
@@ -19,6 +22,7 @@ cd "${ROOT}"
 
 IMAGE="${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.8}"
 CONTAINER_NAME="clickhouse-scanner-test"
+TN_CONTAINER_NAME="clickhouse-scanner-test-tn"
 BUILD="${SMOKE_BUILD:-release}"
 UNITTEST="./build/${BUILD}/test/unittest"
 CH_USER="duckdb"
@@ -35,8 +39,8 @@ fi
 
 ./scripts/generate_test_certs.sh
 
-# remove a leftover container from an earlier run
-docker rm -f "${CONTAINER_NAME}" &>/dev/null || true
+# remove leftover containers from an earlier run
+docker rm -f "${CONTAINER_NAME}" "${TN_CONTAINER_NAME}" &>/dev/null || true
 
 echo "==> Starting ${IMAGE} ..."
 docker run -d --name "${CONTAINER_NAME}" \
@@ -52,43 +56,59 @@ docker run -d --name "${CONTAINER_NAME}" \
 
 cleanup() {
   if [[ "${CLICKHOUSE_TEST_KEEP:-}" == "1" ]]; then
-    echo "==> Keeping container ${CONTAINER_NAME} (CLICKHOUSE_TEST_KEEP=1)"
+    echo "==> Keeping containers ${CONTAINER_NAME} and ${TN_CONTAINER_NAME} (CLICKHOUSE_TEST_KEEP=1)"
   else
-    echo "==> Removing container ${CONTAINER_NAME} ..."
-    docker rm -f "${CONTAINER_NAME}" &>/dev/null || true
+    echo "==> Removing containers ${CONTAINER_NAME} and ${TN_CONTAINER_NAME} ..."
+    docker rm -f "${CONTAINER_NAME}" "${TN_CONTAINER_NAME}" &>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-ch_client() {
-  docker exec -i "${CONTAINER_NAME}" clickhouse-client --user "${CH_USER}" --password "${CH_PASSWORD}" "$@"
+docker run -d --name "${TN_CONTAINER_NAME}" \
+  -p "127.0.0.1::9000" \
+  -e CLICKHOUSE_USER="${CH_USER}" \
+  -e CLICKHOUSE_PASSWORD="${CH_PASSWORD}" \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v "${ROOT}/scripts/clickhouse/transform_null_in.xml:/etc/clickhouse-server/users.d/transform_null_in.xml:ro" \
+  --ulimit nofile=262144:262144 \
+  "${IMAGE}" >/dev/null
+
+ch_client_in() {
+  local container="$1"
+  shift
+  docker exec -i "${container}" clickhouse-client --user "${CH_USER}" --password "${CH_PASSWORD}" "$@"
 }
 
-echo "==> Waiting for ClickHouse to accept queries ..."
-ready=0
-for _ in $(seq 1 60); do
-  if ch_client --query "SELECT 1" &>/dev/null; then
-    ready=1
-    break
-  fi
-  sleep 1
-done
-if [[ "${ready}" != "1" ]]; then
-  echo "ERROR: ClickHouse did not become ready." >&2
-  docker logs --tail 50 "${CONTAINER_NAME}" >&2 || true
+ch_client() {
+  ch_client_in "${CONTAINER_NAME}" "$@"
+}
+
+wait_ready() {
+  echo "==> Waiting for $1 to accept queries ..."
+  for _ in $(seq 1 60); do
+    if ch_client_in "$1" --query "SELECT 1" &>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: ClickHouse ($1) did not become ready." >&2
+  docker logs --tail 50 "$1" >&2 || true
   exit 1
-fi
+}
+wait_ready "${CONTAINER_NAME}"
+wait_ready "${TN_CONTAINER_NAME}"
 
 echo "==> Loading fixtures ..."
 ch_client --multiquery < scripts/setup_clickhouse.sql
 
 host_port() {
-  docker inspect --format "{{(index (index .NetworkSettings.Ports \"$1/tcp\") 0).HostPort}}" "${CONTAINER_NAME}"
+  docker inspect --format "{{(index (index .NetworkSettings.Ports \"$1/tcp\") 0).HostPort}}" "${2:-${CONTAINER_NAME}}"
 }
 
 export CLICKHOUSE_TEST_HOST="127.0.0.1"
 export CLICKHOUSE_TEST_PORT="$(host_port 9000)"
 export CLICKHOUSE_TEST_TLS_PORT="$(host_port 9440)"
+export CLICKHOUSE_TEST_TN_PORT="$(host_port 9000 "${TN_CONTAINER_NAME}")"
 export CLICKHOUSE_TEST_USER="${CH_USER}"
 export CLICKHOUSE_TEST_PASSWORD="${CH_PASSWORD}"
 export CLICKHOUSE_TEST_CA_CERT="${ROOT}/scripts/certs/ca.crt"

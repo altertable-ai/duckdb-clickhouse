@@ -561,7 +561,8 @@ SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_dml.fl');
 0
 
 # ---------------------------------------------------------------------------
-# the ATTACH's settings= does not change which rows match: transform_null_in is pinned to 0
+# the ATTACH's settings= does not change which rows match: IN / NOT IN are guarded against a NULL left side, and the
+# count pins transform_null_in to 0
 # ---------------------------------------------------------------------------
 statement ok
 CALL clickhouse_execute('ch', 'CREATE TABLE w_dml.nn (id Int32, n Nullable(Int32)) ENGINE = MergeTree ORDER BY id');
@@ -585,10 +586,20 @@ SELECT * FROM clickhouse_query('ch', 'SELECT groupArray(id) FROM (SELECT id FROM
 ----
 [1, 2, 4, 5]
 
+# guarded against a NULL n whatever transform_null_in says, which no query setting overrides in a lightweight DELETE
+# or a mutation (see dml_transform_null_in.test)
+statement ok
+CALL clickhouse_execute('ch', 'SYSTEM FLUSH LOGS');
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT DISTINCT query FROM system.query_log WHERE type = ''QueryFinish'' AND query LIKE ''DELETE FROM `w_dml`.`nn` WHERE%(1, 2, 3, 4, 5)%''');
+----
+DELETE FROM `w_dml`.`nn` WHERE if(isNull(`n`), NULL, (`n` NOT IN (1, 2, 3, 4, 5)))
+
 statement ok
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=transform_null_in=1' AS ch_tn (TYPE clickhouse);
 
-# with transform_null_in = 1, ClickHouse itself would count (and delete) the NULL rows too
+# with transform_null_in = 1, ClickHouse itself would count the NULL rows too
 query I
 SELECT * FROM clickhouse_query('ch_tn', 'SELECT count() FROM w_dml.nn WHERE n NOT IN (1, 5, 6, 7, 8)');
 ----

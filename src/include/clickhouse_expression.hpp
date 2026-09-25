@@ -18,6 +18,10 @@ public:
 	static string Translate(const Expression &expr, const std::function<string(idx_t)> &resolve_reference);
 	//! A constant as a ClickHouse literal. Throws NotImplementedException for types without one
 	static string Literal(const Value &value);
+	//! `left` [NOT] IN (`values`, non-NULL literals), NULL for a NULL `left` like DuckDB's, whatever the server's
+	//! transform_null_in: a default-profile transform_null_in = 1 reaches mutations and lightweight DELETEs, and no
+	//! query setting overrides it there
+	static string InList(const string &left, const vector<string> &values, bool negated);
 	//! `sql` (ClickHouse SQL for a value of DuckDB type `source`) converted to `clickhouse_type` (ClickHouse's form
 	//! of DuckDB type `target`) with DuckDB's result, e.g. CAST(roundBankers(x) AS Int32) for DOUBLE to INTEGER,
 	//! where ClickHouse's CAST alone truncates. Throws NotImplementedException for a cast without an exact
