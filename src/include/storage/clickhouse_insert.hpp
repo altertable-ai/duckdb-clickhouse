@@ -42,7 +42,10 @@ public:
 	//! The INSERT target resolved at plan time: the statement BeginInsert() runs, e.g.
 	//! INSERT INTO `db`.`t` (`a`, `b`) VALUES. Empty for CTAS, see `columns`
 	string insert_sql;
-	//! CTAS only: the table to create
+	//! CTAS only: the table to create. Like `catalog_name` above, this keeps no live entry reference across planning
+	//! and execution: BoundCreateTableInfo::schema is a live SchemaCatalogEntry& that a ClearCache() between the two
+	//! could free, but only Base() (the owned CreateTableInfo, not the schema reference) is ever read again, by
+	//! PrepareTarget() -- schema is never dereferenced after planning
 	unique_ptr<BoundCreateTableInfo> create_info;
 
 	//! The columns an INSERT with this column_index_map writes (every column when the map is empty), in table order.

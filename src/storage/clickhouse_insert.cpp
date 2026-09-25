@@ -160,12 +160,39 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 	}
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, op.catalog_name, "CREATE TABLE AS");
 	auto &info = op.create_info->Base();
-	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
-	    ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.table)) {
-		gstate.skip = true;
-		return;
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+		// a fresh read: another connection (even another alias attached to the same server) may have created the
+		// table after this database's schema/table cache was last populated, and the planner routes here whenever
+		// the *cached* catalog had no such table, so the cache can be stale in exactly the case that matters
+		catalog.ClearCache();
+		if (ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.table)) {
+			gstate.skip = true;
+			return;
+		}
 	}
 	auto &table = ClickhouseDdl::CreateTable(context, catalog, op.database_name, info);
+	// IF NOT EXISTS can still race with a concurrent CREATE between the check above and here: the CREATE TABLE
+	// statement is then a no-op on the server and CreateTable() returns the pre-existing table, whose columns may
+	// not match this query at all. Inserting into it on that assumption could read past the end of the input chunk
+	// (the existing table has more columns) or silently drop trailing query columns (fewer columns), so the target
+	// is verified before it is ever built
+	auto &table_columns = table.GetClickhouseColumns();
+	bool mismatch = table_columns.size() != info.columns.LogicalColumnCount();
+	if (!mismatch) {
+		idx_t i = 0;
+		for (auto &column : info.columns.Logical()) {
+			if (!StringUtil::CIEquals(table_columns[i].name, column.Name())) {
+				mismatch = true;
+				break;
+			}
+			i++;
+		}
+	}
+	if (mismatch) {
+		throw InvalidInputException("ClickHouse table \"%s\".\"%s\" already exists with different columns; CREATE "
+		                            "TABLE … AS did not write into it",
+		                            op.database_name, info.table);
+	}
 	// every column, in query order: the CTAS input chunk has one column per created column
 	gstate.columns = ClickhouseInsert::GetInsertColumns(table, physical_index_vector_t<idx_t>());
 	gstate.insert_sql = ClickhouseInsert::BuildInsertQuery(table, gstate.columns);
@@ -184,6 +211,24 @@ unique_ptr<GlobalSinkState> ClickhouseInsert::GetGlobalSinkState(ClientContext &
 void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGlobalState &gstate) const {
 	D_ASSERT(!gstate.connection);
 	PrepareTarget(*this, context, gstate);
+	// belt-and-suspenders against a target that (despite PrepareTarget's own checks) does not match this
+	// operator's single child: every gstate.columns[i].source_index must be a valid index into its output chunk,
+	// checked here rather than trusted, so a mismatch throws instead of reading past the end of the chunk
+	D_ASSERT(!children.empty());
+	auto input_column_count = children[0].get().GetTypes().size();
+	if (gstate.columns.size() != input_column_count) {
+		throw InvalidInputException(
+		    "ClickHouse INSERT target for table \"%s\" has %d columns, but the input has %d: run CALL "
+		    "clickhouse_clear_cache() and retry",
+		    table_name, static_cast<uint64_t>(gstate.columns.size()), static_cast<uint64_t>(input_column_count));
+	}
+	for (auto &column : gstate.columns) {
+		if (column.source_index >= input_column_count) {
+			throw InvalidInputException("ClickHouse INSERT target for table \"%s\" references a column the input "
+			                            "does not have: run CALL clickhouse_clear_cache() and retry",
+			                            table_name);
+		}
+	}
 	// resolved again rather than kept from planning: see catalog_name
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, catalog_name, "INSERT");
 	gstate.connection = catalog.StartWrite(context);

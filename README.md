@@ -168,9 +168,9 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
   for DuckDB views); drop them with `clickhouse_execute`.
 - Other `ALTER TABLE` forms (changing a column's type or default, constraints) are not supported; use
   `clickhouse_execute`. Columns added with `ALTER TABLE … ADD COLUMN` are always `Nullable`.
-- `CREATE TABLE … AS SELECT` creates the table (all columns `Nullable`, `ORDER BY tuple()` for MergeTree engines),
-  then streams the rows in like an `INSERT`. It is not atomic: if the `INSERT` part fails, the table stays, possibly
-  with some rows.
+- `CREATE TABLE … AS SELECT` creates the table (scalar columns `Nullable` -- `Array`/`Tuple`/`Map`/`JSON` never are --
+  and `ORDER BY tuple()` for MergeTree engines), then streams the rows in like an `INSERT`. It is not atomic: if the
+  `INSERT` part fails, the table stays, possibly with some rows.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:

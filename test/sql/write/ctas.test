@@ -95,6 +95,59 @@ SELECT * FROM ch.w_ctas.t1;
 ----
 42
 
+# ---------------------------------------------------------------------------
+# a stale table-set cache: another alias creates the target behind ch's back
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch2 (TYPE clickhouse);
+
+# caches ch's metadata for w_ctas.exists_elsewhere as "not found"
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'ch' AND schema_name = 'w_ctas' AND table_name = 'exists_elsewhere';
+----
+0
+
+statement ok
+CALL clickhouse_execute('ch2', 'CREATE TABLE w_ctas.exists_elsewhere (id Int32, extra String) ENGINE = MergeTree ORDER BY id');
+
+# IF NOT EXISTS re-checks fresh (PrepareTarget clears ch's cache before looking) rather than trusting the stale
+# "not found", finds the table ch2 created behind ch's back, and writes nothing: the operator's own skip path,
+# since ch's plan-time cache still says the table does not exist, so DuckDB routes this to our ClickhouseInsert
+# rather than to a plain CREATE TABLE
+query I
+CREATE TABLE IF NOT EXISTS ch.w_ctas.exists_elsewhere AS SELECT 1::INTEGER AS id;
+----
+0
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_ctas.exists_elsewhere');
+----
+0
+
+# without IF NOT EXISTS, ClickHouse itself rejects the duplicate CREATE (ch's cache now knows about the table,
+# refreshed by the check above); still nothing written
+statement error
+CREATE TABLE ch.w_ctas.exists_elsewhere AS SELECT 1::INTEGER AS id;
+----
+TABLE_ALREADY_EXISTS
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM w_ctas.exists_elsewhere');
+----
+0
+
+# a plain CREATE TABLE ... AS SELECT (no IF NOT EXISTS / OR REPLACE) on a table ch already knows about also fails,
+# and t1's contents are untouched
+statement error
+CREATE TABLE ch.w_ctas.t1 AS SELECT 1::INTEGER AS other;
+----
+TABLE_ALREADY_EXISTS
+
+query I
+SELECT * FROM ch.w_ctas.t1;
+----
+42
+
 # naive timestamp family, BLOB and ENUM sources keep their values
 query I
 CREATE TABLE ch.w_ctas.types AS SELECT
