@@ -96,8 +96,10 @@ jobs:
 
       - name: ClickHouse logs
         if: failure()
-        run: docker logs --tail 200 clickhouse-scanner-test || true
+        run: |
+          docker logs --tail 200 clickhouse-scanner-test || true
+          docker logs --tail 200 clickhouse-scanner-test-tn || true
 
-      - name: Remove ClickHouse container
+      - name: Remove ClickHouse containers
         if: always()
-        run: docker rm -f clickhouse-scanner-test || true
+        run: docker rm -f clickhouse-scanner-test clickhouse-scanner-test-tn || true

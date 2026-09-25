@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# `make smoke`: run the sqllogictests against a throw-away ClickHouse container.
+# `make smoke`: run the sqllogictests against throw-away ClickHouse containers.
 #
 # Starts clickhouse/clickhouse-server on random localhost ports (native + TLS), loads scripts/setup_clickhouse.sql,
-# exports the CLICKHOUSE_TEST_* variables read by `require-env` in the tests, runs the tests and removes the container
+# exports the CLICKHOUSE_TEST_* variables read by `require-env` in the tests, runs the tests and removes the containers
 # on exit, whatever happens. Used unchanged locally and in CI.
 #
 # A second, fixture-less server (CLICKHOUSE_TEST_TN_PORT) runs with transform_null_in = 1 in its default profile,
@@ -14,7 +14,7 @@
 # Environment:
 #   SMOKE_BUILD=release|debug    which build to test (default: release)
 #   CLICKHOUSE_IMAGE             image to run (default: clickhouse/clickhouse-server:25.8)
-#   CLICKHOUSE_TEST_KEEP=1       keep the container after the run, for debugging
+#   CLICKHOUSE_TEST_KEEP=1       keep the containers after the run, for debugging
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -133,7 +133,7 @@ run_unittest() {
   return "${status}"
 }
 
-echo "==> Running ${BUILD} tests against ${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT} (TLS ${CLICKHOUSE_TEST_TLS_PORT}) ..."
+echo "==> Running ${BUILD} tests against ${CLICKHOUSE_TEST_HOST}:${CLICKHOUSE_TEST_PORT} (TLS ${CLICKHOUSE_TEST_TLS_PORT}, transform_null_in ${CLICKHOUSE_TEST_TN_PORT}) ..."
 if [[ $# -gt 0 ]]; then
   run_unittest "$@"
 else
