@@ -214,8 +214,8 @@ string ClickhouseDdl::CreateTableSql(ClientContext &context, const string &datab
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		sql += "IF NOT EXISTS ";
 	}
-	sql += ClickhouseUtils::QuoteIdentifier(database) + "." + ClickhouseUtils::QuoteIdentifier(info.table) + " (" +
-	       StringUtil::Join(columns, ", ") + ") ENGINE = " + engine;
+	sql += ClickhouseUtils::QualifiedName(database, info.table) + " (" + StringUtil::Join(columns, ", ") +
+	       ") ENGINE = " + engine;
 	if (EngineTakesOrderBy(engine)) {
 		if (primary_key.empty()) {
 			sql += " ORDER BY tuple()";

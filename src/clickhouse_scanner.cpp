@@ -115,8 +115,7 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 	}
 	string source;
 	if (bind_data.query.empty()) {
-		source = ClickhouseUtils::QuoteIdentifier(bind_data.database) + "." +
-		         ClickhouseUtils::QuoteIdentifier(bind_data.table);
+		source = ClickhouseUtils::QualifiedName(bind_data.database, bind_data.table);
 	} else {
 		// newlines, not just parentheses: a trailing line comment in the user's query would otherwise
 		// comment out the closing paren (see also ClickhouseQueryBind's DESCRIBE)

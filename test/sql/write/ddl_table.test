@@ -232,28 +232,42 @@ SELECT id, "a b", "c""d" FROM ch.w_ddl.quoting;
 1	x	2
 
 # ---------------------------------------------------------------------------
-# an ENUM label with a quote: the CREATE side (type text sent to, and echoed back by, ClickHouse) round-trips
-# correctly. INSERT/SELECT of the column's actual data is not exercised here: clickhouse-cpp 2.6.2's own type-string
-# parser (clickhouse/types/type_parser.cpp, TypeParser::NextToken's quoted-string case) does not handle a
-# backslash-escaped quote inside an Enum value list -- "TODO (nemkov): handle escaping ?" in its source -- and
-# raises "pos must be less than len" while parsing the block header, for a plain SELECT of such a column just as
-# much as for an INSERT, regardless of which extension code created the table. That is a client-library limitation
-# outside CREATE TABLE/DROP TABLE, not something introduced here
+# an ENUM label with a quote or a backslash is refused: ClickHouse accepts it, but clickhouse-cpp 2.6.2's own
+# type-string parser (clickhouse/types/type_parser.cpp, TypeParser::NextToken's quoted-string case) does not handle
+# an escaped quote inside an Enum value list and raises "pos must be less than len" on every later SELECT or INSERT
+# of the column, so the table would be unusable from DuckDB
 # ---------------------------------------------------------------------------
-statement ok
+statement error
 CREATE TABLE ch.w_ddl.enum_quote (id INTEGER PRIMARY KEY, e ENUM('it''s', 'b'));
-
-query II
-SELECT * FROM clickhouse_query('ch', 'SELECT name, type FROM system.columns WHERE database = ''w_ddl'' AND table = ''enum_quote'' ORDER BY position');
 ----
-id	Int32
-e	Nullable(Enum8('it\'s' = 1, 'b' = 2))
+contains a quote or a backslash
 
-query II
-SELECT column_name, data_type FROM information_schema.columns WHERE table_catalog = 'ch' AND table_schema = 'w_ddl' AND table_name = 'enum_quote' ORDER BY ordinal_position;
+statement error
+CREATE TABLE ch.w_ddl.enum_quote (id INTEGER PRIMARY KEY, e ENUM('back\slash', 'b'));
 ----
-id	INTEGER
-e	ENUM('it''s', 'b')
+contains a quote or a backslash
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ddl'' AND name = ''enum_quote''');
+----
+0
+
+# an unnamed STRUCT has no ClickHouse Tuple spelling that reads back as the same type
+statement error
+CREATE TABLE ch.w_ddl.unnamed_struct AS SELECT row(1, 'a') AS r;
+----
+STRUCT fields must be named for ClickHouse Tuple columns
+
+# nested, too
+statement error
+CREATE TABLE ch.w_ddl.unnamed_struct AS SELECT 1 AS id, [row(1, 'a')] AS l;
+----
+STRUCT fields must be named for ClickHouse Tuple columns
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.tables WHERE database = ''w_ddl'' AND name = ''unnamed_struct''');
+----
+0
 
 # ---------------------------------------------------------------------------
 # rejected definitions create nothing

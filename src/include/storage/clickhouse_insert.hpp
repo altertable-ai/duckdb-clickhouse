@@ -8,7 +8,7 @@ namespace duckdb {
 class ClickhouseCatalog;
 class ClickhouseTableEntry;
 class ClickhouseInsertGlobalState;
-struct BoundCreateTableInfo;
+struct CreateTableInfo;
 
 //! One column an INSERT writes: the ClickHouse column, and the input chunk column holding its values
 struct ClickhouseInsertColumn {
@@ -26,12 +26,13 @@ public:
 	//! CREATE TABLE … AS SELECT: the table is created when the statement runs (on the first row, or in Finalize
 	//! when the query yields none), then filled like an INSERT listing every column
 	ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
-	                 const string &database, unique_ptr<BoundCreateTableInfo> create_info);
+	                 const string &database, unique_ptr<CreateTableInfo> create_info);
 
 	//! The attached database (DuckDB catalog) name, resolved again when the INSERT runs. No reference to the table
-	//! entry or the catalog is kept: the entry is freed by a ClearCache() (clickhouse_clear_cache(),
-	//! clickhouse_execute(), from any connection) that can happen between planning and execution, and a
-	//! DETACH can do the same to the catalog
+	//! entry or the catalog is kept: a ClearCache() (DDL, clickhouse_clear_cache(), clickhouse_execute(), from any
+	//! connection) between planning and execution retires the entry, which then only lives until the transaction
+	//! ends -- a prepared INSERT is planned in one transaction and may run in another -- and a DETACH can free the
+	//! catalog
 	string catalog_name;
 	//! The ClickHouse database and table names, for EXPLAIN and errors
 	string database_name;
@@ -42,11 +43,8 @@ public:
 	//! The INSERT target resolved at plan time: the statement BeginInsert() runs, e.g.
 	//! INSERT INTO `db`.`t` (`a`, `b`) VALUES. Empty for CTAS, see `columns`
 	string insert_sql;
-	//! CTAS only: the table to create. Like `catalog_name` above, this keeps no live entry reference across planning
-	//! and execution: BoundCreateTableInfo::schema is a live SchemaCatalogEntry& that a ClearCache() between the two
-	//! could free, but only Base() (the owned CreateTableInfo, not the schema reference) is ever read again, by
-	//! PrepareTarget() -- schema is never dereferenced after planning
-	unique_ptr<BoundCreateTableInfo> create_info;
+	//! CTAS only: the table to create
+	unique_ptr<CreateTableInfo> create_info;
 
 	//! The columns an INSERT with this column_index_map writes (every column when the map is empty), in table order.
 	//! Throws for columns that cannot be inserted into

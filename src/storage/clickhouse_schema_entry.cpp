@@ -139,15 +139,16 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		auto drop_keyword = table.GetEngine() == "Dictionary" ? "DICTIONARY" : "VIEW";
 		throw NotImplementedException(
 		    "\"%s\" is a ClickHouse %s (engine %s), which DROP TABLE does not drop; drop it with "
-		    "clickhouse_execute('%s', 'DROP %s %s.%s') instead",
+		    "clickhouse_execute('%s', 'DROP %s %s') instead",
 		    table.name, kind, table.GetEngine(), catalog.GetName(), drop_keyword,
-		    ClickhouseUtils::QuoteIdentifier(name), ClickhouseUtils::QuoteIdentifier(table.name));
+		    ClickhouseUtils::QualifiedName(name, table.name));
 	}
 	auto sql = "DROP TABLE " + string(info.if_not_found == OnEntryNotFound::RETURN_NULL ? "IF EXISTS " : "") +
-	           ClickhouseUtils::QuoteIdentifier(name) + "." + ClickhouseUtils::QuoteIdentifier(table.name);
+	           ClickhouseUtils::QualifiedName(name, table.name);
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
+	// belt-and-braces: retirement already keeps `this` alive until this transaction ends
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
-	// `table` is freed by the cache clear inside Execute(): not used after this point
+	// the cache clear inside Execute() retires `table`: not used after this point
 	ClickhouseDdl::Execute(context, ch_catalog, sql);
 }
 

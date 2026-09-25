@@ -20,7 +20,17 @@ static string EnumTypeSql(const LogicalType &type) {
 	auto label_data = FlatVector::GetData<string_t>(labels);
 	vector<string> entries;
 	for (idx_t i = 0; i < size; i++) {
-		entries.push_back(ClickhouseUtils::QuoteLiteral(label_data[i].GetString()) + " = " + to_string(i + 1));
+		auto label = label_data[i].GetString();
+		// ClickHouse itself accepts these (escaped), but clickhouse-cpp 2.6.2's type parser cannot parse an escaped
+		// quote inside an Enum's type string, so every later SELECT or INSERT of the column would fail: refuse to
+		// create a table DuckDB could not use
+		if (label.find('\'') != string::npos || label.find('\\') != string::npos) {
+			throw NotImplementedException("ENUM label %s contains a quote or a backslash, which clickhouse-cpp cannot "
+			                              "read or write in ClickHouse Enum columns; use labels without them, or a "
+			                              "VARCHAR column",
+			                              ClickhouseUtils::QuoteLiteral(label));
+		}
+		entries.push_back(ClickhouseUtils::QuoteLiteral(label) + " = " + to_string(i + 1));
 	}
 	return (size <= 127 ? "Enum8(" : "Enum16(") + StringUtil::Join(entries, ", ") + ")";
 }
@@ -113,6 +123,13 @@ string ClickhouseDdlTypes::ToClickhouse(const LogicalType &type, bool nullable) 
 	case LogicalTypeId::STRUCT: {
 		vector<string> fields;
 		for (auto &child : StructType::GetChildTypes(type)) {
+			// an unnamed STRUCT (e.g. from row(1, 'a')): ClickHouse rejects an empty Tuple element name, and an
+			// unnamed Tuple would read back as a STRUCT with fields "1", "2", … -- a different type
+			if (child.first.empty()) {
+				throw NotImplementedException("STRUCT fields must be named for ClickHouse Tuple columns (got %s); name "
+				                              "them, e.g. {'a': 1, 'b': 'x'} instead of row(1, 'x')",
+				                              type.ToString());
+			}
 			fields.push_back(ClickhouseUtils::QuoteIdentifier(child.first) + " " + ToClickhouse(child.second, true));
 		}
 		return "Tuple(" + StringUtil::Join(fields, ", ") + ")";

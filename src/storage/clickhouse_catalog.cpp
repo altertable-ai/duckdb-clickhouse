@@ -10,6 +10,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -181,7 +182,9 @@ PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &context, P
 			                              column.Name(), column.Type().ToString());
 		}
 	}
-	auto &insert = planner.Make<ClickhouseInsert>(op, *this, op.schema.name, std::move(op.info));
+	// only the owned CreateTableInfo is kept: BoundCreateTableInfo::schema is a reference into this catalog's cache
+	auto create_info = unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(op.info->base));
+	auto &insert = planner.Make<ClickhouseInsert>(op, *this, op.schema.name, std::move(create_info));
 	insert.children.push_back(plan);
 	return insert;
 }

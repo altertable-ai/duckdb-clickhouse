@@ -6,7 +6,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_ddl.hpp"
@@ -23,10 +23,9 @@ ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator 
 }
 
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
-                                   const string &database, unique_ptr<BoundCreateTableInfo> create_info_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
-      catalog_name(catalog.GetName()), database_name(database), table_name(create_info_p->Base().table),
-      create_info(std::move(create_info_p)) {
+                                   const string &database, unique_ptr<CreateTableInfo> create_info_p)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), catalog_name(catalog.GetName()),
+      database_name(database), table_name(create_info_p->table), create_info(std::move(create_info_p)) {
 }
 
 vector<ClickhouseInsertColumn>
@@ -88,8 +87,8 @@ string ClickhouseInsert::BuildInsertQuery(ClickhouseTableEntry &table, const vec
 			select_list.push_back(input_name);
 		}
 	}
-	auto target = "INSERT INTO " + ClickhouseUtils::QuoteIdentifier(table.schema.name) + "." +
-	              ClickhouseUtils::QuoteIdentifier(table.name) + " (" + StringUtil::Join(names, ", ") + ")";
+	auto target = "INSERT INTO " + ClickhouseUtils::QualifiedName(table.schema.name, table.name) + " (" +
+	              StringUtil::Join(names, ", ") + ")";
 	if (!server_conversion) {
 		return target + " VALUES";
 	}
@@ -161,7 +160,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 		return;
 	}
 	auto &catalog = ClickhouseCatalog::GetAttachedDatabase(context, op.catalog_name, "CREATE TABLE AS");
-	auto &info = op.create_info->Base();
+	auto &info = *op.create_info;
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		// a fresh read: another connection (even another alias attached to the same server) may have created the
 		// table after this database's schema/table cache was last populated, and the planner routes here whenever

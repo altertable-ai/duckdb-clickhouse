@@ -64,6 +64,12 @@ New units follow the existing layout; each has one responsibility:
 
 Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected catalog entries through the existing retire-don't-free mechanism (`ClickhouseCatalogSet::ClearEntries`), so plans that are already bound stay safe.
 
+> **As built (Phase 2):**
+> - Invalidation is not per schema: every DDL statement, CTAS, `clickhouse_execute` and `clickhouse_clear_cache()` clears the attached database's whole cache (`ClickhouseCatalog::ClearCache()`: every schema entry, with its table set).
+> - Retire-don't-free did not exist before Phase 2; it is implemented by `ClickhouseTransactionManager`. `ClickhouseCatalogSet::ClearEntries()` hands the cleared entries to `RetireEntries()`, which stamps the batch with the id the next DuckDB transaction on that database would get. Every transaction gets a strictly increasing id when it starts, and every catalog lookup runs inside the database's transaction (`ClickhouseCatalogSet` starts it before handing out entries, including for `duckdb_tables()`-style scans). A batch is released when a transaction ends and no transaction with an id below its stamp is still active. Ids, active transactions and batches share one mutex. So an entry stays valid until every transaction that was active when it was retired has ended.
+> - A bound plan that outlives its transaction (a prepared statement) is rebound before every `EXECUTE`, because the catalog has no catalog version. The scan's bind data also owns its schema entry (`ClickhouseScanBindData::lifetime`, `GetSchemaEntryOwner`).
+> - `CREATE TABLE` / CTAS trust the cache: with a cached table of that name and no `OR REPLACE`, `CREATE TABLE` fails with "already exists … run CALL clickhouse_clear_cache()" (and `IF NOT EXISTS` sends nothing) instead of sending a `CREATE` that could silently leave an empty table where DuckDB dropped the CTAS query.
+
 ## 4. INSERT / COPY / CTAS
 
 - `ClickhouseCatalog::PlanInsert` returns `ClickhouseInsert`. DuckDB has already cast the inserted values to the columns' DuckDB types (the read-path mapping), so the writer only converts along known pairs.
@@ -81,6 +87,8 @@ Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected c
   - AggregateFunction target columns are an error.
   - Types the read path converts on the server (IPv4/IPv6, (U)Int256, Decimal P > 38, JSON/Object/Variant/Dynamic, geo types) are written as String and converted by the server: `INSERT INTO db.t (cols) SELECT <conversion>(c), … FROM input('c String, …')`. **Plan-time spike:** check that clickhouse-cpp's `BeginInsert` works with `input()`. If it does not, INSERT into those column types is rejected with an error pointing to `clickhouse_execute`, and the README says so.
 - **CTAS:** `PlanCreateTableAs` creates the table (Section 5), then plans `ClickhouseInsert` on the new entry.
+
+  > **As built (Phase 2):** `PlanCreateTableAs` only validates (the CREATE statement and every column's write mode) and plans a `ClickhouseInsert` that owns the `CreateTableInfo`. The sink creates the table when the statement runs: on the first row, or in Finalize when the query yields none. `IF NOT EXISTS` checks for the table on a freshly cleared cache first, and the created table's columns are verified before anything is written. DuckDB plans a plain `PhysicalCreateTable` (the query is dropped) when its cached catalog already has the table and there is no `OR REPLACE`; see Section 3's note.
 - **COPY:** `COPY ch.db.t FROM 'file'` goes through DuckDB's insert planning and needs nothing extra.
 
 ## 5. DDL
@@ -116,6 +124,14 @@ Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected c
 - **DROP TABLE / VIEW:** the engine recorded in the table entry picks `DROP TABLE` or `DROP VIEW`. `DROP VIEW` on a table, or `DROP TABLE` on a view, is rejected, matching DuckDB semantics.
 - **ALTER:** add, drop and rename column, and rename table, as in Section 2. Anything else is `NotImplementedException("… use clickhouse_execute()")`.
 - After each DDL statement: invalidate the schema's table set (or the schema set, for database DDL).
+
+> **As built (Phase 2):**
+> - DEFAULT must fold to a constant (DuckDB's constant folding, excluding `now()`-style functions that are only constant within a query), sent as a ClickHouse literal. There is no `clickhouse_expression` translation of DEFAULT expressions; anything else is rejected with a hint to use `clickhouse_execute()`.
+> - `DROP VIEW` is not supported. DuckDB casts view-typed catalog lookups to `ViewCatalogEntry`, so our table entries must never be returned for them. `DROP TABLE` refuses ClickHouse views and dictionaries (engines View, MaterializedView, LiveView, WindowView, Dictionary) and points to `clickhouse_execute()`. `ALTER TABLE` refuses them too.
+> - `CREATE SCHEMA` / `DROP SCHEMA` refuse `main`, which stands for the connection's database.
+> - ALTER resolves column names case-insensitively against the table's ClickHouse columns, as DuckDB identifiers are. It sends the real ClickHouse name, and refuses an `ADD COLUMN` / `RENAME … TO` that would create a case-insensitive duplicate. A table created outside DuckDB with such duplicates is listed with the first of them, and scanning or inserting into it fails with an explicit error. It does not break the rest of its database.
+> - ENUM labels containing `'` or `\` are rejected (clickhouse-cpp 2.6.2 cannot parse them back), as are unnamed STRUCT fields (an unnamed Tuple would read back as a different STRUCT).
+> - All invalidation clears the whole catalog cache (see Section 3's note).
 
 ## 6. UPDATE / DELETE
 

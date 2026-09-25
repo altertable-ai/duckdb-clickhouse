@@ -157,17 +157,29 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
   `Array`/`Tuple`/`Map`, `JSON` → `JSON`. Types with no ClickHouse equivalent (`INTERVAL`, `BIT`, `UNION`, …) are
   rejected. Naive `TIMESTAMP` columns are stored as UTC and read back as `TIMESTAMP WITH TIME ZONE`, and `BLOB` reads
   back as `VARCHAR`.
+- `TIME` → `Time64` and `JSON` → `JSON` need a recent ClickHouse (e.g. 25.x); older servers fail with an unknown-type
+  error. `ENUM` labels containing `'` or `\` and unnamed `STRUCT`s (e.g. `row(1, 'a')`) are rejected: the ClickHouse
+  client library cannot read such enums back, and an unnamed `Tuple` would read back as a different `STRUCT`.
 - Nullable columns become `Nullable(T)`; `PRIMARY KEY` and `NOT NULL` columns do not. `Array`, `Tuple`, `Map` and
   `JSON` columns cannot be `Nullable` in ClickHouse, so they cannot hold `NULL`.
 - The engine is `ch_default_table_engine` (default `MergeTree`, e.g. `SET ch_default_table_engine =
   'ReplicatedMergeTree'` on a self-hosted cluster). MergeTree-family tables are `ORDER BY` the `PRIMARY KEY`, or
-  `tuple()` without one.
+  `tuple()` without one. `CREATE TABLE` runs only on the node DuckDB is connected to: it does not use `ON CLUSTER`,
+  so on a cluster create the table on every node (or with `ON CLUSTER`) through `clickhouse_execute`.
 - `DEFAULT` values must be constants. `UNIQUE`, `CHECK` and `FOREIGN KEY` constraints, generated columns and
   `PARTITIONED BY` / `SORTED BY` are not supported; use `clickhouse_execute` for those, and for `CREATE VIEW`.
 - `DROP TABLE` does not drop ClickHouse views or dictionaries, and `DROP VIEW` cannot reach them (DuckDB only looks
   for DuckDB views); drop them with `clickhouse_execute`.
 - Other `ALTER TABLE` forms (changing a column's type or default, constraints) are not supported; use
-  `clickhouse_execute`. Columns added with `ALTER TABLE … ADD COLUMN` are always `Nullable`.
+  `clickhouse_execute`. Scalar columns added with `ALTER TABLE … ADD COLUMN` are `Nullable` (`Array`/`Tuple`/`Map`/
+  `JSON` columns never are).
+- Column names in `ALTER TABLE` are matched case-insensitively, like all DuckDB identifiers, and a column whose name
+  differs from an existing one only in case cannot be added. A ClickHouse table that already has such columns (e.g.
+  `id` and `ID`) is listed with the first of them only, and querying or inserting into it fails; rename one of the
+  columns, or read it with `clickhouse_query`.
+- `CREATE SCHEMA` / `DROP SCHEMA` refuse `main`, which stands for the connection's database.
+- `CREATE TABLE` trusts the metadata cache: if the cache still has a table that was dropped outside DuckDB, it fails
+  with "already exists"; run `CALL clickhouse_clear_cache()` and retry.
 - `CREATE TABLE … AS SELECT` creates the table (scalar columns `Nullable` -- `Array`/`Tuple`/`Map`/`JSON` never are --
   and `ORDER BY tuple()` for MergeTree engines), then streams the rows in like an `INSERT`. It is not atomic: if the
   `INSERT` part fails, the table stays, possibly with some rows.
