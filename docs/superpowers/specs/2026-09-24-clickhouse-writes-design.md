@@ -149,6 +149,23 @@ Cache invalidation: DDL, CTAS and `clickhouse_execute` invalidate the affected c
 
   Anything else makes the statement untranslatable. No part of a predicate is ever dropped.
 - **Semantics:** translated DML follows ClickHouse semantics where it differs from DuckDB (NaN comparisons, UUID ordering, integer division by zero). This is documented in the README; SELECT pushdown remains exact-only.
+
+  > **As built (Phase 3):** the accepted divergences are a CLOSED list. Translated DML follows ClickHouse semantics only for:
+  > - NaN comparisons;
+  > - UUID ordering;
+  > - integer division and division by zero (`//` and `/` with an integral result become `intDiv`, truncating toward zero in both; a zero divisor fails in ClickHouse where DuckDB returns NULL);
+  > - arithmetic overflow and wrap-around, including out-of-range casts, in WHERE as well as in SET;
+  > - LIKE / ILIKE collation;
+  > - `lowerUTF8` / `upperUTF8` edge cases (e.g. `upper('ß')`);
+  > - explicit non-rounding CASTs follow ClickHouse's parse rules (e.g. a VARCHAR ClickHouse does not parse fails the statement).
+  >
+  > Every other cast and operator must be exact or rejected:
+  > - Casts (written, implicit, and the SET value's cast to its column's DuckDB type) are classified by `ClassifyCast` in `clickhouse_expression.cpp`: FLOAT/DOUBLE → integer is `CAST(roundBankers(x) AS T)` (DuckDB's `std::nearbyint`, half to even); DECIMAL → integer and DECIMAL → DECIMAL with a smaller scale are `CAST(round(x, s) AS T)` (half away from zero in both, verified on ClickHouse 25.8). FLOAT/DOUBLE or VARCHAR → DECIMAL, timestamp precision reductions, VARCHAR → TIMESTAMP_MS/NS, (U)HUGEINT → FLOAT/DOUBLE, DECIMAL wider than 7 (FLOAT) / 15 (DOUBLE) digits → floating point, casts involving BLOB or to JSON, and any pair not listed there are rejected. The SET wrapper `CAST(e AS <column's ClickHouse type>)` converts the column's DuckDB type into its ClickHouse type, the same conversion an INSERT makes.
+  > - `+ - *` on numbers (and DATE ± integer); FLOAT results are wrapped in `toFloat32(…)` (ClickHouse promotes Float32 arithmetic to Float64; rounding the Float64 result of + - * / of two Float32 values gives the single-precision result). `/` with a FLOAT/DOUBLE result is a division, with an integral result `intDiv`; `//` and `%` translate only with an integral result. Unary minus is `negate(x)`.
+  > - TIMESTAMP_NS constants are written with every nanosecond (`fromUnixTimestamp64Nano(ns, 'UTC')`), in DML and in DDL DEFAULTs.
+  > - The count and the statement run with `transform_null_in = 0` whatever the ATTACH's `settings=` say (query settings override the connection's).
+  > - `DELETE` without WHERE / `TRUNCATE` send `TRUNCATE TABLE` only for engines where it removes the rows (`*MergeTree`, Memory, Log, TinyLog, StripeLog, Set, Join); other engines (e.g. Distributed) are rejected, pointing to `clickhouse_execute()`.
+  > - The shape error names the table: `<UPDATE|DELETE> on ClickHouse table "db"."t" must filter only the modified table with translatable expressions (<reason>); use clickhouse_execute() for anything else`. A scan with a pushed-down ORDER BY / LIMIT is rejected.
 - **Statements** are listed in Section 2. `ClickhouseDmlOperator` (a source, `ParallelSource() == false`) runs `SELECT count() FROM db.t WHERE p`, then the statement, and returns the count as DuckDB's affected-row count. It marks the transaction as having written.
 - ClickHouse server errors surface in the existing format, e.g. updating a sort-key column, or a lightweight delete on an engine that doesn't support it.
 - With `READ_ONLY` attach, DuckDB rejects the statement before these hooks run.

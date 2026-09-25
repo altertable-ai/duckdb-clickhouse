@@ -188,7 +188,8 @@ databases; a non-empty one needs `CASCADE`) and `ALTER TABLE … ADD COLUMN` / `
 `UPDATE`, `DELETE` and `TRUNCATE` are translated into one ClickHouse statement each: `ALTER TABLE … UPDATE … WHERE …`
 (a mutation; `ch_mutations_sync`, default `2`, decides whether it waits), `DELETE FROM … WHERE …` (a synchronous
 lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`. The reported row count comes from a
-`SELECT count()` run just before the statement, so it can be off if other clients write at the same time.
+`SELECT count()` run just before the statement, so it can be off if other clients write at the same time. Both run
+with `transform_null_in = 0`, whatever the `settings` of the `ATTACH` say, so `NOT IN` never matches `NULL`s.
 
 - The `WHERE` clause must only use the modified table's columns, constants, prepared-statement parameters (`?`,
   `$1`), comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN`/`NOT IN` lists of constants without `NULL`, `BETWEEN`,
@@ -196,22 +197,51 @@ lightweight delete, MergeTree family only) or, with no `WHERE`, `TRUNCATE TABLE`
   `coalesce`, `CASE` and `CAST`. Anything else — other functions, subqueries, `USING`, `UPDATE … FROM`, `RETURNING`,
   `SET … = DEFAULT` — is rejected before anything runs; use `clickhouse_execute`. An `IN` list of 5 or more values
   must be a condition of its own (e.g. not inside an `OR`). `SET` values follow the same rules as `WHERE`, and are
-  converted to the column's ClickHouse type with `CAST`. ClickHouse does not update sorting-key columns.
+  converted to the column's ClickHouse type with `CAST` (the same conversion an `INSERT` makes). ClickHouse does not
+  update sorting-key columns.
+- Casts, written or implicit (DuckDB casts every `SET` value to its column's type), give DuckDB's result:
+  `FLOAT`/`DOUBLE` to an integer rounds half to even (`roundBankers`), `DECIMAL` to an integer or to a smaller scale
+  rounds half away from zero (`round`), e.g. `SET qty = qty / 2` writes 4 for 7 and `SET price = price * 1.1` writes
+  1.38 for 1.25, as DuckDB would. `FLOAT` arithmetic stays in single precision, as DuckDB's does.
+- `DELETE` without `WHERE` and `TRUNCATE` only run on engines whose `TRUNCATE TABLE` removes the rows: the MergeTree
+  family, `Memory`, `Log`, `TinyLog`, `StripeLog`, `Set` and `Join`. On anything else (e.g. `Distributed`, whose
+  `TRUNCATE` leaves the shards' data alone), use `clickhouse_execute`.
 - Also rejected, because ClickHouse would not pick the same rows as DuckDB:
   - conditions and `SET` values reading `DateTime64` columns with a precision above 6 (DuckDB reads them truncated
     to microseconds) or `FixedString` columns (DuckDB sees their padding); such columns can still be assigned;
   - casts between `TIMESTAMP WITH TIME ZONE` and `DATE`, `TIMESTAMP`, `VARCHAR` or `TIME`, which DuckDB converts in
     its `TimeZone` setting and ClickHouse in the column's or server's time zone;
   - casts to `VARCHAR`, written or implicit (`||`, `LIKE`, … on a non-string), except from integers, `DATE` and
-    `ENUM`: ClickHouse formats floating-point, `DECIMAL`, timestamp and other values differently.
+    `ENUM`: ClickHouse formats floating-point, `DECIMAL`, timestamp and other values differently;
+  - casts that round differently in ClickHouse: `FLOAT`/`DOUBLE` or `VARCHAR` to `DECIMAL`, timestamps to a coarser
+    timestamp (`TIMESTAMP` to `TIMESTAMP_S`, `TIMESTAMP_NS` to `TIMESTAMP`, …), `VARCHAR` to `TIMESTAMP_MS` or
+    `TIMESTAMP_NS`, `DECIMAL` wider than 15 digits (7 for `FLOAT`) or `HUGEINT` to `FLOAT`/`DOUBLE` (this includes
+    `/` on such a `DECIMAL`, which DuckDB computes in `DOUBLE`), and any other cast not known to be exact (e.g.
+    `VARCHAR` to `BLOB` or `JSON`, `FLOAT`/`DOUBLE`/`DECIMAL` to `BOOLEAN`);
+  - `//` and `%` on `FLOAT`, `DOUBLE` or `DECIMAL`: DuckDB's `//` is a plain division there and its `%` is `fmod`,
+    neither of which ClickHouse's `intDiv` and `%` compute; arithmetic on anything but numbers (and a `DATE` plus or
+    minus a number of days).
 - A condition DuckDB proves always false (e.g. `WHERE 1 = 0`) updates or deletes nothing and sends nothing.
-- The translated statement follows ClickHouse semantics where they differ from DuckDB's (e.g. `NaN` comparisons,
-  `UUID` ordering, integer division and division by zero, and explicit `CAST`s). In `UPDATE`, arithmetic overflow and
-  out-of-range values wrap in ClickHouse instead of raising an error (e.g. `SET u = u - 1` on a `UInt32` holding 0
-  writes 4294967295).
+- Everything else is translated exactly, except for these ClickHouse semantics, which the translated statement
+  follows where they differ from DuckDB's:
+  - `NaN` comparisons;
+  - `UUID` ordering;
+  - integer division and division by zero (e.g. `x // 0` and `x % 0` fail in ClickHouse where DuckDB returns
+    `NULL`);
+  - arithmetic overflow and out-of-range casts, which wrap or saturate in ClickHouse instead of raising an error, in
+    `WHERE` as well as in `SET` (e.g. `SET u = u - 1` on a `UInt32` holding 0 writes 4294967295, and
+    `WHERE b + 1 < 0` matches a `BIGINT` holding its maximum, where DuckDB raises an overflow error);
+  - `LIKE`/`ILIKE` collation (bytes in ClickHouse);
+  - `lower`/`upper`, run as `lowerUTF8`/`upperUTF8`, which differ from DuckDB for a few characters (e.g.
+    `upper('ß')` is `ẞ` in DuckDB and `SS` in ClickHouse);
+  - explicit casts that do not round (e.g. `VARCHAR` to an integer or a date) follow ClickHouse's parse rules: a
+    string ClickHouse does not parse fails the statement (e.g. `'2.5'` to `INTEGER`, which DuckDB rounds to 3).
 - `UPDATE` runs as an `ALTER TABLE … UPDATE` mutation. If it fails while running (e.g. a value that does not convert
   to the column's type, or `NULL` into a non-`Nullable` column), it can stay in `system.mutations` and block later
   mutations on the table until you run `KILL MUTATION WHERE …` via `clickhouse_execute`.
+- A mutation that runs longer than `ch_receive_timeout_ms` returns an error to DuckDB but keeps running on the
+  server. Check `system.mutations` (e.g. with `clickhouse_query`) before retrying: running a non-idempotent `UPDATE`
+  such as `SET n = n + 1` again applies it twice.
 
 `clickhouse_execute(database, sql)` runs any ClickHouse statement that returns no rows. Afterwards, that database's
 metadata cache is cleared, so the change is visible to DuckDB right away:
