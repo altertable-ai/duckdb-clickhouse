@@ -22,6 +22,14 @@ struct ClickhouseDmlStatement {
 	//! SELECT ignore(<value>, …): the SET values ClickHouse parses from text, run before the count so that one that
 	//! does not convert fails the statement before the mutation is sent. Empty when there are none
 	string check_sql;
+	//! SELECT countIf(isNull(<value>)), … FROM `db`.`t` WHERE p: one count per SET value that may be NULL where its
+	//! column cannot hold one, run before the count with apply_deleted_mask = 0 (the mutation also rewrites the rows a
+	//! lightweight DELETE only masked, and fails on the first NULL). Empty when there are none
+	string null_check_sql;
+	//! The column each count of null_check_sql is for
+	vector<string> null_check_columns;
+	//! The table's own name, for the NOT NULL error
+	string table_name;
 	//! Query-level settings sent with `sql`: ClickhouseDml::SemanticSettings(), plus lightweight_deletes_sync or
 	//! mutations_sync
 	vector<std::pair<string, string>> settings;
@@ -74,10 +82,10 @@ public:
 	                                               const string &reason);
 	//! "db"."t", for errors
 	static string DisplayName(const TableCatalogEntry &table);
-	//! Query settings every query the extension issues itself runs with (the counts and checks before a statement,
-	//! the statement, an INSERT's conversions), whatever the ATTACH's settings= holds: transform_null_in = 0, no
-	//! FINAL, no filter, limit or partial result, strict IP parsing. The translated predicate does not depend on them
-	//! (see InList)
+	//! Query settings every query the extension issues itself runs with (the catalog's reads of system.databases,
+	//! system.tables and system.columns, the counts and checks before a statement, the statement, an INSERT's
+	//! conversions), whatever the ATTACH's settings= holds: transform_null_in = 0, no FINAL, no filter, limit or
+	//! partial result, strict IP parsing. The translated predicate does not depend on them (see InList)
 	static vector<std::pair<string, string>> SemanticSettings();
 	//! {"mutations_sync", <ch_mutations_sync>}: sent with every mutation (UPDATE, ALTER TABLE … ALTER COLUMN)
 	static std::pair<string, string> MutationsSyncSetting(ClientContext &context);

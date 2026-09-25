@@ -47,7 +47,8 @@ ClickhouseCatalog &ClickhouseCatalog::GetAttachedDatabase(ClientContext &context
 static string ResolveSchemaOption(ClickhousePoolConnection &connection, const string &name) {
 	string match;
 	for (auto &block : connection->Query("SELECT name FROM system.databases WHERE lower(name) = lower(" +
-	                                     ClickhouseUtils::QuoteLiteral(name) + ") ORDER BY name")) {
+	                                         ClickhouseUtils::QuoteLiteral(name) + ") ORDER BY name",
+	                                     ClickhouseDml::SemanticSettings())) {
 		auto names = block[0]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {
 			string candidate(names->At(row));

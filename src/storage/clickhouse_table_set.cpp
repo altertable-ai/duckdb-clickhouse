@@ -6,6 +6,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
+#include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
@@ -26,8 +27,10 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 
 	unordered_map<string, idx_t> row_counts;
 	unordered_map<string, string> engines;
-	for (auto &block :
-	    connection->Query("SELECT name, total_rows, engine FROM system.tables WHERE database = " + database)) {
+	// an ATTACH's settings= (offset, limit, additional_result_filter, …) would hide tables and columns
+	auto settings = ClickhouseDml::SemanticSettings();
+	auto tables_query = "SELECT name, total_rows, engine FROM system.tables WHERE database = " + database;
+	for (auto &block : connection->Query(tables_query, settings)) {
 		auto names = block[0]->As<clickhouse::ColumnString>();
 		auto totals = block[1]->As<clickhouse::ColumnNullable>();
 		auto table_engines = block[2]->As<clickhouse::ColumnString>();
@@ -43,7 +46,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 	auto columns_query = "SELECT table, name, type, default_kind FROM system.columns WHERE database = " + database +
 	                     " AND default_kind != 'EPHEMERAL' ORDER BY table, position";
 	vector<ClickhouseTableDefinition> tables;
-	for (auto &block : connection->Query(columns_query)) {
+	for (auto &block : connection->Query(columns_query, settings)) {
 		auto table_names = block[0]->As<clickhouse::ColumnString>();
 		auto column_names = block[1]->As<clickhouse::ColumnString>();
 		auto column_types = block[2]->As<clickhouse::ColumnString>();

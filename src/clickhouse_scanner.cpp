@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "storage/clickhouse_dml.hpp"
 
 #include <optional>
 
@@ -479,7 +480,7 @@ static unique_ptr<FunctionData> ClickhouseScanBind(ClientContext &context, Table
 	    "SELECT name, type FROM system.columns WHERE database = " + ClickhouseUtils::QuoteLiteral(result->database) +
 	    " AND table = " + ClickhouseUtils::QuoteLiteral(result->table) +
 	    " AND default_kind != 'EPHEMERAL' ORDER BY position";
-	for (auto &block : connection->Query(sql)) {
+	for (auto &block : connection->Query(sql, ClickhouseDml::SemanticSettings())) {
 		auto column_names = block[0]->As<clickhouse::ColumnString>();
 		auto column_types = block[1]->As<clickhouse::ColumnString>();
 		for (size_t row = 0; row < block.GetRowCount(); row++) {

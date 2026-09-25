@@ -535,6 +535,13 @@ static optional_ptr<const BoundConstantExpression> ResolveConstant(const Express
 	return &resolved->Cast<BoundConstantExpression>();
 }
 
+//! Whether a column of this ClickHouse type can store NULL: Nullable (under LowCardinality too), Variant and Dynamic.
+//! Not a plain scalar, nor Array, Tuple, Map or JSON, whose CAST of NULL fails
+static bool CanHoldNull(const ClickhouseTypeNode &node) {
+	auto &name = ClickhouseTypeWrappers::Of(node).base.name;
+	return ClickhouseTypes::IsNullable(node) || name == "Variant" || name == "Dynamic";
+}
+
 //! Whether a DateTime or DateTime64(p < 6) is nested in `node` (an Array, Tuple or Map element)
 static bool HoldsCoarseDateTime(const ClickhouseTypeNode &node) {
 	for (auto &child : node.children) {
@@ -583,11 +590,15 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	auto &child = *op.children[0];
 	vector<string> assignments;
 	vector<string> checked_values;
+	vector<string> null_counts;
 	try {
 		for (idx_t i = 0; i < op.columns.size(); i++) {
 			auto column_id = op.columns[i].index;
 			auto &column = columns[column_id];
 			auto &expr = *op.expressions[i];
+			// whether the value must be checked for NULLs, which the column cannot hold: the mutation would fail on
+			// the first one and stay stuck. A column that cannot hold NULL cannot give one either
+			bool check_nulls = !CanHoldNull(column.type_node);
 			if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 				auto source = UnchangedScanColumn(child, expr.Cast<BoundReferenceExpression>().index);
 				if (source.IsValid() && source.GetIndex() == column_id) {
@@ -595,6 +606,16 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 					// it turns into DELETE + INSERT); sending them would fail on key columns
 					continue;
 				}
+				if (source.IsValid() && !CanHoldNull(columns[source.GetIndex()].type_node)) {
+					check_nulls = false;
+				}
+			}
+			auto constant = ResolveConstant(expr, child);
+			if (constant) {
+				if (check_nulls && constant->value.IsNull()) {
+					throw ConstraintException("NOT NULL constraint failed: %s.%s", target.table.name, column.name);
+				}
+				check_nulls = false;
 			}
 			auto value =
 			    ClickhouseExpression::Translate(expr, [&](idx_t index) { return ResolveOutput(child, index); });
@@ -607,7 +628,6 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 					                              "text",
 					                              column.name, column.clickhouse_type);
 				}
-				auto constant = ResolveConstant(expr, child);
 				if (!constant) {
 					throw NotImplementedException("SET of column \"%s\" (%s) to a value that is not a constant: "
 					                              "ClickHouse parses it from text",
@@ -640,6 +660,10 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 				    "where an INSERT floors them",
 				    column.name, column.clickhouse_type);
 			}
+			if (check_nulls) {
+				null_counts.push_back("countIf(isNull(" + value + "))");
+				result.null_check_columns.push_back(column.name);
+			}
 			assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = CAST(" + value + " AS " +
 			                      column.clickhouse_type + ")");
 		}
@@ -657,6 +681,11 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	if (!checked_values.empty()) {
 		// ignore() still evaluates its arguments, and returns a type the client can read (Int256 and Point are not)
 		result.check_sql = "SELECT ignore(" + StringUtil::Join(checked_values, ", ") + ")";
+	}
+	if (!null_counts.empty()) {
+		result.null_check_sql =
+		    "SELECT " + StringUtil::Join(null_counts, ", ") + " FROM " + target.qualified_name + " WHERE " + where;
+		result.table_name = target.table.name;
 	}
 	result.settings = SemanticSettings();
 	result.settings.push_back(MutationsSyncSetting(context));
@@ -694,6 +723,33 @@ SourceResultType ClickhouseDmlOperator::GetDataInternal(ExecutionContext &contex
 		if (!statement.check_sql.empty()) {
 			// the same conversions as the statement's: one that fails throws ClickHouse's error here
 			connection->Query(statement.check_sql, ClickhouseDml::SemanticSettings());
+		}
+		if (!statement.null_check_sql.empty()) {
+			auto settings = ClickhouseDml::SemanticSettings();
+			settings.emplace_back("apply_deleted_mask", "0");
+			for (auto &block : connection->Query(statement.null_check_sql, settings)) {
+				if (block.GetRowCount() == 0) {
+					continue;
+				}
+				if (block.GetColumnCount() != statement.null_check_columns.size()) {
+					throw InvalidInputException("%s: unexpected result for the NULL check (%s)", statement.description,
+					                            statement.null_check_sql);
+				}
+				for (idx_t i = 0; i < statement.null_check_columns.size(); i++) {
+					auto nulls = block[i]->As<clickhouse::ColumnUInt64>();
+					if (!nulls) {
+						throw InvalidInputException("%s: unexpected result for the NULL check (%s)",
+						                            statement.description, statement.null_check_sql);
+					}
+					if (nulls->At(0) > 0) {
+						throw ConstraintException(
+						    "NOT NULL constraint failed: %s.%s (the new value is NULL in %d row(s) the WHERE clause "
+						    "matches, counting deleted rows not purged yet: ALTER TABLE … APPLY DELETED MASK purges "
+						    "those); nothing was changed",
+						    statement.table_name, statement.null_check_columns[i], nulls->At(0));
+					}
+				}
+			}
 		}
 		// the count is an ordinary query, which an ATTACH's settings= would reach without SemanticSettings
 		for (auto &block : connection->Query(statement.count_sql, ClickhouseDml::SemanticSettings())) {

@@ -693,7 +693,7 @@ UPDATE ch.w_dml2.ip SET {set} WHERE id = 1;
 
 endloop
 
-foreach set ip='bogus' ipn='bogus' i='x' fs='abc' p='nope' ipn=NULL
+foreach set ip='bogus' ipn='bogus' i='x' fs='abc' p='nope'
 
 statement error
 UPDATE ch.w_dml2.ip SET {set} WHERE id = 2;
@@ -701,6 +701,12 @@ UPDATE ch.w_dml2.ip SET {set} WHERE id = 2;
 ClickHouse error
 
 endloop
+
+# NULL into the non-Nullable IPv4 column: refused while planning, like DuckDB's own NOT NULL check
+statement error
+UPDATE ch.w_dml2.ip SET ipn = NULL WHERE id = 2;
+----
+Constraint Error: NOT NULL constraint failed: ip.ipn
 
 query IIIIII
 SELECT * FROM clickhouse_query('ch', 'SELECT id, toString(ip), toString(ipn), fs, toString(i), wkt(p) FROM w_dml2.ip ORDER BY id');
@@ -746,6 +752,127 @@ DELETE FROM ch.w_dml2.ip WHERE id = 2;
 
 query I
 SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''ip'' AND NOT is_done');
+----
+0
+
+# ---------------------------------------------------------------------------
+# NULL into a column ClickHouse cannot store NULL in: the mutation would fail on the first such row and stay stuck.
+# DuckDB raises its NOT NULL error instead, and nothing is sent
+# ---------------------------------------------------------------------------
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE w_dml2.nn (id Int32, i Int32, n Nullable(Int32), lc LowCardinality(String), ln LowCardinality(Nullable(String)), a Array(Int32), v Variant(Int32, String)) ENGINE = MergeTree ORDER BY id');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO w_dml2.nn VALUES (1, 1, NULL, ''a'', NULL, [1], NULL), (2, 2, 5, ''b'', ''x'', [2], ''w''), (3, 3, 7, ''c'', ''y'', [3], 3)');
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n;
+----
+Constraint Error: NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s) the WHERE clause matches
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n WHERE id <= 2;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s)
+
+statement error
+UPDATE ch.w_dml2.nn SET i = CASE WHEN id = 3 THEN NULL ELSE i END WHERE id >= 2;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s)
+
+# LowCardinality(String) is not Nullable either; the first SET column that would get a NULL is named
+statement error
+UPDATE ch.w_dml2.nn SET i = coalesce(n, 0), lc = ln;
+----
+NOT NULL constraint failed: nn.lc (the new value is NULL in 1 row(s)
+
+# a NULL constant is refused while planning
+foreach set i=NULL lc=NULL a=NULL i=NULL::INTEGER+1
+
+statement error
+UPDATE ch.w_dml2.nn SET {set} WHERE id = 2;
+----
+<REGEX>:Constraint Error: NOT NULL constraint failed: nn\.(i|lc|a)\s*
+
+endloop
+
+query IIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i, n, lc, toString(ln) FROM w_dml2.nn ORDER BY id');
+----
+1	1	NULL	a	NULL
+2	2	5	b	x
+3	3	7	c	y
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nn''');
+----
+0
+
+# a WHERE clause that leaves out the NULL rows
+query I
+UPDATE ch.w_dml2.nn SET i = n, lc = ln WHERE id >= 2;
+----
+2
+
+# no NULL can come out: nothing to check
+query I
+UPDATE ch.w_dml2.nn SET i = i + 10 WHERE id <> 2;
+----
+2
+
+# a Variant column holds NULL
+query I
+UPDATE ch.w_dml2.nn SET v = NULL WHERE id = 2;
+----
+1
+
+query IIIII
+SELECT id, i, n, lc, v FROM ch.w_dml2.nn ORDER BY id;
+----
+1	11	NULL	a	null
+2	5	5	x	null
+3	17	7	y	3
+
+query IIIIII
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i, n, lc, toString(ln), isNull(v) FROM w_dml2.nn ORDER BY id');
+----
+1	11	NULL	a	NULL	1
+2	5	5	x	x	1
+3	17	7	y	y	0
+
+# a deleted row that is not purged yet still reaches the mutation, so it counts
+query I
+DELETE FROM ch.w_dml2.nn WHERE id = 1;
+----
+1
+
+statement error
+UPDATE ch.w_dml2.nn SET i = n;
+----
+NOT NULL constraint failed: nn.i (the new value is NULL in 1 row(s) the WHERE clause matches, counting deleted rows not purged yet
+
+statement ok
+CALL clickhouse_execute('ch', 'ALTER TABLE w_dml2.nn APPLY DELETED MASK SETTINGS mutations_sync = 2');
+
+query I
+UPDATE ch.w_dml2.nn SET i = n;
+----
+2
+
+query II
+SELECT * FROM clickhouse_query('ch', 'SELECT id, i FROM w_dml2.nn ORDER BY id');
+----
+2	5
+3	7
+
+# nothing was left stuck: later statements run
+query I
+DELETE FROM ch.w_dml2.nn WHERE id = 3;
+----
+1
+
+query I
+SELECT * FROM clickhouse_query('ch', 'SELECT count() FROM system.mutations WHERE database = ''w_dml2'' AND table = ''nn'' AND NOT is_done');
 ----
 0
 

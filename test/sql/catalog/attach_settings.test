@@ -1,0 +1,145 @@
+# name: test/sql/catalog/attach_settings.test
+# description: an ATTACH's settings= reach the user's queries, never the catalog's own listing of databases, tables and columns
+# group: [catalog]
+
+require clickhouse_scanner
+
+require-env CLICKHOUSE_TEST_HOST
+
+require-env CLICKHOUSE_TEST_PORT
+
+require-env CLICKHOUSE_TEST_USER
+
+require-env CLICKHOUSE_TEST_PASSWORD
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db' AS ch (TYPE clickhouse);
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE IF EXISTS c_settings');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE DATABASE c_settings');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE c_settings.t_a (a Int32, b String, c Nullable(Int32)) ENGINE = MergeTree ORDER BY a');
+
+statement ok
+CALL clickhouse_execute('ch', 'CREATE TABLE c_settings.t_b (x Int32, y Int32) ENGINE = MergeTree ORDER BY x');
+
+statement ok
+CALL clickhouse_execute('ch', 'INSERT INTO c_settings.t_a VALUES (1, ''one'', NULL), (2, ''two'', 2), (3, ''three'', 3)');
+
+# the settings are accepted at ATTACH: the server sees them with each query
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=offset=1' AS ch_offset (TYPE clickhouse);
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=limit=1' AS ch_limit (TYPE clickhouse);
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=additional_result_filter=0' AS ch_result_filter (TYPE clickhouse);
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=additional_table_filters={''system.columns'':''0''}' AS ch_columns_filter (TYPE clickhouse);
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=additional_table_filters={''system.tables'':''0''}' AS ch_tables_filter (TYPE clickhouse);
+
+statement ok
+ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} database=test_db settings=offset=1' AS ch_offset_schema (TYPE clickhouse, SCHEMA 'C_Settings');
+
+foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = '${db}' AND schema_name IN ('c_settings', 'test_db', 'other_db', 'default') ORDER BY ALL;
+----
+c_settings
+default
+other_db
+test_db
+
+query II
+SELECT table_name, estimated_size FROM duckdb_tables() WHERE database_name = '${db}' AND schema_name = 'c_settings' ORDER BY ALL;
+----
+t_a	3
+t_b	0
+
+query III
+SELECT table_name, column_name, is_nullable FROM duckdb_columns() WHERE database_name = '${db}' AND schema_name = 'c_settings' ORDER BY table_name, column_index;
+----
+t_a	a	false
+t_a	b	false
+t_a	c	true
+t_b	x	false
+t_b	y	false
+
+endloop
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ch_offset_schema' ORDER BY ALL;
+----
+t_a
+t_b
+
+query II
+SELECT table_name, column_name FROM duckdb_columns() WHERE database_name = 'ch_offset_schema' ORDER BY table_name, column_index;
+----
+t_a	a
+t_a	b
+t_a	c
+t_b	x
+t_b	y
+
+# clickhouse_scan() reads its table's columns the same way
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} settings=offset=1', 'c_settings', 't_a'));
+----
+3
+
+# the user's own queries still run with the settings: they are what the user asked for
+query I
+SELECT * FROM clickhouse_query('ch_offset', 'SELECT number FROM numbers(3) ORDER BY number');
+----
+1
+2
+
+query I
+SELECT * FROM clickhouse_query('ch_limit', 'SELECT number FROM numbers(3) ORDER BY number');
+----
+0
+
+query I
+SELECT count(*) FROM clickhouse_query('ch_result_filter', 'SELECT number FROM numbers(3)');
+----
+0
+
+query I
+SELECT count(*) FROM ch_offset.c_settings.t_a;
+----
+2
+
+query I
+SELECT count(*) FROM ch_offset_schema.t_a;
+----
+2
+
+query I
+SELECT count(*) FROM clickhouse_scan('host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD} settings=offset=1', 'c_settings', 't_a');
+----
+2
+
+query I
+SELECT count(*) FROM clickhouse_query('ch_columns_filter', 'SELECT name FROM system.columns WHERE database = ''c_settings''');
+----
+0
+
+foreach db ch_offset ch_limit ch_result_filter ch_columns_filter ch_tables_filter ch_offset_schema
+
+statement ok
+DETACH ${db};
+
+endloop
+
+statement ok
+CALL clickhouse_execute('ch', 'DROP DATABASE c_settings');
