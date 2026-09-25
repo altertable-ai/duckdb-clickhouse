@@ -1,6 +1,9 @@
 #include "storage/clickhouse_catalog_set.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/transaction.hpp"
+#include "storage/clickhouse_catalog.hpp"
 
 namespace duckdb {
 
@@ -8,6 +11,13 @@ ClickhouseCatalogSet::ClickhouseCatalogSet(Catalog &catalog) : catalog(catalog) 
 }
 
 void ClickhouseCatalogSet::TryLoadEntries(ClientContext &context) {
+	// before any entry is handed out: see ClickhouseTransactionManager (retire-don't-free). Starting this database's
+	// transaction is what gives the caller an id below the stamp of any batch retiring the entries it is about to
+	// get. Catalog lookups already run in it (CatalogTransaction starts it), but duckdb_tables(), duckdb_columns(),
+	// information_schema and friends scan every attached catalog through ScanSchemas() without doing so
+	if (context.transaction.HasActiveTransaction()) {
+		Transaction::Get(context, catalog.GetAttached());
+	}
 	lock_guard<mutex> load_guard(load_lock);
 	if (is_loaded) {
 		return;
@@ -60,13 +70,21 @@ void ClickhouseCatalogSet::Scan(ClientContext &context, const std::function<void
 }
 
 void ClickhouseCatalogSet::ClearEntries() {
-	lock_guard<mutex> load_guard(load_lock);
-	lock_guard<mutex> guard(entry_lock);
-	// releasing the last reference to an entry here is safe: everything that keeps a raw pointer into one
-	// past the clear owns it through GetEntryOwner() (see ClickhouseScanBindData::lifetime)
-	entries.clear();
-	ordered_entries.clear();
-	is_loaded = false;
+	vector<shared_ptr<CatalogEntry>> cleared;
+	{
+		lock_guard<mutex> load_guard(load_lock);
+		lock_guard<mutex> guard(entry_lock);
+		// ordered_entries holds every entry `entries` does
+		cleared = std::move(ordered_entries);
+		ordered_entries.clear();
+		entries.clear();
+		is_loaded = false;
+	}
+	// retired, not freed: other connections -- or the caller itself -- may still hold raw pointers or references into
+	// these entries. They stay alive until every transaction active on this database now has ended (see
+	// ClickhouseTransactionManager); only after the removal above, so that no transaction can start, look up one of
+	// these entries and still get an id at or past the batch's stamp
+	catalog.Cast<ClickhouseCatalog>().RetireEntries(std::move(cleared));
 }
 
 void ClickhouseCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry) {

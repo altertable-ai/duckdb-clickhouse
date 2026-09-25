@@ -16,7 +16,8 @@ public:
 	explicit ClickhouseCatalogSet(Catalog &catalog);
 	virtual ~ClickhouseCatalogSet() = default;
 
-	//! Exact (case-sensitive) match first, then the first case-insensitive match
+	//! Exact (case-sensitive) match first, then the first case-insensitive match. GetEntry() and Scan() start the
+	//! database's DuckDB transaction for `context` first, if it has not started yet (see ClearEntries())
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const string &name);
 	//! The shared_ptr that owns the currently cached entry named `name`, for a caller that has to keep it
 	//! alive past a ClearEntries() (see ClickhouseScanBindData::lifetime). Exact match only, and never
@@ -24,7 +25,10 @@ public:
 	//! meantime.
 	shared_ptr<CatalogEntry> GetEntryOwner(const string &name);
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
-	//! Drops the cache; the next access reloads from ClickHouse
+	//! Drops the cache; the next access reloads from ClickHouse. The dropped entries are retired, not freed: they stay
+	//! alive until every DuckDB transaction active on the database at this point has ended (see
+	//! ClickhouseTransactionManager), so a raw pointer or reference another connection -- or the caller -- obtained
+	//! from this set within its transaction stays valid until that transaction ends
 	void ClearEntries();
 
 protected:

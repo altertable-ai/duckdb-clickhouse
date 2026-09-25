@@ -52,11 +52,19 @@ public:
 	//! once something can actually be sent -- marks the current transaction as written, so a ROLLBACK warns.
 	//! Every write path (clickhouse_execute(), the INSERT sink) starts here.
 	ClickhousePoolConnection StartWrite(ClientContext &context);
-	//! Forgets all cached databases, tables and columns
+	//! Forgets all cached databases, tables and columns. The forgotten entries are retired rather than freed: they stay
+	//! alive until every DuckDB transaction active on this database at the time of the call has ended (see
+	//! ClickhouseTransactionManager)
 	void ClearCache();
+	//! Hands entries dropped from a cache to the transaction manager, which frees them once no transaction active
+	//! now is left
+	void RetireEntries(vector<shared_ptr<CatalogEntry>> entries);
 	//! The shared_ptr owning the cached schema entry for the ClickHouse database `name`; null once the
 	//! cache has been cleared. Lets a bound scan keep its schema -- and therefore the table entry that
-	//! schema's table set owns -- alive past a ClearCache() (see ClickhouseScanBindData::lifetime).
+	//! schema's table set owns -- alive past a ClearCache() for longer than retirement does, i.e. beyond the
+	//! end of the transaction (see ClickhouseScanBindData::lifetime); and lets a DDL method of a schema entry keep
+	//! `this` alive across the ClearCache() it triggers (belt-and-braces: retirement already does, see
+	//! ClickhouseTransactionManager).
 	shared_ptr<CatalogEntry> GetSchemaEntryOwner(const string &name);
 
 	void Initialize(bool load_builtin) override;

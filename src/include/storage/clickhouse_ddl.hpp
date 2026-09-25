@@ -28,8 +28,10 @@ public:
 	//! the string
 	static void ValidateEngine(const string &engine);
 	//! Runs a DDL statement through catalog.StartWrite() (READ_ONLY check, marks the transaction written) with
-	//! enable_time_time64_type=1, then clears the catalog's cache -- also when the statement failed. Callers that are
-	//! methods of a cached schema entry must hold catalog.GetSchemaEntryOwner(<their name>) across the call
+	//! enable_time_time64_type=1, then clears the catalog's cache -- also when the statement failed. The cleared
+	//! entries are retired and stay valid until the current transaction ends (see ClickhouseTransactionManager);
+	//! methods of a cached schema entry also hold catalog.GetSchemaEntryOwner(<their name>) across the call
+	//! (belt-and-braces)
 	static void Execute(ClientContext &context, ClickhouseCatalog &catalog, const string &sql);
 	//! The (freshly loaded) table entry, or null
 	static optional_ptr<ClickhouseTableEntry> LookupTable(ClientContext &context, ClickhouseCatalog &catalog,

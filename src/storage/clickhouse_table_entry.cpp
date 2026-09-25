@@ -23,10 +23,11 @@ TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, uniq
 	auto &clickhouse_catalog = catalog.Cast<ClickhouseCatalog>();
 	result->pool = clickhouse_catalog.GetConnectionPoolPtr();
 	result->table_entry = this;
-	// the bound plan may outlive the catalog's own reference to this entry (clickhouse_clear_cache()); keep
-	// the schema that transitively owns it alive for as long as the plan holds table_entry. Null only if
-	// another connection cleared the cache between the catalog lookup that found this entry and this call,
-	// a window in which `this` is being freed underneath us either way.
+	// the bound plan may outlive the catalog's own reference to this entry (clickhouse_clear_cache(), any DDL):
+	// retirement keeps the entry alive until the binding transaction ends (see ClickhouseTransactionManager); keep
+	// the schema that transitively owns it alive for as long as the plan holds table_entry, beyond that. Null if
+	// another connection cleared the cache between the catalog lookup that found this entry and this call; the
+	// entry is then retired and stays valid for the rest of this transaction.
 	result->lifetime = clickhouse_catalog.GetSchemaEntryOwner(schema.name);
 	result->database = schema.name;
 	result->table = name;

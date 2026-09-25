@@ -55,6 +55,10 @@ void ClickhouseCatalog::ClearCache() {
 	schemas.ClearEntries();
 }
 
+void ClickhouseCatalog::RetireEntries(vector<shared_ptr<CatalogEntry>> entries) {
+	GetAttached().GetTransactionManager().Cast<ClickhouseTransactionManager>().RetireEntries(std::move(entries));
+}
+
 shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &name) {
 	return schemas.GetEntryOwner(name);
 }
