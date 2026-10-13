@@ -91,7 +91,7 @@ void ClickhouseTransactionManager::RollbackTransaction(Transaction &transaction)
 		if (context) {
 			DUCKDB_LOG_WARNING(*context, StringUtil::Format("ClickHouse writes made in this transaction were already "
 			                                                "committed and cannot be rolled back (database \"%s\")",
-			                                                db.GetName()));
+			                                                db.GetName().GetIdentifierName()));
 		}
 	}
 	EndTransaction(transaction);

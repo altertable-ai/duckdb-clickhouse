@@ -3,6 +3,7 @@
 #include "clickhouse_types.hpp"
 #include "duckdb/common/index_vector.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
 class ClickhouseCatalog;

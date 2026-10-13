@@ -2,6 +2,7 @@
 
 #include "clickhouse_connection.hpp"
 #include "clickhouse_utils.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -18,15 +19,17 @@ namespace duckdb {
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseTableEntry &table_p,
                                    vector<ClickhouseInsertColumn> columns_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
-      catalog_name(table_p.catalog.GetName()), database_name(table_p.schema.name), table_name(table_p.name),
+      catalog_name(table_p.catalog.GetName().GetIdentifierName()),
+      database_name(table_p.schema.name.GetIdentifierName()), table_name(table_p.name.GetIdentifierName()),
       columns(std::move(columns_p)) {
 	insert_sql = BuildInsertQuery(table_p, columns);
 }
 
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
                                    const string &database, unique_ptr<CreateTableInfo> create_info_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), catalog_name(catalog.GetName()),
-      database_name(database), table_name(create_info_p->table), create_info(std::move(create_info_p)) {
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
+      catalog_name(catalog.GetName().GetIdentifierName()), database_name(database),
+      table_name(create_info_p->GetTableName().GetIdentifierName()), create_info(std::move(create_info_p)) {
 }
 
 vector<ClickhouseInsertColumn>
@@ -63,7 +66,8 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		result.push_back(ClickhouseInsertColumn {column, source_index});
 	}
 	if (result.empty()) {
-		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column", table.name);
+		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column",
+		                              table.name.GetIdentifierName());
 	}
 	return result;
 }
@@ -166,7 +170,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 		// table after this database's schema/table cache was last populated, and the planner routes here whenever
 		// the *cached* catalog had no such table, so the cache can be stale in exactly the case that matters
 		catalog.ClearCache();
-		if (ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.table)) {
+		if (ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.GetTableName().GetIdentifierName())) {
 			gstate.skip = true;
 			return;
 		}
@@ -182,7 +186,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 	if (!mismatch) {
 		idx_t i = 0;
 		for (auto &column : info.columns.Logical()) {
-			if (!StringUtil::CIEquals(table_columns[i].name, column.Name())) {
+			if (Identifier(table_columns[i].name) != column.Name()) {
 				mismatch = true;
 				break;
 			}
@@ -192,7 +196,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 	if (mismatch) {
 		throw InvalidInputException("ClickHouse table \"%s\".\"%s\" already exists with different columns; CREATE "
 		                            "TABLE … AS did not write into it",
-		                            op.database_name, info.table);
+		                            op.database_name, info.GetTableName().GetIdentifierName());
 	}
 	// every column, in query order: the CTAS input chunk has one column per created column
 	gstate.columns = ClickhouseInsert::GetInsertColumns(table, physical_index_vector_t<idx_t>());

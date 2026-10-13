@@ -1,6 +1,8 @@
 #include "storage/clickhouse_storage_extension.hpp"
 
 #include "clickhouse_secrets.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "storage/clickhouse_catalog.hpp"

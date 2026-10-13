@@ -2,6 +2,7 @@
 
 #include "clickhouse_scanner.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 
@@ -10,8 +11,8 @@ namespace duckdb {
 ClickhouseTableEntry::ClickhouseTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                            vector<ClickhouseColumnInfo> columns, optional_idx approx_rows,
                                            string engine, string column_collision)
-    : TableCatalogEntry(catalog, schema, info), clickhouse_columns(std::move(columns)), approx_rows(approx_rows),
-      engine(std::move(engine)), column_collision(std::move(column_collision)) {
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)), clickhouse_columns(std::move(columns)),
+      approx_rows(approx_rows), engine(std::move(engine)), column_collision(std::move(column_collision)) {
 }
 
 void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
@@ -50,8 +51,8 @@ TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, uniq
 	// another connection cleared the cache between the catalog lookup that found this entry and this call; the
 	// entry is then retired and stays valid for the rest of this transaction.
 	result->lifetime = clickhouse_catalog.GetSchemaEntryOwner(schema.name);
-	result->database = schema.name;
-	result->table = name;
+	result->database = schema.name.GetIdentifierName();
+	result->table = name.GetIdentifierName();
 	result->columns = clickhouse_columns;
 	result->approx_rows = approx_rows;
 	result->filter_pushdown = ClickhouseScanFunction::FilterPushdownEnabled(context);

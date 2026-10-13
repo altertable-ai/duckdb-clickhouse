@@ -1,7 +1,9 @@
 #include "clickhouse_secrets.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -23,15 +25,15 @@ unique_ptr<BaseSecret> ClickhouseSecrets::CreateFunction(ClientContext &context,
 		auto key = StringUtil::Lower(named_param.first);
 		auto value = named_param.second.ToString();
 		validation.SetOption(key, value);
-		result->secret_map[key] = Value(value);
+		result->secret_map[Identifier(key)] = Value(value);
 	}
-	result->redact_keys = {"password"};
+	result->redact_keys.insert(Identifier("password"));
 	return std::move(result);
 }
 
 void ClickhouseSecrets::SetSecretParameters(CreateSecretFunction &function) {
 	for (auto &name : ClickhouseConnectionConfig::OptionNames()) {
-		function.named_parameters[name] = LogicalType::VARCHAR;
+		function.named_parameters[Identifier(name)] = LogicalType::VARCHAR;
 	}
 }
 
@@ -51,7 +53,7 @@ unique_ptr<SecretEntry> ClickhouseSecrets::GetSecretEntry(ClientContext &context
 	}
 	if (entry->secret->GetType() != TYPE_NAME) {
 		throw BinderException("Secret \"%s\" is not a ClickHouse secret (it has type \"%s\")", name,
-		                      entry->secret->GetType());
+		                      entry->secret->GetType().GetIdentifierName());
 	}
 	return entry;
 }
@@ -59,7 +61,7 @@ unique_ptr<SecretEntry> ClickhouseSecrets::GetSecretEntry(ClientContext &context
 void ClickhouseSecrets::ApplySecret(const SecretEntry &entry, ClickhouseConnectionConfig &config) {
 	auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*entry.secret);
 	for (auto &item : kv_secret.secret_map) {
-		config.SetOption(item.first, item.second.ToString());
+		config.SetOption(item.first.GetIdentifierName(), item.second.ToString());
 	}
 }
 

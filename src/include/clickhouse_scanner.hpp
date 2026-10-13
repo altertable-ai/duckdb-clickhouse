@@ -1,6 +1,7 @@
 #pragma once
 
 #include "clickhouse_types.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
@@ -11,10 +12,9 @@ struct ClickhouseScanBindData : public TableFunctionData {
 	//! Pool of the attached catalog, or a private pool for clickhouse_scan() without ATTACH
 	shared_ptr<ClickhouseConnectionPool> pool;
 	//! The catalog entry backing this scan (attached tables only; null for clickhouse_scan() /
-	//! clickhouse_query(), added in Task 9). Required for get_bind_info so that LogicalGet::GetTable()
+	//! clickhouse_query(), added in Task 9). Required for get_table_entry so that LogicalGet::GetTable()
 	//! resolves, which UPDATE/DELETE's binder needs before it will even consider planning a write.
-	//! A raw pointer (not optional_ptr) so it stays dereferenceable to a non-const TableCatalogEntry&
-	//! even through the const bind data reference get_bind_info receives.
+	//! A raw pointer (not optional_ptr) so it stays dereferenceable to a non-const TableCatalogEntry&.
 	TableCatalogEntry *table_entry = nullptr;
 	//! Keeps table_entry alive for as long as this bind data does: the schema entry it belongs to, which
 	//! owns the table set, which owns table_entry. clickhouse_clear_cache() drops the catalog's own
@@ -49,8 +49,11 @@ public:
 	static string BuildQuery(const ClickhouseScanBindData &bind_data, const vector<column_t> &column_ids,
 	                         optional_ptr<TableFilterSet> filters);
 	static void SetReturnTypes(const ClickhouseScanBindData &bind_data, vector<LogicalType> &return_types,
-	                           vector<string> &names);
+	                           vector<Identifier> &names);
 	static bool IsClickhouseScan(const string &function_name);
+	static bool IsClickhouseScan(const Identifier &function_name) {
+		return IsClickhouseScan(function_name.GetIdentifierName());
+	}
 	//! ch_filter_pushdown
 	static bool FilterPushdownEnabled(ClientContext &context);
 };

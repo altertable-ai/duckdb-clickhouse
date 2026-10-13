@@ -2,6 +2,7 @@
 
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "storage/clickhouse_catalog.hpp"
 
 namespace duckdb {
@@ -35,7 +36,7 @@ static ClickhouseCatalog &GetWritableCatalog(ClientContext &context, const strin
 }
 
 static unique_ptr<FunctionData> ClickhouseExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to clickhouse_execute cannot be NULL");
 	}

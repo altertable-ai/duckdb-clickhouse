@@ -6,14 +6,15 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/function/scalar/tablefilter_functions.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 
@@ -92,7 +93,7 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 		return "toUUID(" + ClickhouseUtils::QuoteLiteral(value.ToString()) + ")";
 	case LogicalTypeId::DATE: {
 		auto date = DateValue::Get(value);
-		if (!Date::IsFinite(date)) {
+		if (!date.IsFinite()) {
 			throw NotImplementedException("ClickHouse filter pushdown: infinite dates are not supported");
 		}
 		if (!DateInPushdownRange(date)) {
@@ -107,7 +108,7 @@ string ClickhouseFilterPushdown::TransformConstant(const Value &value) {
 	}
 	case LogicalTypeId::TIMESTAMP_TZ: {
 		auto timestamp = TimestampTZValue::Get(value);
-		if (!Timestamp::IsFinite(timestamp)) {
+		if (!timestamp.IsFinite()) {
 			throw NotImplementedException("ClickHouse filter pushdown: infinite timestamps are not supported");
 		}
 		return StringUtil::Format("fromUnixTimestamp64Micro(%d, 'UTC')", timestamp.value);
@@ -157,7 +158,7 @@ static string TryFoldUnrepresentableComparison(const string &column, ExpressionT
 	switch (value.type().id()) {
 	case LogicalTypeId::DATE: {
 		auto date = DateValue::Get(value);
-		if (!Date::IsFinite(date)) {
+		if (!date.IsFinite()) {
 			return FoldOutOfBoundsComparison(column, comparison_type, date == date_t::ninfinity());
 		}
 		if (!DateInPushdownRange(date)) {
@@ -167,8 +168,8 @@ static string TryFoldUnrepresentableComparison(const string &column, ExpressionT
 	}
 	case LogicalTypeId::TIMESTAMP_TZ: {
 		auto timestamp = TimestampTZValue::Get(value);
-		if (!Timestamp::IsFinite(timestamp)) {
-			return FoldOutOfBoundsComparison(column, comparison_type, timestamp == timestamp_t::ninfinity());
+		if (!timestamp.IsFinite()) {
+			return FoldOutOfBoundsComparison(column, comparison_type, timestamp == timestamp_tz_t::ninfinity());
 		}
 		return string();
 	}
@@ -179,160 +180,182 @@ static string TryFoldUnrepresentableComparison(const string &column, ExpressionT
 
 //! Whether expr is `CAST(<column reference> AS VARCHAR)`
 static bool IsVarcharCastOfColumnReference(const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+	if (!BoundCastExpression::IsCast(expr)) {
 		return false;
 	}
-	auto &cast_expr = expr.Cast<BoundCastExpression>();
-	return cast_expr.return_type.id() == LogicalTypeId::VARCHAR &&
-	       cast_expr.child->GetExpressionClass() == ExpressionClass::BOUND_REF;
+	auto &cast_expr = expr.Cast<BoundFunctionExpression>();
+	if (cast_expr.GetReturnType().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	auto child_class = BoundCastExpression::Child(cast_expr).GetExpressionClass();
+	return child_class == ExpressionClass::BOUND_REF || child_class == ExpressionClass::BOUND_COLUMN_REF;
 }
 
+static bool IsColumnSubject(const Expression &expr) {
+	return ExpressionFilter::IsSimpleFilterColumnRef(expr);
+}
+
+static bool IsRuntimeHintExpression(const Expression &expr) {
+	return ExpressionFilter::ContainsInternalFunction(expr, TableFilterDynamicFun::Name) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, TableFilterBloomFilterFun::Name) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, TableFilterPrefixRangeFun::Name);
+}
+
+static string TransformExpressionFilter(const string &column, const Expression &expr);
+
 string ClickhouseFilterPushdown::TransformFilter(const string &column, const TableFilter &filter) {
+	return TransformFilter(column, filter, LogicalType::INVALID);
+}
+
+string ClickhouseFilterPushdown::TransformFilter(const string &column, const TableFilter &filter,
+                                                 const LogicalType &column_type) {
+	if (filter.filter_type == TableFilterType::EXPRESSION_FILTER) {
+		if (ExpressionFilter::IsOptionalFilter(filter) || ExpressionFilter::IsRootOptionalFilter(filter)) {
+			return string();
+		}
+		if (ExpressionFilter::GetRootOptionalDynamicFilterData(filter)) {
+			return string();
+		}
+		return TransformExpressionFilter(column, *ExpressionFilter::GetExpressionFilter(filter, "clickhouse").expr);
+	}
 	switch (filter.filter_type) {
-	case TableFilterType::IS_NULL:
-		return column + " IS NULL";
-	case TableFilterType::IS_NOT_NULL:
-		return column + " IS NOT NULL";
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto folded =
-		    TryFoldUnrepresentableComparison(column, constant_filter.comparison_type, constant_filter.constant);
-		if (!folded.empty()) {
-			return folded;
-		}
-		if (constant_filter.constant.type().id() == LogicalTypeId::UUID &&
-		    IsOrderedComparison(constant_filter.comparison_type)) {
-			// ClickHouse orders UUIDs by their second 64-bit half first; its canonical lowercase text orders
-			// exactly like DuckDB's UUID
-			return "toString(" + column + ") " + TransformComparison(constant_filter.comparison_type) + " " +
-			       ClickhouseUtils::QuoteLiteral(constant_filter.constant.ToString());
-		}
-		return column + " " + TransformComparison(constant_filter.comparison_type) + " " +
-		       TransformConstant(constant_filter.constant);
+	case TableFilterType::LEGACY_OPTIONAL_FILTER:
+		return string();
+	case TableFilterType::LEGACY_DYNAMIC_FILTER:
+	case TableFilterType::LEGACY_BLOOM_FILTER:
+	case TableFilterType::LEGACY_PREFIX_RANGE_FILTER:
+		return string();
+	default:
+		break;
 	}
-	case TableFilterType::IN_FILTER: {
-		auto &in_filter = filter.Cast<InFilter>();
-		vector<string> values;
-		for (auto &value : in_filter.values) {
-			try {
-				values.push_back(TransformConstant(value));
-			} catch (NotImplementedException &) {
-				// TransformConstant refuses a value of a type it otherwise translates in exactly two cases:
-				// a DATE outside the range toDate32 represents exactly, and an infinite DATE or
-				// TIMESTAMP_TZ. Such a value can never equal any value the column could hold, so dropping
-				// it from the list is exact. A refusal for any other type means the type is not translatable
-				// at all, which would make dropping it silently wrong -- rethrow and let the whole filter
-				// stay with DuckDB.
-				auto type_id = value.type().id();
-				if (type_id != LogicalTypeId::DATE && type_id != LogicalTypeId::TIMESTAMP_TZ) {
-					throw;
-				}
-			}
-		}
-		if (values.empty()) {
-			return "1 = 0";
-		}
-		return column + " IN (" + StringUtil::Join(values, ", ") + ")";
+	auto type = column_type.IsValid() ? column_type : LogicalType::VARCHAR;
+	auto converted = ExpressionFilter::FromTableFilter(filter, type);
+	return TransformExpressionFilter(column, *converted->expr);
+}
+
+static string TransformExpressionFilter(const string &column, const Expression &expr) {
+	if (ExpressionFilter::IsOptionalExpression(expr) || ExpressionFilter::IsRootOptionalExpression(expr)) {
+		return string();
 	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
+	if (IsRuntimeHintExpression(expr) && expr.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION) {
+		return string();
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		auto is_and = expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
 		vector<string> parts;
-		for (auto &child : conjunction.child_filters) {
-			auto part = TransformFilter(column, *child);
-			if (!part.empty()) {
+		for (auto &child : conj.GetChildren()) {
+			auto part = TransformExpressionFilter(column, *child);
+			if (is_and) {
+				if (!part.empty()) {
+					parts.push_back(part);
+				}
+			} else if (part.empty()) {
+				// one branch does not restrict rows, so neither does the OR
+				return string();
+			} else {
 				parts.push_back(part);
 			}
 		}
 		if (parts.empty()) {
 			return string();
 		}
-		return "(" + StringUtil::Join(parts, " AND ") + ")";
+		return "(" + StringUtil::Join(parts, is_and ? " AND " : " OR ") + ")";
 	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
-		vector<string> parts;
-		for (auto &child : conjunction.child_filters) {
-			auto part = TransformFilter(column, *child);
-			if (part.empty()) {
-				// one branch does not restrict rows, so neither does the OR
-				return string();
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
+		auto &children = op_expr.GetChildren();
+		if (children.size() == 1 && IsColumnSubject(*children[0])) {
+			if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+				return column + " IS NULL";
 			}
-			parts.push_back(part);
+			if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+				return column + " IS NOT NULL";
+			}
 		}
-		return "(" + StringUtil::Join(parts, " OR ") + ")";
-	}
-	case TableFilterType::OPTIONAL_FILTER:
-		// "executing filter is not required for query correctness" (table_filter.hpp) -- DuckDB keeps enforcing
-		// the real predicate itself wherever it needs to (above a join, or above the LIMIT/ORDER BY this filter
-		// was pushed alongside), so it must never become a ClickHouse predicate: doing so could exclude rows
-		// before that real operator ever sees them (a join whose build side resolves to one value, feeding a
-		// LIMIT, is the shape that reproduces it). Never translate the wrapped filter, regardless of whether
-		// it is itself translatable.
-		return string();
-	case TableFilterType::DYNAMIC_FILTER:
-	case TableFilterType::BLOOM_FILTER:
-		// runtime hints from joins / top-n: the operators above the scan still enforce them
-		return string();
-	case TableFilterType::EXPRESSION_FILTER: {
-		// the only two expression shapes ClickhousePushdownExpression (clickhouse_scanner.cpp) ever hands back:
-		// a unary IS [NOT] NULL directly on a bound column reference, or `CAST(<enum column> AS VARCHAR) =/!=
-		// <string constant>` (DuckDB's binder rewrite of `enum_col =/!= 'literal'`)
-		auto &expression_filter = filter.Cast<ExpressionFilter>();
-		auto &expr = *expression_filter.expr;
-		if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
-			auto &op_expr = expr.Cast<BoundOperatorExpression>();
-			if (op_expr.children.size() == 1 &&
-			    op_expr.children[0]->GetExpressionClass() == ExpressionClass::BOUND_REF) {
-				if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
-					return column + " IS NULL";
+		if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		    expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+			vector<string> values;
+			for (idx_t i = 1; i < children.size(); i++) {
+				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					throw NotImplementedException("ClickHouse filter pushdown: unsupported expression filter %s",
+					                              expr.ToString());
 				}
-				if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
-					return column + " IS NOT NULL";
+				auto &value = children[i]->Cast<BoundConstantExpression>().GetValue();
+				try {
+					values.push_back(ClickhouseFilterPushdown::TransformConstant(value));
+				} catch (NotImplementedException &) {
+					// TransformConstant refuses a value of a type it otherwise translates in exactly two cases:
+					// a DATE outside the range toDate32 represents exactly, and an infinite DATE or
+					// TIMESTAMP_TZ. Such a value can never equal any value the column could hold, so dropping
+					// it from the list is exact.
+					auto type_id = value.type().id();
+					if (type_id != LogicalTypeId::DATE && type_id != LogicalTypeId::TIMESTAMP_TZ) {
+						throw;
+					}
 				}
 			}
-		} else if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON &&
-		           (expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL ||
-		            expr.GetExpressionType() == ExpressionType::COMPARE_NOTEQUAL)) {
-			auto &comparison = expr.Cast<BoundComparisonExpression>();
+			if (values.empty()) {
+				return expr.GetExpressionType() == ExpressionType::COMPARE_IN ? "1 = 0" : "1 = 1";
+			}
+			auto op = expr.GetExpressionType() == ExpressionType::COMPARE_IN ? " IN " : " NOT IN ";
+			return column + op + "(" + StringUtil::Join(values, ", ") + ")";
+		}
+	}
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto &comparison = expr.Cast<BoundFunctionExpression>();
+		auto comparison_type = expr.GetExpressionType();
+		auto constant_ptr = ExpressionFilter::TryGetColumnConstantComparison(comparison, comparison_type);
+		if (constant_ptr) {
+			auto &constant = constant_ptr->GetValue();
+			auto folded = TryFoldUnrepresentableComparison(column, comparison_type, constant);
+			if (!folded.empty()) {
+				return folded;
+			}
+			if (constant.type().id() == LogicalTypeId::UUID && IsOrderedComparison(comparison_type)) {
+				// ClickHouse orders UUIDs by their second 64-bit half first; its canonical lowercase text orders
+				// exactly like DuckDB's UUID
+				return "toString(" + column + ") " + TransformComparison(comparison_type) + " " +
+				       ClickhouseUtils::QuoteLiteral(constant.ToString());
+			}
+			return column + " " + TransformComparison(comparison_type) + " " +
+			       ClickhouseFilterPushdown::TransformConstant(constant);
+		}
+		if (comparison_type == ExpressionType::COMPARE_EQUAL || comparison_type == ExpressionType::COMPARE_NOTEQUAL) {
+			auto &left = BoundComparisonExpression::Left(comparison);
+			auto &right = BoundComparisonExpression::Right(comparison);
 			const Expression *other = nullptr;
-			if (IsVarcharCastOfColumnReference(*comparison.left)) {
-				other = comparison.right.get();
-			} else if (IsVarcharCastOfColumnReference(*comparison.right)) {
-				other = comparison.left.get();
+			if (IsVarcharCastOfColumnReference(left)) {
+				other = &right;
+			} else if (IsVarcharCastOfColumnReference(right)) {
+				other = &left;
 			}
 			if (other && other->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 				auto &constant = other->Cast<BoundConstantExpression>();
-				// ClickhousePushdownExpression already rejects a NULL or non-VARCHAR constant here (and
-				// validates the label against the column's own enum members) -- checked again defensively
-				// since this switch has no other way to know that gate ran
-				if (!constant.value.IsNull() && constant.value.type().id() == LogicalTypeId::VARCHAR) {
-					auto op = expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL ? " = " : " != ";
-					return column + op + ClickhouseUtils::QuoteLiteral(StringValue::Get(constant.value));
+				if (!constant.GetValue().IsNull() && constant.GetValue().type().id() == LogicalTypeId::VARCHAR) {
+					auto op = comparison_type == ExpressionType::COMPARE_EQUAL ? " = " : " != ";
+					return column + op + ClickhouseUtils::QuoteLiteral(StringValue::Get(constant.GetValue()));
 				}
 			}
 		}
-		throw NotImplementedException("ClickHouse filter pushdown: unsupported expression filter %s", expr.ToString());
 	}
-	default:
-		throw NotImplementedException("ClickHouse filter pushdown: unsupported filter type %s",
-		                              EnumUtil::ToString(filter.filter_type));
-	}
+	throw NotImplementedException("ClickHouse filter pushdown: unsupported expression filter %s", expr.ToString());
 }
 
 string ClickhouseFilterPushdown::TransformFilters(const vector<column_t> &column_ids,
                                                   optional_ptr<TableFilterSet> filters,
                                                   const vector<ClickhouseColumnInfo> &columns) {
-	if (!filters || filters->filters.empty()) {
+	if (!filters || !filters->HasFilters()) {
 		return string();
 	}
 	vector<string> conditions;
-	for (auto &entry : filters->filters) {
-		auto column_id = column_ids[entry.first];
+	for (auto &entry : *filters) {
+		auto column_id = column_ids[entry.GetIndex()];
 		if (IsVirtualColumn(column_id)) {
 			throw InternalException("ClickHouse filter pushdown: unexpected filter on a virtual column");
 		}
 		auto column = ClickhouseUtils::QuoteIdentifier(columns[column_id].name);
-		auto condition = TransformFilter(column, *entry.second);
+		auto condition = TransformFilter(column, entry.Filter(), columns[column_id].type);
 		if (!condition.empty()) {
 			conditions.push_back(condition);
 		}

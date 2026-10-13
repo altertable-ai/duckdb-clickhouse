@@ -7,8 +7,10 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/scalar/tablefilter_functions.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/list.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 #include <cmath>
@@ -76,7 +78,7 @@ static bool IsTimeZoneDependent(const LogicalType &type) {
 
 static bool IsNullConstant(const Expression &expr) {
 	return expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
-	       expr.Cast<BoundConstantExpression>().value.IsNull();
+	       expr.Cast<BoundConstantExpression>().GetValue().IsNull();
 }
 
 static string ComparisonOperator(const Expression &expr) {
@@ -103,7 +105,7 @@ static string LikePattern(const Expression &pattern) {
 	if (pattern.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 		ThrowUntranslatable(pattern);
 	}
-	auto &value = pattern.Cast<BoundConstantExpression>().value;
+	auto &value = pattern.Cast<BoundConstantExpression>().GetValue();
 	if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
 		ThrowUntranslatable(pattern);
 	}
@@ -347,26 +349,26 @@ string ClickhouseExpression::Cast(const string &sql, const LogicalType &source, 
 //! DuckDB computes FLOAT arithmetic in single precision, ClickHouse promotes Float32 to Float64: rounding the
 //! Float64 result of + - * / (or of a negation) of two Float32 values to Float32 gives the single-precision result
 static string ArithmeticResult(const BoundFunctionExpression &function, const string &sql) {
-	return function.return_type.id() == LogicalTypeId::FLOAT ? "toFloat32(" + sql + ")" : sql;
+	return function.GetReturnType().id() == LogicalTypeId::FLOAT ? "toFloat32(" + sql + ")" : sql;
 }
 
 //! Whether DuckDB's arithmetic function `function` computes what ClickHouse's operator does (overflow and division
 //! by zero aside): numbers only, or a DATE plus/minus a number of days
 static bool IsTranslatableArithmetic(const BoundFunctionExpression &function) {
-	auto &name = function.function.name;
-	auto &children = function.children;
-	auto all_numeric = function.return_type.IsNumeric();
+	auto &name = function.Function().GetName();
+	auto &children = function.GetChildren();
+	auto all_numeric = function.GetReturnType().IsNumeric();
 	for (auto &child : children) {
-		all_numeric = all_numeric && child->return_type.IsNumeric();
+		all_numeric = all_numeric && child->GetReturnType().IsNumeric();
 	}
 	if (all_numeric) {
 		return true;
 	}
-	if (function.return_type.id() != LogicalTypeId::DATE || children.size() != 2) {
+	if (function.GetReturnType().id() != LogicalTypeId::DATE || children.size() != 2) {
 		return false;
 	}
-	auto &left = children[0]->return_type;
-	auto &right = children[1]->return_type;
+	auto &left = children[0]->GetReturnType();
+	auto &right = children[1]->GetReturnType();
 	if (name == "+") {
 		return (left.id() == LogicalTypeId::DATE && right.IsIntegral()) ||
 		       (left.IsIntegral() && right.id() == LogicalTypeId::DATE);
@@ -375,20 +377,20 @@ static bool IsTranslatableArithmetic(const BoundFunctionExpression &function) {
 }
 
 static string TranslateFunction(const BoundFunctionExpression &function, const std::function<string(idx_t)> &resolve) {
-	auto &name = function.function.name;
-	auto &children = function.children;
+	auto name = function.Function().GetName().GetIdentifierName();
+	auto &children = function.GetChildren();
 	auto arg = [&](idx_t i) {
 		return ClickhouseExpression::Translate(*children[i], resolve);
 	};
 	auto is_string = [&](idx_t i) {
-		return children[i]->return_type.id() == LogicalTypeId::VARCHAR;
+		return children[i]->GetReturnType().id() == LogicalTypeId::VARCHAR;
 	};
 	auto is_arithmetic = name == "+" || name == "-" || name == "*" || name == "/" || name == "//" || name == "%";
 	if (is_arithmetic && !IsTranslatableArithmetic(function)) {
 		throw NotImplementedException("%s on %s has no exact ClickHouse translation: %s", name,
-		                              function.return_type.ToString(), function.ToString());
+		                              function.GetReturnType().ToString(), function.ToString());
 	}
-	auto integral_result = function.return_type.IsIntegral();
+	auto integral_result = function.GetReturnType().IsIntegral();
 	if (children.size() == 2 && (name == "+" || name == "-" || name == "*")) {
 		return ArithmeticResult(function, "(" + arg(0) + " " + name + " " + arg(1) + ")");
 	}
@@ -401,7 +403,7 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 		// both
 		return "intDiv(" + arg(0) + ", " + arg(1) + ")";
 	}
-	if (children.size() == 2 && name == "/" && function.return_type.IsFloating()) {
+	if (children.size() == 2 && name == "/" && function.GetReturnType().IsFloating()) {
 		return ArithmeticResult(function, "(" + arg(0) + " / " + arg(1) + ")");
 	}
 	if (children.size() == 2 && name == "%" && integral_result) {
@@ -411,7 +413,7 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 		// DuckDB's // on FLOAT/DOUBLE (and DECIMAL, which it casts to DOUBLE) is a plain division; % on them is
 		// fmod(), which ClickHouse does not compute the same way for large values (1e20 % 3)
 		throw NotImplementedException("%s on %s has no exact ClickHouse translation: %s", name,
-		                              function.return_type.ToString(), function.ToString());
+		                              function.GetReturnType().ToString(), function.ToString());
 	}
 	if (children.size() == 2 && (name == "~~" || name == "!~~" || name == "~~*" || name == "!~~*")) {
 		auto negated = name[0] == '!';
@@ -446,37 +448,38 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 }
 
 static string TranslateOperator(const BoundOperatorExpression &op, const std::function<string(idx_t)> &resolve) {
+	auto &children = op.GetChildren();
 	auto arg = [&](idx_t i) {
-		return ClickhouseExpression::Translate(*op.children[i], resolve);
+		return ClickhouseExpression::Translate(*children[i], resolve);
 	};
 	switch (op.GetExpressionType()) {
 	case ExpressionType::OPERATOR_NOT:
-		if (op.children.size() != 1) {
+		if (children.size() != 1) {
 			ThrowUntranslatable(op);
 		}
 		return "(NOT " + arg(0) + ")";
 	case ExpressionType::OPERATOR_IS_NULL:
-		if (op.children.size() != 1) {
+		if (children.size() != 1) {
 			ThrowUntranslatable(op);
 		}
 		return "(" + arg(0) + " IS NULL)";
 	case ExpressionType::OPERATOR_IS_NOT_NULL:
-		if (op.children.size() != 1) {
+		if (children.size() != 1) {
 			ThrowUntranslatable(op);
 		}
 		return "(" + arg(0) + " IS NOT NULL)";
 	case ExpressionType::COMPARE_IN:
 	case ExpressionType::COMPARE_NOT_IN: {
-		if (op.children.size() < 2) {
+		if (children.size() < 2) {
 			ThrowUntranslatable(op);
 		}
 		vector<string> values;
-		for (idx_t i = 1; i < op.children.size(); i++) {
-			auto &child = *op.children[i];
+		for (idx_t i = 1; i < children.size(); i++) {
+			auto &child = *children[i];
 			// NULLs in the list: DuckDB yields NULL where ClickHouse (transform_null_in=0) yields 0/1, which flips
 			// NOT IN; only constant, non-NULL lists translate exactly
 			if (child.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
-			    child.Cast<BoundConstantExpression>().value.IsNull()) {
+			    child.Cast<BoundConstantExpression>().GetValue().IsNull()) {
 				ThrowUntranslatable(op);
 			}
 			values.push_back(arg(i));
@@ -485,7 +488,7 @@ static string TranslateOperator(const BoundOperatorExpression &op, const std::fu
 	}
 	case ExpressionType::OPERATOR_COALESCE: {
 		vector<string> values;
-		for (idx_t i = 0; i < op.children.size(); i++) {
+		for (idx_t i = 0; i < children.size(); i++) {
 			values.push_back(arg(i));
 		}
 		return "coalesce(" + StringUtil::Join(values, ", ") + ")";
@@ -495,10 +498,52 @@ static string TranslateOperator(const BoundOperatorExpression &op, const std::fu
 	}
 }
 
+static string TranslateComparison(const BoundFunctionExpression &comparison,
+                                  const std::function<string(idx_t)> &resolve) {
+	auto &left = BoundComparisonExpression::Left(comparison);
+	auto &right = BoundComparisonExpression::Right(comparison);
+	// a comparison with a NULL constant is what DuckDB's optimizer leaves of an IN / NOT IN list holding NULL
+	// (x NOT IN (1, NULL) becomes x != 1 AND x != NULL): rejected like the list itself (see COMPARE_IN).
+	// Nothing else produces one: DuckDB folds a hand-written x = NULL to NULL
+	if (IsNullConstant(left) || IsNullConstant(right)) {
+		ThrowUntranslatable(comparison);
+	}
+	return "(" + ClickhouseExpression::Translate(left, resolve) + " " + ComparisonOperator(comparison) + " " +
+	       ClickhouseExpression::Translate(right, resolve) + ")";
+}
+
+static string TranslateBetween(const BoundFunctionExpression &between, const std::function<string(idx_t)> &resolve) {
+	auto input = ClickhouseExpression::Translate(BoundBetweenExpression::Input(between), resolve);
+	return "(" + input + (BoundBetweenExpression::LowerInclusive(between) ? " >= " : " > ") +
+	       ClickhouseExpression::Translate(BoundBetweenExpression::LowerBound(between), resolve) + " AND " + input +
+	       (BoundBetweenExpression::UpperInclusive(between) ? " <= " : " < ") +
+	       ClickhouseExpression::Translate(BoundBetweenExpression::UpperBound(between), resolve) + ")";
+}
+
+static string TranslateCast(const BoundFunctionExpression &cast, const std::function<string(idx_t)> &resolve) {
+	if (BoundCastExpression::IsTryCast(cast)) {
+		ThrowUntranslatable(cast);
+	}
+	auto &child = BoundCastExpression::Child(cast);
+	CastRounding rounding;
+	try {
+		rounding = ClassifyCast(child.GetReturnType(), cast.GetReturnType());
+	} catch (NotImplementedException &ex) {
+		throw NotImplementedException("%s: %s", ErrorData(ex).RawMessage(), cast.ToString());
+	}
+	string type;
+	try {
+		type = ClickhouseDdlTypes::ToClickhouse(cast.GetReturnType(), true);
+	} catch (NotImplementedException &) {
+		ThrowUntranslatable(cast);
+	}
+	return CastSql(rounding, ClickhouseExpression::Translate(child, resolve), cast.GetReturnType(), type);
+}
+
 string ClickhouseExpression::Translate(const Expression &expr, const std::function<string(idx_t)> &resolve) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
-		return resolve(expr.Cast<BoundReferenceExpression>().index);
+		return resolve(expr.Cast<BoundReferenceExpression>().Index());
 	case ExpressionClass::BOUND_PARAMETER:
 		// a parameter whose value is not known yet (PREPARE): when one is supplied, DuckDB's binder emits it as a
 		// constant instead (ExpressionBinder::BindExpression(ParameterExpression &)). ClickhouseDml does not
@@ -506,28 +551,18 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 		throw NotImplementedException("prepared-statement parameter %s has no value yet", expr.ToString());
 	case ExpressionClass::BOUND_CONSTANT:
 		try {
-			return Literal(expr.Cast<BoundConstantExpression>().value);
+			return Literal(expr.Cast<BoundConstantExpression>().GetValue());
 		} catch (NotImplementedException &) {
 			ThrowUntranslatable(expr);
 		}
-	case ExpressionClass::BOUND_COMPARISON: {
-		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		// a comparison with a NULL constant is what DuckDB's optimizer leaves of an IN / NOT IN list holding NULL
-		// (x NOT IN (1, NULL) becomes x != 1 AND x != NULL): rejected like the list itself (see COMPARE_IN).
-		// Nothing else produces one: DuckDB folds a hand-written x = NULL to NULL
-		if (IsNullConstant(*comparison.left) || IsNullConstant(*comparison.right)) {
-			ThrowUntranslatable(expr);
-		}
-		return "(" + Translate(*comparison.left, resolve) + " " + ComparisonOperator(expr) + " " +
-		       Translate(*comparison.right, resolve) + ")";
-	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-		if (conjunction.children.empty()) {
+		auto &children = conjunction.GetChildren();
+		if (children.empty()) {
 			ThrowUntranslatable(expr);
 		}
 		vector<string> parts;
-		for (auto &child : conjunction.children) {
+		for (auto &child : children) {
 			parts.push_back(Translate(*child, resolve));
 		}
 		string separator;
@@ -545,92 +580,101 @@ string ClickhouseExpression::Translate(const Expression &expr, const std::functi
 	}
 	case ExpressionClass::BOUND_OPERATOR:
 		return TranslateOperator(expr.Cast<BoundOperatorExpression>(), resolve);
-	case ExpressionClass::BOUND_BETWEEN: {
-		auto &between = expr.Cast<BoundBetweenExpression>();
-		auto input = Translate(*between.input, resolve);
-		return "(" + input + (between.lower_inclusive ? " >= " : " > ") + Translate(*between.lower, resolve) + " AND " +
-		       input + (between.upper_inclusive ? " <= " : " < ") + Translate(*between.upper, resolve) + ")";
-	}
-	case ExpressionClass::BOUND_FUNCTION:
-		return TranslateFunction(expr.Cast<BoundFunctionExpression>(), resolve);
-	case ExpressionClass::BOUND_CAST: {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		if (cast.try_cast) {
-			ThrowUntranslatable(expr);
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (BoundComparisonExpression::IsComparison(function)) {
+			return TranslateComparison(function, resolve);
 		}
-		CastRounding rounding;
-		try {
-			rounding = ClassifyCast(cast.child->return_type, cast.return_type);
-		} catch (NotImplementedException &ex) {
-			throw NotImplementedException("%s: %s", ErrorData(ex).RawMessage(), expr.ToString());
+		if (BoundCastExpression::IsCast(function)) {
+			return TranslateCast(function, resolve);
 		}
-		string type;
-		try {
-			type = ClickhouseDdlTypes::ToClickhouse(cast.return_type, true);
-		} catch (NotImplementedException &) {
-			ThrowUntranslatable(expr);
+		if (function.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			return TranslateBetween(function, resolve);
 		}
-		return CastSql(rounding, Translate(*cast.child, resolve), cast.return_type, type);
+		return TranslateFunction(function, resolve);
 	}
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
 		string sql = "(CASE";
-		for (auto &check : case_expr.case_checks) {
+		for (auto &check : case_expr.CaseChecks()) {
 			sql += " WHEN " + Translate(*check.when_expr, resolve) + " THEN " + Translate(*check.then_expr, resolve);
 		}
-		return sql + " ELSE " + Translate(*case_expr.else_expr, resolve) + " END)";
+		return sql + " ELSE " + Translate(*case_expr.ElseExpression(), resolve) + " END)";
 	}
 	default:
 		ThrowUntranslatable(expr);
 	}
 }
 
-string ClickhouseExpression::TranslateTableFilter(const TableFilter &filter, const LogicalType &column_type,
-                                                  const string &column) {
-	switch (filter.filter_type) {
-	case TableFilterType::OPTIONAL_FILTER:
+static bool IsRuntimeHintExpression(const Expression &expr) {
+	return ExpressionFilter::ContainsInternalFunction(expr, TableFilterDynamicFun::Name) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, TableFilterBloomFilterFun::Name) ||
+	       ExpressionFilter::ContainsInternalFunction(expr, TableFilterPrefixRangeFun::Name);
+}
+
+static string TranslateTableFilterExpression(const Expression &expr, const string &column) {
+	if (ExpressionFilter::IsOptionalExpression(expr) || ExpressionFilter::IsRootOptionalExpression(expr)) {
 		return string();
-	case TableFilterType::DYNAMIC_FILTER:
-	case TableFilterType::BLOOM_FILTER:
-		throw NotImplementedException("runtime filter %s", EnumUtil::ToString(filter.filter_type));
-	case TableFilterType::CONJUNCTION_AND: {
+	}
+	if (IsRuntimeHintExpression(expr) && expr.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION) {
+		throw NotImplementedException("runtime filter");
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		auto is_and = expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
 		vector<string> parts;
-		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
-			auto part = TranslateTableFilter(*child, column_type, column);
-			if (!part.empty()) {
+		for (auto &child : conj.GetChildren()) {
+			auto part = TranslateTableFilterExpression(*child, column);
+			if (is_and) {
+				if (!part.empty()) {
+					parts.push_back(part);
+				}
+			} else if (part.empty()) {
+				throw NotImplementedException("OR filter with a non-exact branch");
+			} else {
 				parts.push_back(part);
 			}
 		}
-		return parts.empty() ? string() : "(" + StringUtil::Join(parts, " AND ") + ")";
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		vector<string> parts;
-		for (auto &child : filter.Cast<ConjunctionOrFilter>().child_filters) {
-			auto part = TranslateTableFilter(*child, column_type, column);
-			if (part.empty()) {
-				// dropping a branch of an OR would narrow it; dropping the whole OR would widen the statement
-				throw NotImplementedException("OR filter with a non-exact branch");
-			}
-			parts.push_back(part);
-		}
 		if (parts.empty()) {
+			if (is_and) {
+				return string();
+			}
 			throw NotImplementedException("empty OR filter");
 		}
-		return "(" + StringUtil::Join(parts, " OR ") + ")";
+		return "(" + StringUtil::Join(parts, is_and ? " AND " : " OR ") + ")";
 	}
-	default: {
-		// every other filter (constant comparison, IS [NOT] NULL, IN list, expression, struct extract) as the
-		// expression DuckDB itself would evaluate for it, through the same allow-list as a LogicalFilter's
-		BoundReferenceExpression column_ref(column_type, 0);
-		auto expr = filter.ToExpression(column_ref);
-		return Translate(*expr, [&](idx_t index) -> string {
-			if (index != 0) {
-				throw NotImplementedException("filter referencing another column");
-			}
-			return column;
-		});
+	return ClickhouseExpression::Translate(expr, [&](idx_t index) -> string {
+		if (index != 0) {
+			throw NotImplementedException("filter referencing another column");
+		}
+		return column;
+	});
+}
+
+string ClickhouseExpression::TranslateTableFilter(const TableFilter &filter, const LogicalType &column_type,
+                                                  const string &column) {
+	if (filter.filter_type == TableFilterType::EXPRESSION_FILTER) {
+		if (ExpressionFilter::IsOptionalFilter(filter) || ExpressionFilter::IsRootOptionalFilter(filter)) {
+			return string();
+		}
+		if (ExpressionFilter::GetRootOptionalDynamicFilterData(filter)) {
+			throw NotImplementedException("runtime filter");
+		}
+		return TranslateTableFilterExpression(*ExpressionFilter::GetExpressionFilter(filter, "clickhouse").expr,
+		                                      column);
 	}
+	switch (filter.filter_type) {
+	case TableFilterType::LEGACY_OPTIONAL_FILTER:
+		return string();
+	case TableFilterType::LEGACY_DYNAMIC_FILTER:
+	case TableFilterType::LEGACY_BLOOM_FILTER:
+	case TableFilterType::LEGACY_PREFIX_RANGE_FILTER:
+		throw NotImplementedException("runtime filter %s", EnumUtil::ToString(filter.filter_type));
+	default:
+		break;
 	}
+	auto converted = ExpressionFilter::FromTableFilter(filter, column_type);
+	return TranslateTableFilterExpression(*converted->expr, column);
 }
 
 } // namespace duckdb

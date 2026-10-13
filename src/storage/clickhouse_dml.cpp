@@ -37,7 +37,8 @@ void ClickhouseDml::ThrowUnsupportedShape(const string &statement, const TableCa
 }
 
 string ClickhouseDml::DisplayName(const TableCatalogEntry &table) {
-	return KeywordHelper::WriteQuoted(table.schema.name, '"') + "." + KeywordHelper::WriteQuoted(table.name, '"');
+	return KeywordHelper::WriteQuoted(table.schema.name.GetIdentifierName(), '"') + "." +
+	       KeywordHelper::WriteQuoted(table.name.GetIdentifierName(), '"');
 }
 
 //! Whether TRUNCATE TABLE really removes the rows of a table with this engine: the MergeTree family (Replicated,
@@ -94,14 +95,14 @@ static const LogicalComparisonJoin &ValidateInListJoin(const LogicalOperator &op
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
 	auto &constants = join.children[1]->Cast<LogicalColumnDataGet>();
-	if (join.conditions.size() != 1 || join.predicate || !join.duplicate_eliminated_columns.empty() ||
+	if (join.conditions.size() != 1 || join.HasArbitraryConditions() || !join.duplicate_eliminated_columns.empty() ||
 	    !join.mark_types.empty() || join.delim_flipped || constants.chunk_types.size() != 1 || !constants.collection) {
 		throw NotImplementedException(IN_LIST_JOIN);
 	}
 	auto &condition = join.conditions[0];
-	if (condition.comparison != ExpressionType::COMPARE_EQUAL || !condition.left || !condition.right ||
-	    condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF ||
-	    condition.right->Cast<BoundReferenceExpression>().index != 0) {
+	if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+	    condition.GetRHS().GetExpressionClass() != ExpressionClass::BOUND_REF ||
+	    condition.GetRHS().Cast<BoundReferenceExpression>().Index() != 0) {
 		throw NotImplementedException(IN_LIST_JOIN);
 	}
 	return join;
@@ -194,7 +195,7 @@ static ReferenceStep StepReference(const LogicalOperator &op, idx_t index) {
 		}
 		auto &expr = *op.expressions[index];
 		if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-			return PassThrough(op, index, expr.Cast<BoundReferenceExpression>().index);
+			return PassThrough(op, index, expr.Cast<BoundReferenceExpression>().Index());
 		}
 		return ReferenceStep {ReferenceStep::Kind::PROJECTION_EXPRESSION, &op, index};
 	}
@@ -246,21 +247,21 @@ static string TranslateInListFilter(const Expression &expr, const LogicalOperato
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
 	    expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
 		auto &op = expr.Cast<BoundOperatorExpression>();
-		if (op.children.size() != 1) {
+		if (op.GetChildren().size() != 1) {
 			return string();
 		}
-		inner = op.children[0].get();
+		inner = op.GetChildren()[0].get();
 		negated = true;
 	}
 	if (inner->GetExpressionClass() != ExpressionClass::BOUND_REF) {
 		return string();
 	}
-	auto join = FindMarkJoin(input, inner->Cast<BoundReferenceExpression>().index);
+	auto join = FindMarkJoin(input, inner->Cast<BoundReferenceExpression>().Index());
 	if (!join) {
 		return string();
 	}
 	auto &left_input = *join->children[0];
-	auto left = ClickhouseExpression::Translate(*join->conditions[0].left,
+	auto left = ClickhouseExpression::Translate(join->conditions[0].GetLHS(),
 	                                            [&](idx_t i) { return ClickhouseDml::ResolveOutput(left_input, i); });
 	auto &constants = join->children[1]->Cast<LogicalColumnDataGet>();
 	vector<string> values;
@@ -362,7 +363,7 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 			throw NotImplementedException("operator %s", LogicalOperatorToString(current.get().type));
 		}
 		auto &get = current.get().Cast<LogicalGet>();
-		if (!ClickhouseScanFunction::IsClickhouseScan(get.function.name) || !get.bind_data ||
+		if (!ClickhouseScanFunction::IsClickhouseScan(get.function.GetName()) || !get.bind_data ||
 		    ScanBindData(get).table_entry != &table) {
 			throw NotImplementedException("reads another table");
 		}
@@ -375,17 +376,20 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 			// ClickHouse would not match the rows the predicate alone selects
 			throw NotImplementedException("scan with a pushed-down ORDER BY or LIMIT");
 		}
-		// at the logical level (before PhysicalPlanGenerator::CreatePlan(LogicalGet) renumbers them for the
-		// physical scan), table_filters is keyed by the table column id itself (TableFilterSet::PushFilter keys by
-		// ColumnIndex::GetPrimaryIndex()), not by position in the get's column_ids. Every filter is here, whether
-		// or not the scan would push it into ClickHouse for a SELECT (supports_pushdown_type is only consulted
-		// when the get is planned)
-		for (auto &entry : get.table_filters.filters) {
-			auto column_id = entry.first;
+		// table_filters is keyed by ProjectionIndex into the get's column_ids (FilterCombiner::PushFilter).
+		// Every filter is here, whether or not the scan would push it into ClickHouse for a SELECT
+		// (supports_pushdown_type is only consulted when the get is planned)
+		auto &column_ids = get.GetColumnIds();
+		for (auto &entry : get.table_filters) {
+			auto proj_idx = entry.GetIndex().GetIndex();
+			if (proj_idx >= column_ids.size()) {
+				throw NotImplementedException("filter on an unknown projection");
+			}
+			auto column_id = column_ids[proj_idx].GetPrimaryIndex();
 			if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size()) {
 				throw NotImplementedException("filter on a virtual column");
 			}
-			auto sql = ClickhouseExpression::TranslateTableFilter(*entry.second, bind_data.columns[column_id].type,
+			auto sql = ClickhouseExpression::TranslateTableFilter(entry.Filter(), bind_data.columns[column_id].type,
 			                                                      ColumnSql(bind_data, column_id));
 			if (!sql.empty()) {
 				conditions.push_back(sql);
@@ -417,7 +421,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanDelete(LogicalDelete &op) {
 	}
 	auto target = AnalyzeTarget("DELETE", op.table, *op.children[0]);
 	ClickhouseDmlStatement result;
-	result.catalog_name = op.table.catalog.GetName();
+	result.catalog_name = op.table.catalog.GetName().GetIdentifierName();
 	if (target.unbound_parameters) {
 		result.description = "DELETE FROM " + target.qualified_name;
 		result.unbound_parameters = true;
@@ -505,7 +509,7 @@ static optional_ptr<const BoundConstantExpression> ResolveConstant(const Express
                                                                    const LogicalOperator &child) {
 	auto resolved = &expr;
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-		auto traced = TraceReference(child, expr.Cast<BoundReferenceExpression>().index);
+		auto traced = TraceReference(child, expr.Cast<BoundReferenceExpression>().Index());
 		if (traced.kind != ReferenceStep::Kind::PROJECTION_EXPRESSION) {
 			return nullptr;
 		}
@@ -643,7 +647,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 		}
 	}
 	ClickhouseDmlStatement result;
-	result.catalog_name = op.table.catalog.GetName();
+	result.catalog_name = op.table.catalog.GetName().GetIdentifierName();
 	result.description = "ALTER TABLE " + target.qualified_name + " UPDATE";
 	// both flags come with an empty predicate, which must never become WHERE 1 (every row)
 	if (target.unbound_parameters) {
@@ -668,7 +672,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			bool check_nulls = !CanHoldNull(column.type_node);
 			optional_idx source;
 			if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
-				source = UnchangedScanColumn(child, expr.Cast<BoundReferenceExpression>().index);
+				source = UnchangedScanColumn(child, expr.Cast<BoundReferenceExpression>().Index());
 				if (source.IsValid() && source.GetIndex() == column_id) {
 					// col = col: DuckDB adds every column like this to some UPDATEs (e.g. of an array column, which
 					// it turns into DELETE + INSERT); sending them would fail on key columns
@@ -682,10 +686,11 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			// a NULL element also fails the mutation, and isNull() of an Array, Tuple or Map is never true: decided
 			// here, from the constant or the ClickHouse type of the source column
 			if (constant) {
-				if (check_nulls && constant->value.IsNull()) {
-					throw ConstraintException("NOT NULL constraint failed: %s.%s", target.table.name, column.name);
+				if (check_nulls && constant->GetValue().IsNull()) {
+					throw ConstraintException("NOT NULL constraint failed: %s.%s",
+					                          target.table.name.GetIdentifierName(), column.name);
 				}
-				if (HoldsNullElement(constant->value, column.type_node)) {
+				if (HoldsNullElement(constant->GetValue(), column.type_node)) {
 					throw ConstraintException("NOT NULL constraint failed: %s.%s (an element of the new value is NULL, "
 					                          "which ClickHouse type %s cannot store)",
 					                          target.table.name, column.name, column.clickhouse_type);
@@ -706,7 +711,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			}
 			if (ConvertedOnServer(column.type_node)) {
 				auto &base = ClickhouseTypeWrappers::Of(column.type_node).base;
-				if (constant && constant->value.IsNull()) {
+				if (constant && constant->GetValue().IsNull()) {
 					// exact whatever the type (a column that cannot hold NULL was refused above)
 					assignments.push_back(ClickhouseUtils::QuoteIdentifier(column.name) + " = CAST(NULL AS " +
 					                      column.clickhouse_type + ")");
@@ -741,8 +746,8 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 			// converts the column's DuckDB type into its ClickHouse type: exact for the types left here, except for
 			// DateTime and DateTime64(p < 6), floored first like an INSERT. Should the value's type ever differ from
 			// the column's, that first cast is checked (and rounded) here
-			if (expr.return_type != column.type) {
-				value = ClickhouseExpression::Cast(value, expr.return_type, column.type,
+			if (expr.GetReturnType() != column.type) {
+				value = ClickhouseExpression::Cast(value, expr.GetReturnType(), column.type,
 				                                   ClickhouseDdlTypes::ToClickhouse(column.type, true));
 			}
 			auto precision = ClickhouseTypes::DateTimePrecision(column.type_node);
@@ -779,7 +784,7 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 	if (!null_counts.empty()) {
 		result.null_check_sql =
 		    "SELECT " + StringUtil::Join(null_counts, ", ") + " FROM " + target.qualified_name + " WHERE " + where;
-		result.table_name = target.table.name;
+		result.table_name = target.table.name.GetIdentifierName();
 	}
 	result.settings = ClickhouseConnection::ExtensionQuerySettings();
 	result.settings.push_back(MutationsSyncSetting(context));

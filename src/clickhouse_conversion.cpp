@@ -6,6 +6,11 @@
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 
 #include <clickhouse/client.h>
 #include <clickhouse/columns/bool.h>
@@ -31,12 +36,12 @@ static void ConvertNumeric(const ch::ColumnRef &column, Vector &result, idx_t of
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
 	auto &data = typed->GetWritableData();
-	memcpy(FlatVector::GetData<T>(result), data.data() + offset, count * sizeof(T));
+	memcpy(FlatVector::GetDataMutable<T>(result), data.data() + offset, count * sizeof(T));
 }
 
 static void ConvertBool(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,
                         const string &column_name) {
-	auto data = FlatVector::GetData<bool>(result);
+	auto data = FlatVector::GetDataMutable<bool>(result);
 	if (auto typed = column->As<ch::ColumnBool>()) {
 		for (idx_t i = 0; i < count; i++) {
 			data[i] = typed->At(offset + i);
@@ -62,7 +67,7 @@ static void ConvertInt128(const ch::ColumnRef &column, Vector &result, idx_t off
 	if (!typed) {
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
-	auto data = FlatVector::GetData<hugeint_t>(result);
+	auto data = FlatVector::GetDataMutable<hugeint_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		data[i] = ToHugeint(typed->At(offset + i));
 	}
@@ -74,7 +79,7 @@ static void ConvertUInt128(const ch::ColumnRef &column, Vector &result, idx_t of
 	if (!typed) {
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
-	auto data = FlatVector::GetData<uhugeint_t>(result);
+	auto data = FlatVector::GetDataMutable<uhugeint_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto value = typed->At(offset + i);
 		data[i] = uhugeint_t(absl::Uint128High64(value), absl::Uint128Low64(value));
@@ -84,7 +89,7 @@ static void ConvertUInt128(const ch::ColumnRef &column, Vector &result, idx_t of
 template <class T>
 static void ConvertDecimalTo(const std::shared_ptr<ch::ColumnDecimal> &typed, Vector &result, idx_t offset,
                              idx_t count) {
-	auto data = FlatVector::GetData<T>(result);
+	auto data = FlatVector::GetDataMutable<T>(result);
 	for (idx_t i = 0; i < count; i++) {
 		data[i] = static_cast<T>(typed->At(offset + i));
 	}
@@ -107,7 +112,7 @@ static void ConvertDecimal(const ch::ColumnRef &column, Vector &result, idx_t of
 		ConvertDecimalTo<int64_t>(typed, result, offset, count);
 		break;
 	case PhysicalType::INT128: {
-		auto data = FlatVector::GetData<hugeint_t>(result);
+		auto data = FlatVector::GetDataMutable<hugeint_t>(result);
 		for (idx_t i = 0; i < count; i++) {
 			data[i] = ToHugeint(typed->At(offset + i));
 		}
@@ -121,8 +126,8 @@ static void ConvertDecimal(const ch::ColumnRef &column, Vector &result, idx_t of
 template <class COLUMN>
 static void ConvertStringColumn(const std::shared_ptr<COLUMN> &typed, Vector &result, idx_t offset, idx_t count,
                                 const string &column_name) {
-	auto data = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto data = FlatVector::GetDataMutable<string_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < count; i++) {
 		if (!validity.RowIsValid(i)) {
 			continue;
@@ -152,7 +157,7 @@ static void ConvertString(const ch::ColumnRef &column, Vector &result, idx_t off
 
 static void ConvertDate(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,
                         const string &column_name) {
-	auto data = FlatVector::GetData<date_t>(result);
+	auto data = FlatVector::GetDataMutable<date_t>(result);
 	if (auto typed = column->As<ch::ColumnDate>()) {
 		for (idx_t i = 0; i < count; i++) {
 			data[i] = date_t(static_cast<int32_t>(typed->RawAt(offset + i)));
@@ -170,7 +175,7 @@ static void ConvertDate(const ch::ColumnRef &column, Vector &result, idx_t offse
 
 static void ConvertTimestamp(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,
                              const string &column_name) {
-	auto data = FlatVector::GetData<timestamp_tz_t>(result);
+	auto data = FlatVector::GetDataMutable<timestamp_tz_t>(result);
 	if (auto typed = column->As<ch::ColumnDateTime>()) {
 		for (idx_t i = 0; i < count; i++) {
 			auto seconds = static_cast<int64_t>(typed->RawAt(offset + i));
@@ -198,7 +203,7 @@ static void ConvertTime(const ch::ColumnRef &column, Vector &result, idx_t offse
 	idx_t precision = time32 ? 0 : time64->GetPrecision();
 	auto nanoseconds = result.GetType().id() == LogicalTypeId::TIME_NS;
 	auto max_ticks = Interval::SECS_PER_DAY * ClickhouseUtils::PowerOfTen(precision);
-	auto &validity = FlatVector::Validity(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < count; i++) {
 		if (!validity.RowIsValid(i)) {
 			continue;
@@ -210,9 +215,9 @@ static void ConvertTime(const ch::ColumnRef &column, Vector &result, idx_t offse
 			    column_name);
 		}
 		if (nanoseconds) {
-			FlatVector::GetData<dtime_ns_t>(result)[i] = dtime_ns_t(ClickhouseUtils::ScaleTicks(ticks, precision, 9));
+			FlatVector::GetDataMutable<dtime_ns_t>(result)[i] = dtime_ns_t(ClickhouseUtils::ScaleTicks(ticks, precision, 9));
 		} else {
-			FlatVector::GetData<dtime_t>(result)[i] = dtime_t(ClickhouseUtils::ScaleTicks(ticks, precision, 6));
+			FlatVector::GetDataMutable<dtime_t>(result)[i] = dtime_t(ClickhouseUtils::ScaleTicks(ticks, precision, 6));
 		}
 	}
 }
@@ -223,7 +228,7 @@ static void ConvertUUID(const ch::ColumnRef &column, Vector &result, idx_t offse
 	if (!typed) {
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
-	auto data = FlatVector::GetData<hugeint_t>(result);
+	auto data = FlatVector::GetDataMutable<hugeint_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto value = typed->At(offset + i);
 		data[i] = UUID::FromUHugeint(uhugeint_t(value.first, value.second));
@@ -233,8 +238,8 @@ static void ConvertUUID(const ch::ColumnRef &column, Vector &result, idx_t offse
 template <class T>
 static void WriteEnumPositions(const ch::ColumnRef &column, Vector &result, idx_t offset, idx_t count,
                                const unordered_map<int16_t, uint32_t> &positions, const string &column_name) {
-	auto data = FlatVector::GetData<T>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto data = FlatVector::GetDataMutable<T>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	auto enum8 = column->As<ch::ColumnEnum8>();
 	auto enum16 = column->As<ch::ColumnEnum16>();
 	for (idx_t i = 0; i < count; i++) {
@@ -289,7 +294,7 @@ static void ConvertList(const ch::ColumnRef &column, Vector &result, idx_t offse
 	if (!array) {
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
-	auto entries = FlatVector::GetData<list_entry_t>(result);
+	auto entries = FlatVector::GetDataMutable<list_entry_t>(result);
 	idx_t child_start = count == 0 ? 0 : array->GetOffset(offset);
 	idx_t total = 0;
 	for (idx_t i = 0; i < count; i++) {
@@ -327,7 +332,7 @@ static void ConvertStruct(const ch::ColumnRef &column, Vector &result, idx_t off
 		ThrowUnexpectedColumn(column, result, column_name);
 	}
 	for (idx_t c = 0; c < children.size(); c++) {
-		ClickhouseConversion::ConvertColumn(tuple->At(c), *children[c], offset, count, column_name);
+		ClickhouseConversion::ConvertColumn(tuple->At(c), children[c], offset, count, column_name);
 	}
 }
 
@@ -335,7 +340,7 @@ void ClickhouseConversion::ConvertColumn(const ch::ColumnRef &column, Vector &re
                                          const string &column_name) {
 	D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
 	auto values = column;
-	auto &validity = FlatVector::Validity(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	if (auto nullable = column->As<ch::ColumnNullable>()) {
 		for (idx_t i = 0; i < count; i++) {
 			validity.Set(i, !nullable->IsNull(offset + i));

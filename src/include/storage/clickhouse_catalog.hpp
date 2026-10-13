@@ -2,6 +2,7 @@
 
 #include "clickhouse_connection_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_schema_set.hpp"
 
@@ -69,15 +70,15 @@ public:
 	//! end of the transaction (see ClickhouseScanBindData::lifetime); and lets a DDL method of a schema entry keep
 	//! `this` alive across the ClearCache() it triggers (belt-and-braces: retirement already does, see
 	//! ClickhouseTransactionManager).
-	shared_ptr<CatalogEntry> GetSchemaEntryOwner(const string &name);
+	shared_ptr<CatalogEntry> GetSchemaEntryOwner(const Identifier &name);
 
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {
 		return CATALOG_TYPE;
 	}
 	//! The SCHEMA database if the ATTACH named one, else the connection's database
-	string GetDefaultSchema() const override {
-		return options.schema.empty() ? config.database : options.schema;
+	optional<Identifier> GetDefaultSchema() const override {
+		return Identifier(options.schema.empty() ? config.database : options.schema);
 	}
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
@@ -121,7 +122,7 @@ public:
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 	//! CREATE SCHEMA / DROP SCHEMA refuse "main", which stands for GetDefaultSchema()
-	void ThrowIfDefaultSchema(const string &schema_name) const;
+	void ThrowIfDefaultSchema(const Identifier &schema_name) const;
 
 	ClickhouseConnectionConfig config;
 	ClickhouseAttachOptions options;

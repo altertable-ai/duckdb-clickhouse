@@ -1,6 +1,7 @@
 #include "clickhouse_scanner.hpp"
 #include "clickhouse_utils.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "storage/clickhouse_catalog.hpp"
@@ -47,7 +48,7 @@ static bool HasTrailingFormatClause(const string &sql) {
 //! pool of an already attached ClickHouse catalog, which ClickhouseAttach only creates when the setting
 //! allows it.
 static unique_ptr<FunctionData> ClickhouseQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to clickhouse_query cannot be NULL");
 	}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
@@ -69,6 +70,10 @@ public:
 	//! case-insensitively
 	static optional_ptr<const ClickhouseColumnInfo> ResolveColumn(const ClickhouseTableEntry &table,
 	                                                              const string &name);
+	static optional_ptr<const ClickhouseColumnInfo> ResolveColumn(const ClickhouseTableEntry &table,
+	                                                              const Identifier &name) {
+		return ResolveColumn(table, name.GetIdentifierName());
+	}
 };
 
 } // namespace duckdb

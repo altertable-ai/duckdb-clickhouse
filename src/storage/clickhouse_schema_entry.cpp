@@ -32,21 +32,21 @@ optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateTable(CatalogTransaction
 		// CREATE TABLE … AS SELECT here -- dropping its SELECT -- whenever this cache already has the table (and
 		// only reaches PlanCreateTableAs otherwise). If the table was dropped on the server behind this cache's back,
 		// sending a plain CREATE TABLE would succeed and silently leave an empty table instead of the query's rows
-		auto existing = tables.GetEntry(context, base.table);
+		auto existing = tables.GetEntry(context, base.GetTableName());
 		if (existing) {
 			if (base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 				return existing;
 			}
 			throw CatalogException("Table \"%s\" already exists in ClickHouse database \"%s\" (if it was dropped "
 			                       "outside DuckDB, run CALL clickhouse_clear_cache())",
-			                       base.table, name);
+			                       base.GetTableName().GetIdentifierName(), name.GetIdentifierName());
 		}
 	}
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	// ClickhouseDdl clears the catalog cache, which retires this schema entry; retirement keeps it alive until this
 	// transaction ends (see ClickhouseTransactionManager), and keep_alive does too (belt-and-braces)
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
-	return &ClickhouseDdl::CreateTable(context, ch_catalog, name, base);
+	return &ClickhouseDdl::CreateTable(context, ch_catalog, name.GetIdentifierName(), base);
 }
 optional_ptr<CatalogEntry> ClickhouseSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
 	ThrowNotSupported("Functions and macros");
@@ -85,12 +85,13 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	}
 	auto &context = transaction.GetContext();
 	auto &alter = info.Cast<AlterTableInfo>();
-	auto entry = tables.GetEntry(context, alter.name);
+	auto &table_name = alter.GetQualifiedName().Name();
+	auto entry = tables.GetEntry(context, table_name);
 	if (!entry) {
 		if (alter.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;
 		}
-		throw CatalogException("Table with name %s does not exist!", alter.name);
+		throw CatalogException("Table with name %s does not exist!", table_name.GetIdentifierName());
 	}
 	auto &table = entry->Cast<ClickhouseTableEntry>();
 	if (table.IsViewLike()) {
@@ -105,7 +106,7 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	// SET/DROP DEFAULT can run a mutation (and clear the cache) while the statement is built
 	auto keep_alive = ch_catalog.GetSchemaEntryOwner(name);
 	// built before Execute() clears the cache and retires `entry`
-	auto statement = ClickhouseDdl::AlterTable(context, ch_catalog, name, table, alter);
+	auto statement = ClickhouseDdl::AlterTable(context, ch_catalog, name.GetIdentifierName(), table, alter);
 	if (statement.sql.empty()) {
 		// nothing to change (see ClickhouseDdl::AlterTable)
 		return;
@@ -123,12 +124,13 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		throw NotImplementedException("DROP %s is not supported for ClickHouse databases",
 		                              CatalogTypeToString(info.type));
 	}
-	auto entry = tables.GetEntry(context, info.name);
+	auto &table_name = info.GetQualifiedName().Name();
+	auto entry = tables.GetEntry(context, table_name);
 	if (!entry) {
 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;
 		}
-		throw CatalogException("Table with name %s does not exist!", info.name);
+		throw CatalogException("Table with name %s does not exist!", table_name.GetIdentifierName());
 	}
 	auto &table = entry->Cast<ClickhouseTableEntry>();
 	if (table.IsViewLike()) {
@@ -137,7 +139,7 @@ void ClickhouseSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		throw NotImplementedException(
 		    "\"%s\" is a ClickHouse %s (engine %s), which DROP TABLE does not drop; drop it with "
 		    "clickhouse_execute('%s', 'DROP %s %s') instead",
-		    table.name, kind, table.GetEngine(), catalog.GetName(), drop_keyword,
+		    table.name.GetIdentifierName(), kind, table.GetEngine(), catalog.GetName().GetIdentifierName(), drop_keyword,
 		    ClickhouseUtils::QualifiedName(name, table.name));
 	}
 	auto sql = "DROP TABLE " + string(info.if_not_found == OnEntryNotFound::RETURN_NULL ? "IF EXISTS " : "") +

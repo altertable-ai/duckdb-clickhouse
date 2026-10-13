@@ -42,7 +42,7 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 	if (!bound->IsFoldable() || !bound->IsConsistent()) {
 		throw NotImplementedException("DEFAULT value of column \"%s\" must be a constant for ClickHouse tables (got "
 		                              "%s); use clickhouse_execute() instead",
-		                              column.Name(), column.DefaultValue().ToString());
+		                              column.Name().GetIdentifierName(), column.DefaultValue().ToString());
 	}
 	auto value = ExpressionExecutor::EvaluateScalar(context, *bound);
 	// every unsupported DEFAULT -- including an infinite timestamp, which TransformConstant() refuses -- gets this
@@ -52,7 +52,7 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 	} catch (NotImplementedException &) {
 		throw NotImplementedException("DEFAULT value %s of column \"%s\" (type %s) cannot be written as a "
 		                              "ClickHouse literal; use clickhouse_execute() instead",
-		                              value.ToString(), column.Name(), value.type().ToString());
+		                              value.ToString(), column.Name().GetIdentifierName(), value.type().ToString());
 	}
 }
 
@@ -146,7 +146,7 @@ string ClickhouseDdl::CreateTableSql(ClientContext &context, const string &datab
 		                              "tables; create the table with clickhouse_execute() instead");
 	}
 	unordered_set<idx_t> not_null;
-	vector<string> primary_key;
+	vector<Identifier> primary_key;
 	for (auto &constraint : info.constraints) {
 		switch (constraint->type) {
 		case ConstraintType::NOT_NULL:
@@ -176,7 +176,7 @@ string ClickhouseDdl::CreateTableSql(ClientContext &context, const string &datab
 	for (auto &column : info.columns.Logical()) {
 		bool in_primary_key = false;
 		for (auto &key : primary_key) {
-			in_primary_key = in_primary_key || StringUtil::CIEquals(key, column.Name());
+			in_primary_key = in_primary_key || key == column.Name();
 		}
 		auto nullable = !in_primary_key && not_null.find(column.Logical().index) == not_null.end();
 		columns.push_back(ColumnSql(context, column, nullable));
@@ -190,7 +190,7 @@ string ClickhouseDdl::CreateTableSql(ClientContext &context, const string &datab
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		sql += "IF NOT EXISTS ";
 	}
-	sql += ClickhouseUtils::QualifiedName(database, info.table) + " (" + StringUtil::Join(columns, ", ") +
+	sql += ClickhouseUtils::QualifiedName(database, info.GetTableName()) + " (" + StringUtil::Join(columns, ", ") +
 	       ") ENGINE = " + engine;
 	if (EngineTakesOrderBy(engine)) {
 		if (primary_key.empty()) {
@@ -225,12 +225,13 @@ void ClickhouseDdl::Execute(ClientContext &context, ClickhouseCatalog &catalog, 
 optional_ptr<ClickhouseTableEntry> ClickhouseDdl::LookupTable(ClientContext &context, ClickhouseCatalog &catalog,
                                                               const string &database, const string &table) {
 	auto transaction = catalog.GetCatalogTransaction(context);
-	auto schema = catalog.LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, database),
-	                                   OnEntryNotFound::RETURN_NULL);
+	auto schema =
+	    catalog.LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(database))),
+	                         OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		return nullptr;
 	}
-	auto entry = schema->LookupEntry(transaction, EntryLookupInfo(CatalogType::TABLE_ENTRY, table));
+	auto entry = schema->LookupEntry(transaction, EntryLookupInfo(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(table))));
 	if (!entry) {
 		return nullptr;
 	}
@@ -240,11 +241,11 @@ optional_ptr<ClickhouseTableEntry> ClickhouseDdl::LookupTable(ClientContext &con
 ClickhouseTableEntry &ClickhouseDdl::CreateTable(ClientContext &context, ClickhouseCatalog &catalog,
                                                  const string &database, CreateTableInfo &info) {
 	Execute(context, catalog, CreateTableSql(context, database, info));
-	auto entry = LookupTable(context, catalog, database, info.table);
+	auto entry = LookupTable(context, catalog, database, info.GetTableName().GetIdentifierName());
 	if (!entry) {
 		throw InvalidInputException("ClickHouse table \"%s\".\"%s\" was created but cannot be found; run CALL "
 		                            "clickhouse_clear_cache() and retry",
-		                            database, info.table);
+		                            database, info.GetTableName().GetIdentifierName());
 	}
 	return *entry;
 }
@@ -275,12 +276,21 @@ static string SpelledAs(const ClickhouseColumnInfo &column, const string &name) 
 	return column.name == name ? string() : " (ClickHouse column \"" + column.name + "\")";
 }
 
+static string SpelledAs(const ClickhouseColumnInfo &column, const Identifier &name) {
+	return SpelledAs(column, name.GetIdentifierName());
+}
+
 static const ClickhouseColumnInfo &RequireColumn(const ClickhouseTableEntry &table, const string &name) {
 	auto column = ClickhouseDdl::ResolveColumn(table, name);
 	if (!column) {
-		throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"", name, table.name);
+		throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"", name,
+		                       table.name.GetIdentifierName());
 	}
 	return *column;
+}
+
+static const ClickhouseColumnInfo &RequireColumn(const ClickhouseTableEntry &table, const Identifier &name) {
+	return RequireColumn(table, name.GetIdentifierName());
 }
 
 //! A column as the server has it now: the cached entry may be stale, and a MODIFY COLUMN built from a stale type
@@ -429,7 +439,7 @@ static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog,
 
 static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCatalog &catalog, const string &database,
                                            const ClickhouseTableEntry &table, SetDefaultInfo &info) {
-	auto &cached = RequireColumn(table, info.column_name);
+	auto &cached = RequireColumn(table, info.column_path[0]);
 	auto &engine = table.GetEngine();
 	auto merge_tree = StringUtil::EndsWith(engine, "MergeTree");
 	// Memory stores an added column for the rows it already holds
@@ -464,7 +474,7 @@ static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCat
 		sql = ModifyColumn(qualified, column.info, "REMOVE DEFAULT");
 	} else {
 		// ClickHouse keeps the column's type: only the default is replaced
-		ColumnDefinition definition(column.info.name, column.info.type);
+		ColumnDefinition definition(Identifier(column.info.name), column.info.type);
 		definition.SetDefaultValue(info.expression->Copy());
 		sql = ModifyColumn(qualified, column.info, ClickhouseDdl::DefaultValueSql(context, definition).substr(1));
 	}
@@ -520,11 +530,11 @@ static bool IsPlainTypeChange(const ChangeColumnTypeInfo &info) {
 		return false;
 	}
 	auto &cast = info.expression->Cast<CastExpression>();
-	if (cast.try_cast || cast.child->GetExpressionType() != ExpressionType::COLUMN_REF) {
+	if (cast.IsTryCast() || cast.Child().GetExpressionType() != ExpressionType::COLUMN_REF) {
 		return false;
 	}
-	auto &column = cast.child->Cast<ColumnRefExpression>();
-	return !column.IsQualified() && StringUtil::CIEquals(column.GetColumnName(), info.column_name);
+	auto &column = cast.Child().Cast<ColumnRefExpression>();
+	return !column.IsQualified() && column.GetColumnName() == info.GetColumnName();
 }
 
 static bool IsNested(const LogicalType &type) {
@@ -629,7 +639,7 @@ static bool KeepsEveryValue(const LogicalType &source, const LogicalType &target
 
 static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const string &database,
                                            const ClickhouseTableEntry &table, ChangeColumnTypeInfo &info) {
-	auto &cached = RequireColumn(table, info.column_name);
+	auto &cached = RequireColumn(table, info.column_path[0]);
 	if (!IsPlainTypeChange(info)) {
 		throw NotImplementedException("ALTER COLUMN … TYPE … USING is not supported for ClickHouse tables; convert "
 		                              "the column with clickhouse_execute() instead");
@@ -687,7 +697,7 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 		auto &new_name = add.new_column.Name();
 		// case-insensitively: ClickHouse would accept "ID" next to "id", and the next metadata load could not list both
 		for (auto &column : table.GetClickhouseColumns()) {
-			if (StringUtil::CIEquals(column.name, new_name)) {
+			if (Identifier(column.name) == new_name) {
 				if (add.if_column_not_exists) {
 					return {};
 				}
@@ -739,7 +749,7 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 		}
 		// renaming a column to another spelling of its own name (id -> ID) is fine; to any other column's is not
 		for (auto &other : table.GetClickhouseColumns()) {
-			if (&other != column.get() && StringUtil::CIEquals(other.name, rename.new_name)) {
+			if (&other != column.get() && Identifier(other.name) == rename.new_name) {
 				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s",
 				                       rename.new_name, table.name, SpelledAs(other, rename.new_name));
 			}
@@ -754,9 +764,11 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 	case AlterTableType::SET_DEFAULT:
 		return SetDefault(context, catalog, database, table, info.Cast<SetDefaultInfo>());
 	case AlterTableType::DROP_NOT_NULL:
-		return ChangeNullability(catalog, database, table, info.Cast<DropNotNullInfo>().column_name, true);
+		return ChangeNullability(catalog, database, table, info.Cast<DropNotNullInfo>().column_path[0].GetIdentifierName(),
+		                         true);
 	case AlterTableType::SET_NOT_NULL:
-		return ChangeNullability(catalog, database, table, info.Cast<SetNotNullInfo>().column_name, false);
+		return ChangeNullability(catalog, database, table, info.Cast<SetNotNullInfo>().column_path[0].GetIdentifierName(),
+		                         false);
 	case AlterTableType::ALTER_COLUMN_TYPE:
 		return ChangeType(catalog, database, table, info.Cast<ChangeColumnTypeInfo>());
 	default:

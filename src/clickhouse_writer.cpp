@@ -11,6 +11,10 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/common/vector/unified_vector_format.hpp"
 
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/bool.h>
@@ -369,7 +373,7 @@ static bool TryRescaleTicks(int64_t ticks, idx_t from, idx_t to, int64_t &result
 //! The value, for errors; infinities and values beyond int64 microseconds have no timestamp text
 static string TimestampText(int64_t ticks, idx_t precision) {
 	int64_t micros;
-	if (!TryRescaleTicks(ticks, precision, 6, micros) || !Timestamp::IsFinite(timestamp_t(micros))) {
+	if (!TryRescaleTicks(ticks, precision, 6, micros) || !timestamp_t(micros).IsFinite()) {
 		return "an infinite or out-of-range timestamp";
 	}
 	return Timestamp::ToString(timestamp_t(micros)) + " (UTC)";
@@ -602,7 +606,7 @@ static void AppendStruct(const AppendInput &input, const ch::ColumnRef &target) 
 		}
 	}
 	for (idx_t c = 0; c < children.size(); c++) {
-		AppendInput child {*children[c], input.size, input.sel, input.count, input.nulls_as_default, input.column_name};
+		AppendInput child {children[c], input.size, input.sel, input.count, input.nulls_as_default, input.column_name};
 		AppendRows(child, tuple->At(c));
 	}
 }

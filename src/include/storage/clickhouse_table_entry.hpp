@@ -17,6 +17,9 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
+	const ColumnList &GetColumns() const override {
+		return columns;
+	}
 
 	//! Every ClickHouse column, in table order. Matches the DuckDB column list one to one unless the table has
 	//! case-colliding columns (see ThrowIfColumnsCollide())
@@ -42,6 +45,7 @@ public:
 	string ViewLikeKind() const;
 
 private:
+	ColumnList columns;
 	vector<ClickhouseColumnInfo> clickhouse_columns;
 	//! system.tables.total_rows (not known for views and some engines)
 	optional_idx approx_rows;

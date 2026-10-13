@@ -2,6 +2,7 @@
 
 #include "clickhouse_types.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 
@@ -20,12 +21,13 @@ public:
 	static string TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
 	                               const vector<ClickhouseColumnInfo> &columns);
 	//! Translates one filter on `column`. Returns "" for a filter that must not become a ClickHouse predicate:
-	//! TableFilterType::OPTIONAL_FILTER (by DuckDB's own definition, not required for query correctness -- e.g.
-	//! a join- or TopN-pushed narrowing that DuckDB still applies itself above the scan; applying it inside
-	//! ClickHouse too could exclude rows before the join/ORDER BY/LIMIT above the scan sees them) and
-	//! DYNAMIC_FILTER/BLOOM_FILTER (runtime hints enforced by the operator that created them, not by the scan).
-	//! Throws for a *required* filter that cannot be translated -- it never silently drops one.
+	//! an optional filter (by DuckDB's own definition, not required for query correctness -- e.g. a join- or
+	//! TopN-pushed narrowing that DuckDB still applies itself above the scan; applying it inside ClickHouse too
+	//! could exclude rows before the join/ORDER BY/LIMIT above the scan sees them) and a runtime hint (dynamic,
+	//! bloom, prefix-range) enforced by the operator that created it, not by the scan. Throws for a *required*
+	//! filter that cannot be translated -- it never silently drops one.
 	static string TransformFilter(const string &column, const TableFilter &filter);
+	static string TransformFilter(const string &column, const TableFilter &filter, const LogicalType &column_type);
 	static string TransformConstant(const Value &value);
 };
 
