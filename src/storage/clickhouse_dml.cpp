@@ -729,7 +729,8 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 				if (HoldsNullElement(constant->GetValue(), column.type_node)) {
 					throw ConstraintException("NOT NULL constraint failed: %s.%s (an element of the new value is NULL, "
 					                          "which ClickHouse type %s cannot store)",
-					                          target.table.name, column.name, column.clickhouse_type);
+					                          target.table.name.GetIdentifierName(), column.name,
+					                          column.clickhouse_type);
 				}
 				check_nulls = false;
 			} else if (source.IsValid()) {

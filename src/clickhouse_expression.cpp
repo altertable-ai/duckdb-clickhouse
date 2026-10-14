@@ -444,6 +444,10 @@ static string TranslateFunction(const BoundFunctionExpression &function, const s
 	if (children.size() == 1 && (name == "length" || name == "len") && is_string(0)) {
 		return "lengthUTF8(" + arg(0) + ")";
 	}
+	if (children.size() == 1 && name == "isnan") {
+		// MoveUnaryMinusRule (DuckDB 2.0) wraps floating comparisons such as [-x < c] in isnan(x)
+		return "isNaN(" + arg(0) + ")";
+	}
 	ThrowUntranslatable(function);
 }
 
