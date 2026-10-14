@@ -171,6 +171,7 @@ static unique_ptr<GlobalTableFunctionState> ClickhouseInitGlobal(ClientContext &
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
 	auto result = make_uniq<ClickhouseScanGlobalState>();
 	result->sql = ClickhouseScanFunction::BuildQuery(bind_data, input.column_ids, StaticScanFilters(input));
+	bind_data.last_sql = result->sql;
 	// columns needed only to evaluate a filter DuckDB couldn't push down (ClickhouseSupportsPushdownType
 	// returned false for them) are still fetched -- filter_prune=true lets DuckDB tell us, via
 	// projection_ids, which of the fetched columns actually need to reach `output`
@@ -261,6 +262,10 @@ static unique_ptr<NodeStatistics> ClickhouseScanCardinality(ClientContext &conte
 static InsertionOrderPreservingMap<string> ClickhouseScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
+	if (!bind_data.last_sql.empty()) {
+		result["ClickHouse Query"] = bind_data.last_sql;
+		return result;
+	}
 	if (bind_data.query.empty()) {
 		result["Table"] = bind_data.database + "." + bind_data.table;
 	} else {

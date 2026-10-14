@@ -22,7 +22,7 @@ void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
 	throw InvalidInputException("ClickHouse table \"%s\".\"%s\" has columns whose names differ only in case (%s), "
 	                            "which DuckDB cannot tell apart; rename one of them (ALTER TABLE … RENAME COLUMN), or "
 	                            "read the table with clickhouse_query()",
-	                            schema.name, name, column_collision);
+	                            schema.name.GetIdentifierName(), name.GetIdentifierName(), column_collision);
 }
 
 bool ClickhouseTableEntry::IsViewLike() const {

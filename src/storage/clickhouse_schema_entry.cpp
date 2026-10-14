@@ -98,7 +98,7 @@ void ClickhouseSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		throw NotImplementedException(
 		    "\"%s\" is a ClickHouse %s (engine %s), which ALTER TABLE cannot modify; alter it with "
 		    "clickhouse_execute() instead",
-		    table.name, table.ViewLikeKind(), table.GetEngine());
+		    table.name.GetIdentifierName(), table.ViewLikeKind(), table.GetEngine());
 	}
 	auto &ch_catalog = catalog.Cast<ClickhouseCatalog>();
 	// the ALTER COLUMN checks read the server before anything is written: refuse a READ_ONLY attach first

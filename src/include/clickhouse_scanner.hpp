@@ -34,6 +34,9 @@ struct ClickhouseScanBindData : public TableFunctionData {
 	//! Filled by ClickhouseOptimizer, e.g. " ORDER BY `n` DESC NULLS LAST" and " LIMIT 3"
 	string order_by_clause;
 	string limit_clause;
+	//! SQL sent to ClickHouse for the latest execution of this bind (set in init_global). Mutable so
+	//! to_string can surface it after EXPLAIN ANALYZE; DuckDB 2.0 dropped dynamic_to_string.
+	mutable string last_sql;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

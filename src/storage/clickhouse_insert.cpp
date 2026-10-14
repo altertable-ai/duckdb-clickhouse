@@ -9,6 +9,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_ddl.hpp"
@@ -52,7 +53,8 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		if (column.default_kind == "MATERIALIZED" || column.default_kind == "ALIAS") {
 			throw BinderException("Column \"%s\" of ClickHouse table \"%s\" is a %s column, which ClickHouse computes "
 			                      "itself; list the columns to insert explicitly, e.g. INSERT INTO %s (…) VALUES …",
-			                      column.name, table.name, column.default_kind, table.name);
+			                      column.name, table.name.GetIdentifierName(), column.default_kind,
+			                      table.name.GetIdentifierName());
 		}
 		switch (ClickhouseWriter::GetWriteMode(column.type_node)) {
 		case ClickhouseWriteMode::NATIVE:
@@ -70,6 +72,26 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		                              table.name.GetIdentifierName());
 	}
 	return result;
+}
+
+vector<ClickhouseInsertColumn> ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table, const LogicalInsert &op) {
+	if (!op.column_index_map.empty()) {
+		return GetInsertColumns(table, op.column_index_map);
+	}
+	// ResolveInputProjection expands the child to every physical column and moves bound_defaults of
+	// omitted columns into that projection (leaving a nullptr). Listed columns keep their default.
+	physical_index_vector_t<idx_t> column_index_map;
+	idx_t source_index = 0;
+	for (auto &col : table.GetColumns().Physical()) {
+		auto storage_idx = col.StorageOid();
+		if (storage_idx < op.bound_defaults.size() && !op.bound_defaults[storage_idx]) {
+			column_index_map.push_back(DConstants::INVALID_INDEX);
+		} else {
+			column_index_map.push_back(source_index);
+		}
+		source_index++;
+	}
+	return GetInsertColumns(table, column_index_map);
 }
 
 string ClickhouseInsert::BuildInsertQuery(ClickhouseTableEntry &table, const vector<ClickhouseInsertColumn> &columns) {

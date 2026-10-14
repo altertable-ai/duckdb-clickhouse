@@ -11,6 +11,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -325,7 +326,8 @@ ClickhouseDmlTarget ClickhouseDml::AnalyzeTarget(const string &statement, TableC
 	if (ch_table.IsViewLike()) {
 		throw NotImplementedException("\"%s\" is a ClickHouse %s (engine %s), which %s does not modify; run the "
 		                              "statement with clickhouse_execute() instead",
-		                              ch_table.name, ch_table.ViewLikeKind(), ch_table.GetEngine(), statement);
+		                              ch_table.name.GetIdentifierName(), ch_table.ViewLikeKind(), ch_table.GetEngine(),
+		                              statement);
 	}
 	ClickhouseDmlTarget result {ch_table, ClickhouseUtils::QualifiedName(ch_table.schema.name, ch_table.name), ""};
 	if (HasParameters(child)) {
@@ -624,6 +626,34 @@ static bool HoldsCoarseDateTime(const ClickhouseTypeNode &node) {
 	return false;
 }
 
+//! DuckDB 2.0 no longer leaves BOUND_DEFAULT on LogicalUpdate: SET col = DEFAULT is copied into
+//! the child projection from bound_defaults (no query location). SET col = NULL is a user constant
+//! and has one, so the two stay distinguishable.
+static bool IsRewrittenDefault(const LogicalUpdate &op, idx_t assignment_idx, const Expression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
+		return true;
+	}
+	if (op.children.empty() || op.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return false;
+	}
+	auto &proj = op.children[0]->Cast<LogicalProjection>();
+	optional_idx source;
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		source = expr.Cast<BoundReferenceExpression>().Index();
+	} else if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		source = expr.Cast<BoundColumnRefExpression>().Binding().column_index.GetIndex();
+	}
+	if (!source.IsValid() || source.GetIndex() >= proj.expressions.size()) {
+		return false;
+	}
+	auto &src = *proj.expressions[source.GetIndex()];
+	auto storage_idx = op.columns[assignment_idx].index;
+	if (storage_idx >= op.bound_defaults.size() || !op.bound_defaults[storage_idx]) {
+		return false;
+	}
+	return src.Equals(*op.bound_defaults[storage_idx]) && !src.HasQueryLocation();
+}
+
 ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, LogicalUpdate &op) {
 	if (op.return_chunk) {
 		throw NotImplementedException("RETURNING is not supported for ClickHouse tables");
@@ -640,9 +670,9 @@ ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, Logical
 		if (op.columns[i].index >= columns.size()) {
 			ThrowUnsupportedShape("UPDATE", op.table, "SET of an unknown column");
 		}
-		if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
-			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE; checked before the matches_nothing and
-			// unbound_parameters early returns, so such a statement is refused even when no row matches
+		if (IsRewrittenDefault(op, i, *op.expressions[i])) {
+			// ClickHouse has no DEFAULT in ALTER TABLE … UPDATE. DuckDB 2.0 rewrites SET col = DEFAULT
+			// into a BoundRef/BoundColumnRef of the bound default (no longer BOUND_DEFAULT).
 			ThrowUnsupportedShape("UPDATE", op.table, "SET " + columns[op.columns[i].index].name + " = DEFAULT");
 		}
 	}

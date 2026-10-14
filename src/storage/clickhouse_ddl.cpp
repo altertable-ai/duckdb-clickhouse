@@ -266,7 +266,7 @@ optional_ptr<const ClickhouseColumnInfo> ClickhouseDdl::ResolveColumn(const Clic
 	if (case_insensitive_matches > 1) {
 		throw CatalogException("Column name \"%s\" is ambiguous in ClickHouse table \"%s\": several columns match it "
 		                       "case-insensitively; quote the exact ClickHouse column name",
-		                       name, table.name);
+		                       name, table.name.GetIdentifierName());
 	}
 	return result;
 }
@@ -321,7 +321,7 @@ static ClickhouseServerColumn LoadServerColumn(ClickhouseConnection &connection,
 	}
 	throw CatalogException("Column \"%s\" of ClickHouse table \"%s\" no longer exists; run CALL "
 	                       "clickhouse_clear_cache() and retry",
-	                       column, table.name);
+	                       column, table.name.GetIdentifierName());
 }
 
 //! Runs with ClickhouseConnection::ExtensionQuerySettings() plus `extra_settings`: the count reads every stored row
@@ -363,12 +363,12 @@ static void ThrowIfNotRewritable(const ClickhouseServerColumn &column, const Cli
 	if (column.in_key) {
 		throw NotImplementedException("Column \"%s\" is part of the sorting, primary, partition or sampling key of "
 		                              "ClickHouse table \"%s\", whose type ClickHouse cannot change",
-		                              column.info.name, table.name);
+		                              column.info.name, table.name.GetIdentifierName());
 	}
 	if (column.default_kind == "ALIAS") {
 		throw NotImplementedException("Column \"%s\" of ClickHouse table \"%s\" is an ALIAS; change it with "
 		                              "clickhouse_execute() instead",
-		                              column.info.name, table.name);
+		                              column.info.name, table.name.GetIdentifierName());
 	}
 }
 
@@ -418,7 +418,8 @@ static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog,
 		    "yet, and ClickHouse computes it there from the current default, so it has to be materialized first, which "
 		    "ch_mutations_sync = %s would leave running in the background%s; SET ch_mutations_sync = 2, or use "
 		    "clickhouse_execute() instead",
-		    name, table.name, missing_parts, sync.second, sync.second == "0" ? "" : " on the other replicas");
+		    name, table.name.GetIdentifierName(), missing_parts, sync.second,
+		    sync.second == "0" ? "" : " on the other replicas");
 	}
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
 	auto quoted = ClickhouseUtils::QuoteIdentifier(name);
@@ -433,7 +434,7 @@ static void StoreInEveryPart(ClientContext &context, ClickhouseCatalog &catalog,
 	if (missing_parts > 0) {
 		throw InvalidInputException("Cannot change the default of column \"%s\" of ClickHouse table \"%s\": %d part(s) "
 		                            "still do not store the column after `%s`; the default was not changed",
-		                            name, table.name, missing_parts, sql);
+		                            name, table.name.GetIdentifierName(), missing_parts, sql);
 	}
 }
 
@@ -447,7 +448,7 @@ static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCat
 		throw NotImplementedException("Cannot change the default of column \"%s\" of ClickHouse table \"%s\" (engine "
 		                              "%s): only MergeTree-family and Memory tables are supported; use "
 		                              "clickhouse_execute() instead",
-		                              cached.name, table.name, engine);
+		                              cached.name, table.name.GetIdentifierName(), engine);
 	}
 	ClickhouseServerColumn column;
 	uint64_t missing_parts = 0;
@@ -462,7 +463,7 @@ static ClickhouseAlterStatement SetDefault(ClientContext &context, ClickhouseCat
 		// MODIFY COLUMN … DEFAULT would silently turn it into a DEFAULT column
 		throw NotImplementedException("Column \"%s\" of ClickHouse table \"%s\" is %s, not a column with a DEFAULT; "
 		                              "change it with clickhouse_execute() instead",
-		                              column.info.name, table.name, column.default_kind);
+		                              column.info.name, table.name.GetIdentifierName(), column.default_kind);
 	}
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
 	string sql;
@@ -517,7 +518,7 @@ static ClickhouseAlterStatement ChangeNullability(ClickhouseCatalog &catalog, co
 			    "NOT NULL constraint failed: %s.%s (%d stored row(s) of the ClickHouse table hold "
 			    "NULL, counting deleted rows not purged yet: ALTER TABLE … APPLY DELETED MASK "
 			    "purges those); nothing was changed",
-			    table.name, column.info.name, nulls);
+			    table.name.GetIdentifierName(), column.info.name, nulls);
 		}
 	}
 	wrappers.nullable = nullable;
@@ -659,7 +660,7 @@ static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const str
 		// an element that does not convert becomes NULL (['1', 'x'] to [1, NULL])
 		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": only scalar "
 		                              "columns can change type through ALTER TABLE; use clickhouse_execute() instead",
-		                              name, table.name);
+		                              name, table.name.GetIdentifierName());
 	}
 	if (!KeepsEveryValue(source, target)) {
 		throw NotImplementedException(
@@ -667,7 +668,7 @@ static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const str
 		    "keep every value exactly are supported (to a wider integer, DECIMAL or floating-point type that holds "
 		    "every value, FLOAT to DOUBLE, integers, DATE and ENUM to VARCHAR, DATE to TIMESTAMP); convert the column "
 		    "with clickhouse_execute() instead",
-		    name, table.name, source.ToString(), target.ToString());
+		    name, table.name.GetIdentifierName(), source.ToString(), target.ToString());
 	}
 	// the DuckDB-level conversion is only what ClickHouse does if the column holds exactly the type DuckDB reads it
 	// as: not, e.g., BFloat16 (FLOAT). An enum converts by label whatever its values
@@ -680,7 +681,7 @@ static ClickhouseAlterStatement ChangeType(ClickhouseCatalog &catalog, const str
 		throw NotImplementedException("Cannot change the type of column \"%s\" of ClickHouse table \"%s\": its "
 		                              "ClickHouse type %s is not one DuckDB converts exactly; use clickhouse_execute() "
 		                              "instead",
-		                              name, table.name, column.info.clickhouse_type);
+		                              name, table.name.GetIdentifierName(), column.info.clickhouse_type);
 	}
 	ThrowIfNotRewritable(column, table);
 	auto qualified = ClickhouseUtils::QualifiedName(database, table.name);
@@ -701,8 +702,9 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 				if (add.if_column_not_exists) {
 					return {};
 				}
-				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s", new_name,
-				                       table.name, SpelledAs(column, new_name));
+				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s",
+				                       new_name.GetIdentifierName(), table.name.GetIdentifierName(),
+				                       SpelledAs(column, new_name));
 			}
 		}
 		// scalar columns are added Nullable (Array/Tuple/Map/JSON never are): DuckDB's ADD COLUMN carries no NOT
@@ -719,7 +721,7 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 				    "Cannot add column \"%s\" with a DEFAULT to ClickHouse table \"%s\" (engine %s): it holds rows, "
 				    "which ClickHouse would give NULL rather than the default (only MergeTree-family tables compute it "
 				    "for existing rows); add the column without a DEFAULT, or use clickhouse_execute() instead",
-				    new_name, table.name, engine);
+				    new_name.GetIdentifierName(), table.name.GetIdentifierName(), engine);
 			}
 		}
 		// IF NOT EXISTS still sent: the cached column list may be stale
@@ -734,7 +736,7 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 				return {};
 			}
 			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"",
-			                       remove.removed_column, table.name);
+			                       remove.removed_column.GetIdentifierName(), table.name.GetIdentifierName());
 		}
 		// IF EXISTS still sent: the cached column list may be stale
 		return {"ALTER TABLE " + qualified + " DROP COLUMN " + (remove.if_column_exists ? "IF EXISTS " : "") +
@@ -744,14 +746,15 @@ ClickhouseAlterStatement ClickhouseDdl::AlterTable(ClientContext &context, Click
 		auto &rename = info.Cast<RenameColumnInfo>();
 		auto column = ResolveColumn(table, rename.old_name);
 		if (!column) {
-			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"", rename.old_name,
-			                       table.name);
+			throw CatalogException("Column with name \"%s\" does not exist in ClickHouse table \"%s\"",
+			                       rename.old_name.GetIdentifierName(), table.name.GetIdentifierName());
 		}
 		// renaming a column to another spelling of its own name (id -> ID) is fine; to any other column's is not
 		for (auto &other : table.GetClickhouseColumns()) {
 			if (&other != column.get() && Identifier(other.name) == rename.new_name) {
 				throw CatalogException("Column with name \"%s\" already exists in ClickHouse table \"%s\"%s",
-				                       rename.new_name, table.name, SpelledAs(other, rename.new_name));
+				                       rename.new_name.GetIdentifierName(), table.name.GetIdentifierName(),
+				                       SpelledAs(other, rename.new_name));
 			}
 		}
 		return {"ALTER TABLE " + qualified + " RENAME COLUMN " + ClickhouseUtils::QuoteIdentifier(column->name) +

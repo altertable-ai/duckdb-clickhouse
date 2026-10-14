@@ -9,6 +9,7 @@ namespace duckdb {
 class ClickhouseCatalog;
 class ClickhouseTableEntry;
 class ClickhouseInsertGlobalState;
+class LogicalInsert;
 struct CreateTableInfo;
 
 //! One column an INSERT writes: the ClickHouse column, and the input chunk column holding its values
@@ -51,6 +52,8 @@ public:
 	//! Throws for columns that cannot be inserted into
 	static vector<ClickhouseInsertColumn> GetInsertColumns(ClickhouseTableEntry &table,
 	                                                       const physical_index_vector_t<idx_t> &column_index_map);
+	//! DuckDB 2.0 no longer stores column_index_map on LogicalInsert; reconstruct listed columns from bound_defaults
+	static vector<ClickhouseInsertColumn> GetInsertColumns(ClickhouseTableEntry &table, const LogicalInsert &op);
 	static string BuildInsertQuery(ClickhouseTableEntry &table, const vector<ClickhouseInsertColumn> &columns);
 
 	//! Starts the ClickHouse INSERT: resolves the attached database again, takes a connection through

@@ -10,6 +10,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -254,7 +255,7 @@ PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &context, Physical
 	// DuckDB's own planner adds a projection filling in the DEFAULTs of unlisted columns
 	// (ResolveDefaultsProjection); it is skipped on purpose, so ClickHouse applies its own defaults instead
 	auto &table = op.table.Cast<ClickhouseTableEntry>();
-	auto columns = ClickhouseInsert::GetInsertColumns(table, op.column_index_map);
+	auto columns = ClickhouseInsert::GetInsertColumns(table, op);
 	auto &insert = planner.Make<ClickhouseInsert>(op, table, std::move(columns));
 	insert.children.push_back(*plan);
 	return insert;
