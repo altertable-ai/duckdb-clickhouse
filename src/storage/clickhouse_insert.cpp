@@ -243,7 +243,9 @@ void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGloba
 	// checked here rather than trusted, so a mismatch throws instead of reading past the end of the chunk
 	D_ASSERT(!children.empty());
 	auto input_column_count = children[0].get().GetTypes().size();
-	if (gstate.columns.size() != input_column_count) {
+	// DuckDB 2.0's child projection has every physical column (defaults included); we only send the
+	// listed ones, so the target can be narrower than the input
+	if (gstate.columns.size() > input_column_count) {
 		throw InvalidInputException(
 		    "ClickHouse INSERT target for table \"%s\" has %d columns, but the input has %d: run CALL "
 		    "clickhouse_clear_cache() and retry",

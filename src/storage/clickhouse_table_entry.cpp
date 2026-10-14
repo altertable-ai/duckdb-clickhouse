@@ -3,6 +3,8 @@
 #include "clickhouse_scanner.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 
@@ -58,6 +60,20 @@ TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, uniq
 	result->filter_pushdown = ClickhouseScanFunction::FilterPushdownEnabled(context);
 	bind_data = std::move(result);
 	return ClickhouseScanFunction();
+}
+
+//! Marks user SET/INSERT values so PlanUpdate can tell them from DuckDB 2.0's rewritten SET col = DEFAULT
+static const Identifier USER_ASSIGNMENT_ALIAS("clickhouse_user_assignment");
+
+unique_ptr<Expression> ClickhouseTableEntry::GetDefaultExpressionForColumn(ClientContext &context,
+                                                                           const LogicalType &input_type,
+                                                                           const LogicalType &result_type,
+                                                                           ColumnBinding binding,
+                                                                           const Expression &constant_value) const {
+	auto expr =
+	    TableCatalogEntry::GetDefaultExpressionForColumn(context, input_type, result_type, binding, constant_value);
+	expr->SetAlias(USER_ASSIGNMENT_ALIAS);
+	return expr;
 }
 
 TableStorageInfo ClickhouseTableEntry::GetStorageInfo(ClientContext &context) {

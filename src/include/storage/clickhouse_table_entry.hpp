@@ -17,6 +17,9 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
+	unique_ptr<Expression> GetDefaultExpressionForColumn(ClientContext &context, const LogicalType &input_type,
+	                                                     const LogicalType &result_type, ColumnBinding binding,
+	                                                     const Expression &constant_value) const override;
 	const ColumnList &GetColumns() const override {
 		return columns;
 	}

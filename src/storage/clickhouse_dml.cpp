@@ -627,11 +627,14 @@ static bool HoldsCoarseDateTime(const ClickhouseTypeNode &node) {
 }
 
 //! DuckDB 2.0 no longer leaves BOUND_DEFAULT on LogicalUpdate: SET col = DEFAULT is copied into
-//! the child projection from bound_defaults (no query location). SET col = NULL is a user constant
-//! and has one, so the two stay distinguishable.
+//! the child projection from bound_defaults. User assignments are marked in
+//! ClickhouseTableEntry::GetDefaultExpressionForColumn so SET col = NULL is not mistaken for DEFAULT.
 static bool IsRewrittenDefault(const LogicalUpdate &op, idx_t assignment_idx, const Expression &expr) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_DEFAULT) {
 		return true;
+	}
+	if (expr.HasAlias() && expr.GetAlias() == Identifier("clickhouse_user_assignment")) {
+		return false;
 	}
 	if (op.children.empty() || op.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return false;
@@ -647,11 +650,14 @@ static bool IsRewrittenDefault(const LogicalUpdate &op, idx_t assignment_idx, co
 		return false;
 	}
 	auto &src = *proj.expressions[source.GetIndex()];
+	if (src.HasAlias() && src.GetAlias() == Identifier("clickhouse_user_assignment")) {
+		return false;
+	}
 	auto storage_idx = op.columns[assignment_idx].index;
 	if (storage_idx >= op.bound_defaults.size() || !op.bound_defaults[storage_idx]) {
 		return false;
 	}
-	return src.Equals(*op.bound_defaults[storage_idx]) && !src.HasQueryLocation();
+	return src.Equals(*op.bound_defaults[storage_idx]);
 }
 
 ClickhouseDmlStatement ClickhouseDml::PlanUpdate(ClientContext &context, LogicalUpdate &op) {
