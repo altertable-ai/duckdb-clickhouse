@@ -11,7 +11,7 @@ struct ClickhouseClearCacheData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> ClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return make_uniq<ClickhouseClearCacheData>();

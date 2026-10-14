@@ -9,6 +9,8 @@
 #include "clickhouse_type_mapping_function.hpp"
 #include "dbconnector/pool.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"

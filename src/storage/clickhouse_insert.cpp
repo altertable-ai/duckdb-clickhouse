@@ -2,12 +2,14 @@
 
 #include "clickhouse_connection.hpp"
 #include "clickhouse_utils.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_connection_pool.hpp"
 #include "storage/clickhouse_ddl.hpp"
@@ -18,15 +20,17 @@ namespace duckdb {
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseTableEntry &table_p,
                                    vector<ClickhouseInsertColumn> columns_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
-      catalog_name(table_p.catalog.GetName()), database_name(table_p.schema.name), table_name(table_p.name),
+      catalog_name(table_p.catalog.GetName().GetIdentifierName()),
+      database_name(table_p.schema.name.GetIdentifierName()), table_name(table_p.name.GetIdentifierName()),
       columns(std::move(columns_p)) {
 	insert_sql = BuildInsertQuery(table_p, columns);
 }
 
 ClickhouseInsert::ClickhouseInsert(PhysicalPlan &physical_plan, LogicalOperator &op, ClickhouseCatalog &catalog,
                                    const string &database, unique_ptr<CreateTableInfo> create_info_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), catalog_name(catalog.GetName()),
-      database_name(database), table_name(create_info_p->table), create_info(std::move(create_info_p)) {
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
+      catalog_name(catalog.GetName().GetIdentifierName()), database_name(database),
+      table_name(create_info_p->GetTableName().GetIdentifierName()), create_info(std::move(create_info_p)) {
 }
 
 vector<ClickhouseInsertColumn>
@@ -49,7 +53,8 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		if (column.default_kind == "MATERIALIZED" || column.default_kind == "ALIAS") {
 			throw BinderException("Column \"%s\" of ClickHouse table \"%s\" is a %s column, which ClickHouse computes "
 			                      "itself; list the columns to insert explicitly, e.g. INSERT INTO %s (…) VALUES …",
-			                      column.name, table.name, column.default_kind, table.name);
+			                      column.name, table.name.GetIdentifierName(), column.default_kind,
+			                      table.name.GetIdentifierName());
 		}
 		switch (ClickhouseWriter::GetWriteMode(column.type_node)) {
 		case ClickhouseWriteMode::NATIVE:
@@ -63,9 +68,30 @@ ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table,
 		result.push_back(ClickhouseInsertColumn {column, source_index});
 	}
 	if (result.empty()) {
-		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column", table.name);
+		throw NotImplementedException("INSERT into ClickHouse table \"%s\" must write at least one column",
+		                              table.name.GetIdentifierName());
 	}
 	return result;
+}
+
+vector<ClickhouseInsertColumn> ClickhouseInsert::GetInsertColumns(ClickhouseTableEntry &table, const LogicalInsert &op) {
+	if (!op.column_index_map.empty()) {
+		return GetInsertColumns(table, op.column_index_map);
+	}
+	// ResolveInputProjection expands the child to every physical column and moves bound_defaults of
+	// omitted columns into that projection (leaving a nullptr). Listed columns keep their default.
+	physical_index_vector_t<idx_t> column_index_map;
+	idx_t source_index = 0;
+	for (auto &col : table.GetColumns().Physical()) {
+		auto storage_idx = col.StorageOid();
+		if (storage_idx < op.bound_defaults.size() && !op.bound_defaults[storage_idx]) {
+			column_index_map.push_back(DConstants::INVALID_INDEX);
+		} else {
+			column_index_map.push_back(source_index);
+		}
+		source_index++;
+	}
+	return GetInsertColumns(table, column_index_map);
 }
 
 string ClickhouseInsert::BuildInsertQuery(ClickhouseTableEntry &table, const vector<ClickhouseInsertColumn> &columns) {
@@ -166,7 +192,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 		// table after this database's schema/table cache was last populated, and the planner routes here whenever
 		// the *cached* catalog had no such table, so the cache can be stale in exactly the case that matters
 		catalog.ClearCache();
-		if (ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.table)) {
+		if (ClickhouseDdl::LookupTable(context, catalog, op.database_name, info.GetTableName().GetIdentifierName())) {
 			gstate.skip = true;
 			return;
 		}
@@ -182,7 +208,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 	if (!mismatch) {
 		idx_t i = 0;
 		for (auto &column : info.columns.Logical()) {
-			if (!StringUtil::CIEquals(table_columns[i].name, column.Name())) {
+			if (Identifier(table_columns[i].name) != column.Name()) {
 				mismatch = true;
 				break;
 			}
@@ -192,7 +218,7 @@ static void PrepareTarget(const ClickhouseInsert &op, ClientContext &context, Cl
 	if (mismatch) {
 		throw InvalidInputException("ClickHouse table \"%s\".\"%s\" already exists with different columns; CREATE "
 		                            "TABLE … AS did not write into it",
-		                            op.database_name, info.table);
+		                            op.database_name, info.GetTableName().GetIdentifierName());
 	}
 	// every column, in query order: the CTAS input chunk has one column per created column
 	gstate.columns = ClickhouseInsert::GetInsertColumns(table, physical_index_vector_t<idx_t>());
@@ -217,7 +243,9 @@ void ClickhouseInsert::StartInsert(ClientContext &context, ClickhouseInsertGloba
 	// checked here rather than trusted, so a mismatch throws instead of reading past the end of the chunk
 	D_ASSERT(!children.empty());
 	auto input_column_count = children[0].get().GetTypes().size();
-	if (gstate.columns.size() != input_column_count) {
+	// DuckDB 2.0's child projection has every physical column (defaults included); we only send the
+	// listed ones, so the target can be narrower than the input
+	if (gstate.columns.size() > input_column_count) {
 		throw InvalidInputException(
 		    "ClickHouse INSERT target for table \"%s\" has %d columns, but the input has %d: run CALL "
 		    "clickhouse_clear_cache() and retry",

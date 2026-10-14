@@ -31,7 +31,7 @@ public:
 	                   const string &clickhouse_type);
 	//! A filter DuckDB pushed into a scan (LogicalGet::table_filters) on `column` (ClickHouse SQL for a column of
 	//! DuckDB type `column_type`), translated exactly through Translate(). Never narrows a predicate by dropping a
-	//! part: returns "" only for an OPTIONAL_FILTER (a hint: DuckDB keeps its exact predicate in a LogicalFilter
+	//! part: returns "" only for an optional filter (a hint: DuckDB keeps its exact predicate in a LogicalFilter
 	//! above the scan), which the caller skips; throws NotImplementedException for anything it cannot translate
 	//! exactly, including runtime (dynamic, bloom) filters and an OR with a non-exact branch
 	static string TranslateTableFilter(const TableFilter &filter, const LogicalType &column_type, const string &column);

@@ -2,6 +2,7 @@
 
 #include "clickhouse_ddl_types.hpp"
 #include "clickhouse_utils.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "clickhouse_writer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -29,7 +31,7 @@ namespace duckdb {
 
 ClickhouseCatalog &ClickhouseCatalog::GetAttachedDatabase(ClientContext &context, const string &database_name,
                                                           const string &function_name) {
-	auto database = DatabaseManager::Get(context).GetDatabase(context, database_name);
+	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(database_name));
 	if (!database) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in %s", database_name, function_name);
 	}
@@ -92,7 +94,7 @@ void ClickhouseCatalog::RetireEntries(vector<shared_ptr<CatalogEntry>> entries) 
 	GetAttached().GetTransactionManager().Cast<ClickhouseTransactionManager>().RetireEntries(std::move(entries));
 }
 
-shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &name) {
+shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const Identifier &name) {
 	return schemas.GetEntryOwner(name);
 }
 
@@ -100,32 +102,32 @@ shared_ptr<CatalogEntry> ClickhouseCatalog::GetSchemaEntryOwner(const string &na
 //! ch.main would drop that database (and then trip DuckDB's own PhysicalDrop assertion that "main" is never dropped),
 //! and CREATE SCHEMA ch.main would create a real `main` database that silently takes over what ch.main means from
 //! then on (any case: LookupSchema() also finds a `MAIN` database case-insensitively)
-void ClickhouseCatalog::ThrowIfDefaultSchema(const string &schema_name) const {
-	if (!StringUtil::CIEquals(schema_name, DEFAULT_SCHEMA)) {
+void ClickhouseCatalog::ThrowIfDefaultSchema(const Identifier &schema_name) const {
+	if (schema_name != DEFAULT_SCHEMA) {
 		return;
 	}
 	if (!options.schema.empty()) {
 		throw CatalogException("Cannot create or drop schema \"%s\": in this attached ClickHouse database it stands "
 		                       "for the SCHEMA database (\"%s\"); use its own name instead",
-		                       schema_name, options.schema);
+		                       schema_name.GetIdentifierName(), options.schema);
 	}
 	throw CatalogException("Cannot create or drop schema \"%s\": in an attached ClickHouse database it stands for "
 	                       "the connection's database (\"%s\"); use clickhouse_execute() to manage a ClickHouse "
 	                       "database with that name",
-	                       schema_name, config.database);
+	                       schema_name.GetIdentifierName(), config.database);
 }
 
 optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	auto &context = transaction.GetContext();
-	ThrowIfDefaultSchema(info.schema);
+	ThrowIfDefaultSchema(info.SchemaName());
 	if (!options.schema.empty()) {
-		if (!StringUtil::CIEquals(info.schema, options.schema)) {
+		if (info.SchemaName() != Identifier(options.schema)) {
 			throw CatalogException("Cannot create schema \"%s\": \"%s\" was attached with SCHEMA '%s' and shows no "
 			                       "other ClickHouse database; use clickhouse_execute() to create it",
-			                       info.schema, GetName(), options.schema);
+			                       info.SchemaName().GetIdentifierName(), GetName().GetIdentifierName(), options.schema);
 		}
 		// the one name the schema list shows
-		info.schema = options.schema;
+		info.SetSchema(Identifier(options.schema));
 	}
 	string sql = "CREATE DATABASE ";
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
@@ -133,22 +135,23 @@ optional_ptr<CatalogEntry> ClickhouseCatalog::CreateSchema(CatalogTransaction tr
 	} else if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		throw NotImplementedException("CREATE OR REPLACE SCHEMA is not supported for ClickHouse databases");
 	}
-	ClickhouseDdl::Execute(context, *this, sql + ClickhouseUtils::QuoteIdentifier(info.schema));
-	auto entry = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.schema),
+	ClickhouseDdl::Execute(context, *this, sql + ClickhouseUtils::QuoteIdentifier(info.SchemaName()));
+	auto entry = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(info.SchemaName())),
 	                          OnEntryNotFound::RETURN_NULL);
 	return entry.get();
 }
 
 void ClickhouseCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	ThrowIfDefaultSchema(info.name);
+	auto &drop_name = info.GetQualifiedName().Name();
+	ThrowIfDefaultSchema(drop_name);
 	auto transaction = GetCatalogTransaction(context);
-	auto schema =
-	    LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.name), OnEntryNotFound::RETURN_NULL);
+	auto schema = LookupSchema(transaction, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(drop_name)),
+	                           OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;
 		}
-		throw CatalogException("Schema with name \"%s\" does not exist!", info.name);
+		throw CatalogException("Schema with name \"%s\" does not exist!", drop_name.GetIdentifierName());
 	}
 	auto database = schema->name;
 	if (!info.cascade) {
@@ -189,7 +192,10 @@ optional_ptr<SchemaCatalogEntry> ClickhouseCatalog::LookupSchema(CatalogTransact
 	auto entry = schemas.GetEntry(context, schema_name);
 	if (!entry && schema_name == DEFAULT_SCHEMA) {
 		// "main" refers to the SCHEMA database, else to the database named in the connection settings
-		entry = schemas.GetEntry(context, GetDefaultSchema());
+		auto default_schema = GetDefaultSchema();
+		if (default_schema) {
+			entry = schemas.GetEntry(context, *default_schema);
+		}
 	}
 	if (!entry) {
 		if (if_not_found == OnEntryNotFound::RETURN_NULL) {
@@ -220,18 +226,18 @@ PhysicalOperator &ClickhouseCatalog::PlanCreateTableAs(ClientContext &context, P
 	ThrowIfReadOnly();
 	auto &info = op.info->Base();
 	// fail now, before anything is created, for columns ClickHouse cannot hold or that the INSERT cannot write
-	ClickhouseDdl::CreateTableSql(context, op.schema.name, info);
+	ClickhouseDdl::CreateTableSql(context, op.schema.name.GetIdentifierName(), info);
 	for (auto &column : info.columns.Logical()) {
 		auto type = ClickhouseDdlTypes::ToClickhouse(column.Type(), true);
 		if (ClickhouseWriter::GetWriteMode(ClickhouseTypeParser::Parse(type)) == ClickhouseWriteMode::UNSUPPORTED) {
 			throw NotImplementedException("Column \"%s\" (%s) cannot be written into ClickHouse by CREATE TABLE AS; "
 			                              "create the table with clickhouse_execute() instead",
-			                              column.Name(), column.Type().ToString());
+			                              column.Name().GetIdentifierName(), column.Type().ToString());
 		}
 	}
 	// only the owned CreateTableInfo is kept: BoundCreateTableInfo::schema is a reference into this catalog's cache
 	auto create_info = unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(op.info->base));
-	auto &insert = planner.Make<ClickhouseInsert>(op, *this, op.schema.name, std::move(create_info));
+	auto &insert = planner.Make<ClickhouseInsert>(op, *this, op.schema.name.GetIdentifierName(), std::move(create_info));
 	insert.children.push_back(plan);
 	return insert;
 }
@@ -249,7 +255,7 @@ PhysicalOperator &ClickhouseCatalog::PlanInsert(ClientContext &context, Physical
 	// DuckDB's own planner adds a projection filling in the DEFAULTs of unlisted columns
 	// (ResolveDefaultsProjection); it is skipped on purpose, so ClickHouse applies its own defaults instead
 	auto &table = op.table.Cast<ClickhouseTableEntry>();
-	auto columns = ClickhouseInsert::GetInsertColumns(table, op.column_index_map);
+	auto columns = ClickhouseInsert::GetInsertColumns(table, op);
 	auto &insert = planner.Make<ClickhouseInsert>(op, table, std::move(columns));
 	insert.children.push_back(*plan);
 	return insert;

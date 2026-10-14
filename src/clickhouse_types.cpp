@@ -3,6 +3,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/unordered_set.hpp"
 
 #include <algorithm>
@@ -362,7 +364,7 @@ ClickhouseColumnType ClickhouseTypes::ToDuckDB(const ClickhouseTypeNode &node) {
 	} else if ((name == "Enum8" || name == "Enum16") && !type.literals.empty()) {
 		auto entries = ParseEnumEntries(type);
 		Vector labels(LogicalType::VARCHAR, entries.size());
-		auto label_data = FlatVector::GetData<string_t>(labels);
+		auto label_data = FlatVector::GetDataMutable<string_t>(labels);
 		for (idx_t i = 0; i < entries.size(); i++) {
 			label_data[i] = StringVector::AddString(labels, entries[i].label);
 		}

@@ -164,7 +164,7 @@ SCHEMA must name a ClickHouse database
 statement error
 ATTACH 'host=${CLICKHOUSE_TEST_HOST} port=${CLICKHOUSE_TEST_PORT} user=${CLICKHOUSE_TEST_USER} password=${CLICKHOUSE_TEST_PASSWORD}' AS ch_null (TYPE clickhouse, SCHEMA NULL);
 ----
-NULL is not supported as a valid option for ATTACH option "schema"
+NULL is not supported as a valid option for ATTACH option
 
 query I
 SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ch_missing', 'ch_empty', 'ch_null');

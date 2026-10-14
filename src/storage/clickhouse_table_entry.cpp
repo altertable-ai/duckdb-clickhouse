@@ -2,6 +2,9 @@
 
 #include "clickhouse_scanner.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "storage/clickhouse_catalog.hpp"
 
@@ -10,8 +13,8 @@ namespace duckdb {
 ClickhouseTableEntry::ClickhouseTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                            vector<ClickhouseColumnInfo> columns, optional_idx approx_rows,
                                            string engine, string column_collision)
-    : TableCatalogEntry(catalog, schema, info), clickhouse_columns(std::move(columns)), approx_rows(approx_rows),
-      engine(std::move(engine)), column_collision(std::move(column_collision)) {
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)), clickhouse_columns(std::move(columns)),
+      approx_rows(approx_rows), engine(std::move(engine)), column_collision(std::move(column_collision)) {
 }
 
 void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
@@ -21,7 +24,7 @@ void ClickhouseTableEntry::ThrowIfColumnsCollide() const {
 	throw InvalidInputException("ClickHouse table \"%s\".\"%s\" has columns whose names differ only in case (%s), "
 	                            "which DuckDB cannot tell apart; rename one of them (ALTER TABLE … RENAME COLUMN), or "
 	                            "read the table with clickhouse_query()",
-	                            schema.name, name, column_collision);
+	                            schema.name.GetIdentifierName(), name.GetIdentifierName(), column_collision);
 }
 
 bool ClickhouseTableEntry::IsViewLike() const {
@@ -50,13 +53,27 @@ TableFunction ClickhouseTableEntry::GetScanFunction(ClientContext &context, uniq
 	// another connection cleared the cache between the catalog lookup that found this entry and this call; the
 	// entry is then retired and stays valid for the rest of this transaction.
 	result->lifetime = clickhouse_catalog.GetSchemaEntryOwner(schema.name);
-	result->database = schema.name;
-	result->table = name;
+	result->database = schema.name.GetIdentifierName();
+	result->table = name.GetIdentifierName();
 	result->columns = clickhouse_columns;
 	result->approx_rows = approx_rows;
 	result->filter_pushdown = ClickhouseScanFunction::FilterPushdownEnabled(context);
 	bind_data = std::move(result);
 	return ClickhouseScanFunction();
+}
+
+//! Marks user SET/INSERT values so PlanUpdate can tell them from DuckDB 2.0's rewritten SET col = DEFAULT
+static const Identifier USER_ASSIGNMENT_ALIAS("clickhouse_user_assignment");
+
+unique_ptr<Expression> ClickhouseTableEntry::GetDefaultExpressionForColumn(ClientContext &context,
+                                                                           const LogicalType &input_type,
+                                                                           const LogicalType &result_type,
+                                                                           ColumnBinding binding,
+                                                                           const Expression &constant_value) const {
+	auto expr =
+	    TableCatalogEntry::GetDefaultExpressionForColumn(context, input_type, result_type, binding, constant_value);
+	expr->SetAlias(USER_ASSIGNMENT_ALIAS);
+	return expr;
 }
 
 TableStorageInfo ClickhouseTableEntry::GetStorageInfo(ClientContext &context) {

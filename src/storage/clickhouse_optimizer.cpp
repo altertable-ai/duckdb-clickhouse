@@ -22,7 +22,7 @@ static optional_ptr<LogicalGet> FindClickhouseScan(LogicalOperator &op) {
 		return nullptr;
 	}
 	auto &get = current.get().Cast<LogicalGet>();
-	if (!ClickhouseScanFunction::IsClickhouseScan(get.function.name) || !get.bind_data) {
+	if (!ClickhouseScanFunction::IsClickhouseScan(get.function.GetName()) || !get.bind_data) {
 		return nullptr;
 	}
 	return &get;
@@ -33,19 +33,24 @@ static optional_ptr<LogicalGet> FindClickhouseScan(LogicalOperator &op) {
 //! those without throwing; see its header comment) -- a required filter DuckDB would still need to apply itself
 //! must never be skipped by pushing the LIMIT past it.
 //!
-//! get.table_filters is keyed by the scan's own (absolute) column index, matching bind_data.columns directly --
-//! see ClickhouseFilterPushdown::TransformFilters for the position-indexed variant used once a physical plan
-//! exists.
+//! get.table_filters is keyed by ProjectionIndex into the scan's column_ids (see FilterCombiner). Map that
+//! through GetColumnIds() to the bind_data.columns index.
 static bool AllFiltersPushed(LogicalGet &get, const ClickhouseScanBindData &bind_data) {
-	for (auto &entry : get.table_filters.filters) {
-		auto column_id = entry.first;
+	auto &column_ids = get.GetColumnIds();
+	for (auto &entry : get.table_filters) {
+		auto proj_idx = entry.GetIndex().GetIndex();
+		if (proj_idx >= column_ids.size()) {
+			return false;
+		}
+		auto column_id = column_ids[proj_idx].GetPrimaryIndex();
 		if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size() || !bind_data.filter_pushdown ||
 		    !ClickhouseTypes::SupportsFilterPushdown(bind_data.columns[column_id].type_node)) {
 			return false;
 		}
 		try {
 			ClickhouseFilterPushdown::TransformFilter(
-			    ClickhouseUtils::QuoteIdentifier(bind_data.columns[column_id].name), *entry.second);
+			    ClickhouseUtils::QuoteIdentifier(bind_data.columns[column_id].name), entry.Filter(),
+			    bind_data.columns[column_id].type);
 		} catch (const NotImplementedException &) {
 			// a required filter DuckDB cannot translate: ClickHouse would not enforce it, so a LIMIT applied
 			// server-side could return the wrong rows
@@ -63,10 +68,10 @@ static string TraceColumn(Expression &expr, LogicalOperator &child, LogicalGet &
 		return string();
 	}
 	auto &column_ref = expr.Cast<BoundColumnRefExpression>();
-	if (column_ref.depth > 0) {
+	if (column_ref.Depth() > 0) {
 		return string();
 	}
-	auto binding = column_ref.binding;
+	auto binding = column_ref.Binding();
 	reference<LogicalOperator> current = child;
 	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &projection = current.get().Cast<LogicalProjection>();
@@ -78,10 +83,10 @@ static string TraceColumn(Expression &expr, LogicalOperator &child, LogicalGet &
 			return string();
 		}
 		auto &inner = projected.Cast<BoundColumnRefExpression>();
-		if (inner.depth > 0) {
+		if (inner.Depth() > 0) {
 			return string();
 		}
-		binding = inner.binding;
+		binding = inner.Binding();
 		current = *current.get().children[0];
 	}
 	if (binding.table_index != get.table_index) {

@@ -63,7 +63,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 	}
 
 	for (auto &table : tables) {
-		CreateTableInfo info(schema, table.name);
+		CreateTableInfo info(schema, Identifier(table.name));
 		// ClickHouse column names are case-sensitive, DuckDB's are not: ColumnList::AddColumn() throws for a second
 		// column whose name differs from an earlier one only in case, and throwing here would make every table of
 		// this database unreachable. Only the first of such columns is listed, and the table entry refuses scans and
@@ -80,7 +80,7 @@ void ClickhouseTableSet::LoadEntries(ClientContext &context) {
 			}
 			seen.emplace(column.name, column.name);
 			auto index = info.columns.LogicalColumnCount();
-			info.columns.AddColumn(ColumnDefinition(column.name, column.type));
+			info.columns.AddColumn(ColumnDefinition(Identifier(column.name), column.type));
 			if (!ClickhouseTypes::IsNullable(column.type_node)) {
 				info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(index)));
 			}

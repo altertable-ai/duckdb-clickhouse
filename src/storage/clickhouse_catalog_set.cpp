@@ -33,24 +33,24 @@ void ClickhouseCatalogSet::TryLoadEntries(ClientContext &context) {
 	is_loaded = true;
 }
 
-optional_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntry(ClientContext &context, const string &name) {
+optional_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntry(ClientContext &context, const Identifier &name) {
 	TryLoadEntries(context);
 	lock_guard<mutex> guard(entry_lock);
-	auto exact = entries.find(name);
+	auto exact = entries.find(name.GetIdentifierName());
 	if (exact != entries.end()) {
 		return exact->second.get();
 	}
 	for (auto &entry : ordered_entries) {
-		if (StringUtil::CIEquals(entry->name, name)) {
+		if (entry->name == name) {
 			return entry.get();
 		}
 	}
 	return nullptr;
 }
 
-shared_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntryOwner(const string &name) {
+shared_ptr<CatalogEntry> ClickhouseCatalogSet::GetEntryOwner(const Identifier &name) {
 	lock_guard<mutex> guard(entry_lock);
-	auto entry = entries.find(name);
+	auto entry = entries.find(name.GetIdentifierName());
 	if (entry == entries.end()) {
 		return nullptr;
 	}
@@ -90,7 +90,7 @@ void ClickhouseCatalogSet::ClearEntries() {
 void ClickhouseCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
 	shared_ptr<CatalogEntry> shared_entry(std::move(entry));
 	lock_guard<mutex> guard(entry_lock);
-	entries[shared_entry->name] = shared_entry;
+	entries[shared_entry->name.GetIdentifierName()] = shared_entry;
 	ordered_entries.push_back(std::move(shared_entry));
 }
 

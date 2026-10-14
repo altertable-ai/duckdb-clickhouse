@@ -1,7 +1,9 @@
 #include "storage/clickhouse_schema_set.hpp"
 
 #include "clickhouse_connection.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_schema_entry.hpp"
 
@@ -35,7 +37,7 @@ void ClickhouseSchemaSet::LoadEntries(ClientContext &context) {
 				continue;
 			}
 			CreateSchemaInfo info;
-			info.schema = name;
+			info.SetQualifiedName(QualifiedName({Identifier(name)}, Identifier()));
 			info.internal = false;
 			CreateEntry(make_uniq<ClickhouseSchemaEntry>(catalog, info));
 		}

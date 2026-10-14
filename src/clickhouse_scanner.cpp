@@ -7,6 +7,7 @@
 #include "clickhouse_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/table_column.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
@@ -133,9 +135,9 @@ string ClickhouseScanFunction::BuildQuery(const ClickhouseScanBindData &bind_dat
 }
 
 void ClickhouseScanFunction::SetReturnTypes(const ClickhouseScanBindData &bind_data, vector<LogicalType> &return_types,
-                                            vector<string> &names) {
+                                            vector<Identifier> &names) {
 	for (auto &column : bind_data.columns) {
-		names.push_back(column.name);
+		names.push_back(Identifier(column.name));
 		return_types.push_back(column.type);
 	}
 }
@@ -169,6 +171,7 @@ static unique_ptr<GlobalTableFunctionState> ClickhouseInitGlobal(ClientContext &
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
 	auto result = make_uniq<ClickhouseScanGlobalState>();
 	result->sql = ClickhouseScanFunction::BuildQuery(bind_data, input.column_ids, StaticScanFilters(input));
+	bind_data.last_sql = result->sql;
 	// columns needed only to evaluate a filter DuckDB couldn't push down (ClickhouseSupportsPushdownType
 	// returned false for them) are still fetched -- filter_prune=true lets DuckDB tell us, via
 	// projection_ids, which of the fetched columns actually need to reach `output`
@@ -259,6 +262,10 @@ static unique_ptr<NodeStatistics> ClickhouseScanCardinality(ClientContext &conte
 static InsertionOrderPreservingMap<string> ClickhouseScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<ClickhouseScanBindData>();
+	if (!bind_data.last_sql.empty()) {
+		result["ClickHouse Query"] = bind_data.last_sql;
+		return result;
+	}
 	if (bind_data.query.empty()) {
 		result["Table"] = bind_data.database + "." + bind_data.table;
 	} else {
@@ -272,23 +279,13 @@ static InsertionOrderPreservingMap<string> ClickhouseScanToString(TableFunctionT
 	return result;
 }
 
-static InsertionOrderPreservingMap<string> ClickhouseScanDynamicToString(TableFunctionDynamicToStringInput &input) {
-	InsertionOrderPreservingMap<string> result;
-	if (input.global_state) {
-		result["ClickHouse Query"] = input.global_state->Cast<ClickhouseScanGlobalState>().sql;
-	}
-	return result;
-}
-
-//! Without this, LogicalGet::GetTable() always returns null (it requires get_bind_info), which makes
+//! Without this, LogicalGet::GetTable() always returns null (it requires get_table_entry), which makes
 //! UPDATE/DELETE's binder reject the scan before it ever reaches ClickhouseCatalog::PlanUpdate/PlanDelete.
-static BindInfo ClickhouseGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
-	auto &bind_data = bind_data_p->Cast<ClickhouseScanBindData>();
-	if (bind_data.table_entry) {
-		return BindInfo(*bind_data.table_entry);
+static optional_ptr<TableCatalogEntry> ClickhouseGetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
+	if (!bind_data_p) {
+		return nullptr;
 	}
-	// clickhouse_scan() / clickhouse_query() (Task 9): no backing catalog entry
-	return BindInfo(ScanType::EXTERNAL);
+	return bind_data_p->Cast<ClickhouseScanBindData>().table_entry;
 }
 
 //! DuckDB only hands us filters on columns for which this returns true; it evaluates all others itself
@@ -310,15 +307,18 @@ bool ClickhouseScanFunction::FilterPushdownEnabled(ClientContext &context) {
 
 //! `CAST(<column> AS VARCHAR)`, unwrapped to the column reference inside, or null when expr isn't that shape
 static const BoundColumnRefExpression *AsVarcharCastOfColumnRef(const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+	if (!BoundCastExpression::IsCast(expr)) {
 		return nullptr;
 	}
-	auto &cast_expr = expr.Cast<BoundCastExpression>();
-	if (cast_expr.return_type.id() != LogicalTypeId::VARCHAR ||
-	    cast_expr.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+	auto &cast_expr = expr.Cast<BoundFunctionExpression>();
+	if (cast_expr.GetReturnType().id() != LogicalTypeId::VARCHAR) {
 		return nullptr;
 	}
-	return &cast_expr.child->Cast<BoundColumnRefExpression>();
+	auto &child = BoundCastExpression::Child(cast_expr);
+	if (child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	return &child.Cast<BoundColumnRefExpression>();
 }
 
 //! Resolves a BoundColumnRefExpression to its ClickHouse column, when that column may have filters pushed down
@@ -328,10 +328,10 @@ static optional_idx ResolvePushdownableColumn(const LogicalGet &get, const Click
 		return optional_idx();
 	}
 	auto &get_column_ids = get.GetColumnIds();
-	if (column_ref.binding.column_index >= get_column_ids.size()) {
+	if (column_ref.Binding().column_index >= get_column_ids.size()) {
 		return optional_idx();
 	}
-	auto column_id = get_column_ids[column_ref.binding.column_index].GetPrimaryIndex();
+	auto column_id = get_column_ids[column_ref.Binding().column_index].GetPrimaryIndex();
 	if (IsVirtualColumn(column_id) || column_id >= bind_data.columns.size()) {
 		return optional_idx();
 	}
@@ -354,24 +354,28 @@ static bool ClickhousePushdownExpression(ClientContext &context, const LogicalGe
 	}
 	auto &bind_data = get.bind_data->Cast<ClickhouseScanBindData>();
 
-	if (expr.type == ExpressionType::OPERATOR_IS_NULL || expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+	    expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
 		auto &op_expr = expr.Cast<BoundOperatorExpression>();
-		if (op_expr.children.size() != 1 ||
-		    op_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		auto &children = op_expr.GetChildren();
+		if (children.size() != 1 || children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return false;
 		}
-		auto &column_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+		auto &column_ref = children[0]->Cast<BoundColumnRefExpression>();
 		return ResolvePushdownableColumn(get, bind_data, column_ref).IsValid();
 	}
 
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON &&
-	    (expr.type == ExpressionType::COMPARE_EQUAL || expr.type == ExpressionType::COMPARE_NOTEQUAL)) {
-		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		auto *column_ref = AsVarcharCastOfColumnRef(*comparison.left);
-		auto *other = comparison.right.get();
+	if (BoundComparisonExpression::IsComparison(expr) &&
+	    (expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL ||
+	     expr.GetExpressionType() == ExpressionType::COMPARE_NOTEQUAL)) {
+		auto &comparison = expr.Cast<BoundFunctionExpression>();
+		auto &left = BoundComparisonExpression::Left(comparison);
+		auto &right = BoundComparisonExpression::Right(comparison);
+		auto *column_ref = AsVarcharCastOfColumnRef(left);
+		const Expression *other = &right;
 		if (!column_ref) {
-			column_ref = AsVarcharCastOfColumnRef(*comparison.right);
-			other = comparison.left.get();
+			column_ref = AsVarcharCastOfColumnRef(right);
+			other = &left;
 		}
 		if (!column_ref || other->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
@@ -380,7 +384,7 @@ static bool ClickhousePushdownExpression(ClientContext &context, const LogicalGe
 		// a NULL constant never survives to here in practice (DuckDB folds `x = NULL` away before filter
 		// pushdown), but TransformFilter reconstructs this same shape independently -- guard it explicitly
 		// rather than rely on that
-		if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+		if (constant.GetValue().IsNull() || constant.GetValue().type().id() != LogicalTypeId::VARCHAR) {
 			return false;
 		}
 		auto column_id = ResolvePushdownableColumn(get, bind_data, *column_ref);
@@ -394,7 +398,7 @@ static bool ClickhousePushdownExpression(ClientContext &context, const LogicalGe
 		// matching (observed for `!=`; `=` happens to not error, but relying on that would be fragile), so
 		// don't push and let DuckDB compare the (always-false) strings itself
 		auto &column_type = bind_data.columns[column_id.GetIndex()].type;
-		return EnumType::GetPos(column_type, StringValue::Get(constant.value)) >= 0;
+		return EnumType::GetPos(column_type, StringValue::Get(constant.GetValue())) >= 0;
 	}
 
 	return false;
@@ -420,8 +424,7 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 	function.get_partition_data = ClickhouseGetPartitionData;
 	function.cardinality = ClickhouseScanCardinality;
 	function.to_string = ClickhouseScanToString;
-	function.dynamic_to_string = ClickhouseScanDynamicToString;
-	function.get_bind_info = ClickhouseGetBindInfo;
+	function.get_table_entry = ClickhouseGetTableEntry;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	// lets DuckDB immediately drop columns that are only needed to evaluate a filter it couldn't push down
@@ -442,7 +445,7 @@ void ClickhouseScanFunction::SetScanCallbacks(TableFunction &function) {
 //! Binds clickhouse_scan('<connection string>', '<database>', '<table>' [, secret := '<secret name>']): opens a
 //! private connection pool (no ATTACH) and reads the table's columns straight from system.columns
 static unique_ptr<FunctionData> ClickhouseScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// same gate ATTACH goes through (ClickhouseAttach); must come before anything that reads a secret or
 	// opens a connection
 	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
@@ -499,7 +502,7 @@ ClickhouseScanFunction::ClickhouseScanFunction()
     : TableFunction("clickhouse_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                     ClickhouseScan, ClickhouseScanBind) {
 	SetScanCallbacks(*this);
-	named_parameters["secret"] = LogicalType::VARCHAR;
+	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) { options.Add("secret", LogicalType::VARCHAR); });
 }
 
 } // namespace duckdb

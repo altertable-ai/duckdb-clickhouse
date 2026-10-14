@@ -4,6 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 namespace duckdb {
 
@@ -120,12 +121,14 @@ string ClickhouseDdlTypes::ToClickhouse(const LogicalType &type, bool nullable) 
 		break;
 	case LogicalTypeId::LIST:
 		return "Array(" + ToClickhouse(ListType::GetChildType(type), true) + ")";
+	// DuckDB 2.0 types row(1, 'a') as TUPLE rather than an unnamed STRUCT
+	case LogicalTypeId::TUPLE:
 	case LogicalTypeId::STRUCT: {
 		vector<string> fields;
 		for (auto &child : StructType::GetChildTypes(type)) {
-			// an unnamed STRUCT (e.g. from row(1, 'a')): ClickHouse rejects an empty Tuple element name, and an
-			// unnamed Tuple would read back as a STRUCT with fields "1", "2", … -- a different type
-			if (child.first.empty()) {
+			// an unnamed STRUCT / TUPLE (e.g. from row(1, 'a')): ClickHouse rejects an empty Tuple element name,
+			// and an unnamed Tuple would read back as a STRUCT with fields "1", "2", … -- a different type
+			if (StructType::IsUnnamed(type) || child.first.empty()) {
 				throw NotImplementedException("STRUCT fields must be named for ClickHouse Tuple columns (got %s); name "
 				                              "them, e.g. {'a': 1, 'b': 'x'} instead of row(1, 'x')",
 				                              type.ToString());

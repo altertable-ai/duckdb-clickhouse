@@ -1,6 +1,7 @@
 #include "clickhouse_type_mapping_function.hpp"
 
 #include "clickhouse_types.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 
 namespace duckdb {
 
@@ -14,7 +15,7 @@ struct ClickhouseTypeMappingData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> TypeMappingBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("clickhouse_type_mapping: the type cannot be NULL");
 	}

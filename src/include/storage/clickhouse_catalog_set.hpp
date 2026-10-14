@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/unordered_map.hpp"
 
@@ -18,12 +19,18 @@ public:
 
 	//! Exact (case-sensitive) match first, then the first case-insensitive match. GetEntry() and Scan() start the
 	//! database's DuckDB transaction for `context` first, if it has not started yet (see ClearEntries())
-	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const string &name);
+	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const Identifier &name);
+	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const string &name) {
+		return GetEntry(context, Identifier(name));
+	}
 	//! The shared_ptr that owns the currently cached entry named `name`, for a caller that has to keep it
 	//! alive past a ClearEntries() (see ClickhouseScanBindData::lifetime). Exact match only, and never
 	//! loads: the caller already holds the entry it is asking about. Null if the cache was cleared in the
 	//! meantime.
-	shared_ptr<CatalogEntry> GetEntryOwner(const string &name);
+	shared_ptr<CatalogEntry> GetEntryOwner(const Identifier &name);
+	shared_ptr<CatalogEntry> GetEntryOwner(const string &name) {
+		return GetEntryOwner(Identifier(name));
+	}
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
 	//! Drops the cache; the next access reloads from ClickHouse. The dropped entries are retired, not freed: they stay
 	//! alive until every DuckDB transaction active on the database at this point has ended (see
