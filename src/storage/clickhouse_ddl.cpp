@@ -15,12 +15,30 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "storage/clickhouse_catalog.hpp"
 #include "storage/clickhouse_dml.hpp"
 #include "storage/clickhouse_table_entry.hpp"
 
 namespace duckdb {
+
+//! Whether the expression calls a non-cast function that is constant only within one query, such as now() or
+//! current_date. Casts are skipped: those that are CONSISTENT_WITHIN_QUERY only read session settings such as
+//! TimeZone at bind time, which is meant to be folded with the current session's settings.
+static bool CallsQueryConstantFunction(const Expression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION && !BoundCastExpression::IsCast(expr) &&
+	    expr.Cast<BoundFunctionExpression>().Function().GetStability() == FunctionStability::CONSISTENT_WITHIN_QUERY) {
+		return true;
+	}
+	bool result = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		result = result || CallsQueryConstantFunction(child);
+	});
+	return result;
+}
 
 string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefinition &column) {
 	if (!column.HasDefaultValue()) {
@@ -37,9 +55,9 @@ string ClickhouseDdl::DefaultValueSql(ClientContext &context, const ColumnDefini
 	// IsFoldable() alone is not enough: now()/current_timestamp/current_database() etc. have
 	// FunctionStability::CONSISTENT_WITHIN_QUERY, which DuckDB still considers foldable (it is constant for the
 	// lifetime of one query) even though it is not a true constant -- baking today's value into the DDL as a
-	// literal DEFAULT would silently stop it from updating on every future INSERT. IsConsistent() additionally
-	// requires every function in the tree to be FunctionStability::CONSISTENT, which excludes those.
-	if (!bound->IsFoldable() || !bound->IsConsistent()) {
+	// literal DEFAULT would silently stop it from updating on every future INSERT. Neither IsConsistent() (since
+	// DuckDB 2.0.1) nor RequiresRebind() (also set by TimeZone-reading casts) tells those apart.
+	if (!bound->IsFoldable() || CallsQueryConstantFunction(*bound)) {
 		throw NotImplementedException("DEFAULT value of column \"%s\" must be a constant for ClickHouse tables (got "
 		                              "%s); use clickhouse_execute() instead",
 		                              column.Name().GetIdentifierName(), column.DefaultValue().ToString());
